@@ -155,6 +155,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/monsters">Monsters</a>
   <a href="/spells">Spells</a>
   <a href="/classes">Classes</a>
+  <a href="/items">Items</a>
   <a href="/combat">Combat</a>
 </nav>
 <div class="container">
@@ -989,11 +990,6 @@ def monster_detail(slug: str):
 # Spells
 # ---------------------------------------------------------------------------
 
-_SPELL_SCHOOLS = [
-    "Abjuration", "Alteration", "Conjuration", "Divination",
-    "Enchantment", "Evocation", "Illusion", "Necromancy",
-]
-
 SELECT_STYLE = (
     'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
     'padding:6px 10px;border-radius:4px;font-size:1em"'
@@ -1006,6 +1002,43 @@ BTN_STYLE = (
     'style="background:#3a2818;border:1px solid #5a4030;color:#c8a96e;'
     'padding:6px 14px;border-radius:4px;cursor:pointer"'
 )
+
+_WIZARD_SCHOOLS = [
+    "Abjuration", "Alteration", "Conjuration/Summoning", "Divination",
+    "Enchantment/Charm", "Evocation", "Illusion/Phantasm", "Invocation/Evocation", "Necromancy",
+]
+_PRIEST_SCHOOLS = [
+    "Abjuration", "Alteration", "Conjuration", "Divination",
+    "Enchantment", "Evocation", "Illusion", "Necromancy",
+]
+_ALL_SCHOOLS = sorted(set(_WIZARD_SCHOOLS + _PRIEST_SCHOOLS))
+
+
+def _spell_query(q: str, caster: str, school: str, level: str):
+    if not _2E_DB.exists():
+        return []
+    conn = sqlite3.connect(str(_2E_DB))
+    conn.row_factory = sqlite3.Row
+    where, params = ["1=1"], []
+    if q:
+        where.append("name LIKE ? COLLATE NOCASE")
+        params.append(f"%{q}%")
+    if caster:
+        where.append("lower(caster) = ?")
+        params.append(caster)
+    if level and level.isdigit():
+        where.append("level = ?")
+        params.append(int(level))
+    if school:
+        where.append("school LIKE ? COLLATE NOCASE")
+        params.append(f"%{school}%")
+    rows = conn.execute(
+        f"SELECT id, name, level, school, caster, casting_time FROM spells "
+        f"WHERE {' AND '.join(where)} ORDER BY level, name",
+        params,
+    ).fetchall()
+    conn.close()
+    return rows
 
 
 def _spell_card(r) -> str:
@@ -1029,6 +1062,89 @@ def _spell_section(title: str, rows) -> str:
     return f"<h2 style='margin-top:24px'>{html.escape(title)}{count}</h2>{cards}"
 
 
+def _spell_results_html(rows, caster: str) -> str:
+    if not rows:
+        return "<p class='muted'>No results.</p>"
+    if not caster:
+        wizard_rows = [r for r in rows if (r["caster"] or "").lower() == "wizard"]
+        priest_rows = [r for r in rows if (r["caster"] or "").lower() == "priest"]
+        other_rows  = [r for r in rows if (r["caster"] or "").lower() not in ("wizard", "priest")]
+        count = f"<p class='muted' style='margin-bottom:4px'>{len(rows)} spell{'s' if len(rows) != 1 else ''}</p>"
+        return (count
+                + _spell_section("Wizard Spells", wizard_rows)
+                + _spell_section("Priest Spells", priest_rows)
+                + _spell_section("Other", other_rows))
+    count = f"<p class='muted' style='margin-bottom:4px'>{len(rows)} spell{'s' if len(rows) != 1 else ''}</p>"
+    return count + "".join(_spell_card(r) for r in rows)
+
+
+@app.route("/api/spells/cards")
+def api_spell_cards():
+    q      = request.args.get("q", "").strip()
+    caster = request.args.get("caster", "").strip().lower()
+    school = request.args.get("school", "").strip()
+    level  = request.args.get("level", "").strip()
+    rows   = _spell_query(q, caster, school, level)
+    return Response(_spell_results_html(rows, caster), mimetype="text/html")
+
+
+_SPELLS_JS = r"""
+<script>
+const WIZARD_SCHOOLS = """ + json.dumps(_WIZARD_SCHOOLS) + r""";
+const PRIEST_SCHOOLS = """ + json.dumps(_PRIEST_SCHOOLS) + r""";
+const ALL_SCHOOLS    = """ + json.dumps(_ALL_SCHOOLS) + r""";
+
+let _timer = null;
+
+function schoolsFor(caster) {
+  if (caster === "wizard") return WIZARD_SCHOOLS;
+  if (caster === "priest") return PRIEST_SCHOOLS;
+  return ALL_SCHOOLS;
+}
+
+function updateSchools() {
+  const caster = document.querySelector('input[name="caster"]:checked').value;
+  const sel = document.getElementById("school-sel");
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">All schools</option>';
+  for (const s of schoolsFor(caster)) {
+    const opt = document.createElement("option");
+    opt.value = s; opt.textContent = s;
+    if (s === prev) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+async function doFetch() {
+  const q      = document.getElementById("spell-q").value.trim();
+  const caster = document.querySelector('input[name="caster"]:checked').value;
+  const school = document.getElementById("school-sel").value;
+  const level  = document.getElementById("level-sel").value;
+  if (q.length > 0 && q.length < 3) return;
+  const p = new URLSearchParams();
+  if (q)      p.set("q",      q);
+  if (caster) p.set("caster", caster);
+  if (school) p.set("school", school);
+  if (level)  p.set("level",  level);
+  const r = await fetch("/api/spells/cards?" + p.toString());
+  document.getElementById("spell-results").innerHTML = await r.text();
+}
+
+function schedule() {
+  clearTimeout(_timer);
+  _timer = setTimeout(doFetch, 280);
+}
+
+document.getElementById("spell-q").addEventListener("input", schedule);
+document.getElementById("school-sel").addEventListener("change", schedule);
+document.getElementById("level-sel").addEventListener("change", schedule);
+document.querySelectorAll('input[name="caster"]').forEach(r => {
+  r.addEventListener("change", () => { updateSchools(); schedule(); });
+});
+</script>
+"""
+
+
 @app.route("/spells")
 def spells():
     q      = request.args.get("q", "").strip()
@@ -1040,41 +1156,10 @@ def spells():
         body = "<h1>Spells</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
         return render("Spells", body)
 
-    conn = sqlite3.connect(str(_2E_DB))
-    conn.row_factory = sqlite3.Row
+    rows = _spell_query(q, caster, school, level)
 
-    where, params = ["1=1"], []
-    if q:
-        where.append("name LIKE ? COLLATE NOCASE")
-        params.append(f"%{q}%")
-    if caster:
-        where.append("lower(caster) = ?")
-        params.append(caster)
-    if level.isdigit():
-        where.append("level = ?")
-        params.append(int(level))
-    if school:
-        where.append("school LIKE ? COLLATE NOCASE")
-        params.append(f"%{school}%")
-
-    rows = conn.execute(
-        f"SELECT id, name, level, school, caster, casting_time FROM spells "
-        f"WHERE {' AND '.join(where)} ORDER BY level, name",
-        params,
-    ).fetchall()
-    conn.close()
-
-    # Build filter form
-    school_opts = '<option value="">All schools</option>' + "".join(
-        f'<option value="{s}" {"selected" if school == s else ""}>{s}</option>'
-        for s in _SPELL_SCHOOLS
-    )
-    level_opts = '<option value="">All levels</option>' + "".join(
-        f'<option value="{i}" {"selected" if level == str(i) else ""}>Level {i}</option>'
-        for i in range(1, 10)
-    )
-    def _radio(val, label, current):
-        chk = "checked" if current == val else ""
+    def _radio(val, label):
+        chk = "checked" if caster == val else ""
         return (
             f'<label style="display:inline-flex;align-items:center;gap:4px;'
             f'cursor:pointer;color:#d4c5a9;font-size:.95em">'
@@ -1085,50 +1170,38 @@ def spells():
     radios = (
         f'<div style="display:flex;gap:14px;align-items:center;'
         f'background:#2a2018;border:1px solid #4a3828;border-radius:4px;padding:6px 12px">'
-        + _radio("", "Both", caster)
-        + _radio("wizard", "Wizard", caster)
-        + _radio("priest", "Priest", caster)
-        + f'</div>'
+        + _radio("", "Both") + _radio("wizard", "Wizard") + _radio("priest", "Priest")
+        + '</div>'
     )
 
-    search_box = (
-        f'<form method="get" style="margin-bottom:20px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-        f'<input name="q" value="{html.escape(q)}" placeholder="Search by name…" {INPUT_STYLE}>'
+    schools_for_caster = (
+        _WIZARD_SCHOOLS if caster == "wizard"
+        else _PRIEST_SCHOOLS if caster == "priest"
+        else _ALL_SCHOOLS
+    )
+    school_opts = '<option value="">All schools</option>' + "".join(
+        f'<option value="{s}" {"selected" if school == s else ""}>{s}</option>'
+        for s in schools_for_caster
+    )
+    level_opts = '<option value="">All levels</option>' + "".join(
+        f'<option value="{i}" {"selected" if level == str(i) else ""}>Level {i}</option>'
+        for i in range(1, 10)
+    )
+
+    controls = (
+        f'<div style="margin-bottom:20px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        f'<input id="spell-q" name="q" value="{html.escape(q)}" placeholder="Search by name…" {INPUT_STYLE} autocomplete="off">'
         f'{radios}'
-        f'<select name="school" {SELECT_STYLE}>{school_opts}</select>'
-        f'<select name="level" {SELECT_STYLE}>{level_opts}</select>'
-        f'<button type="submit" {BTN_STYLE}>Filter</button>'
-        f'</form>'
+        f'<select id="school-sel" name="school" {SELECT_STYLE}>{school_opts}</select>'
+        f'<select id="level-sel" name="level" {SELECT_STYLE}>{level_opts}</select>'
+        f'</div>'
     )
 
-    if not rows:
-        body = f"<h1>Spells</h1>{search_box}<p class='muted'>No results.</p>"
-        return render("Spells", body)
-
-    # Separate into wizard / priest when no caster filter is active
-    if not caster:
-        wizard_rows  = [r for r in rows if (r["caster"] or "").lower() == "wizard"]
-        priest_rows  = [r for r in rows if (r["caster"] or "").lower() == "priest"]
-        other_rows   = [r for r in rows if (r["caster"] or "").lower() not in ("wizard", "priest")]
-        total = len(rows)
-        sections = (
-            _spell_section("Wizard Spells", wizard_rows)
-            + _spell_section("Priest Spells", priest_rows)
-            + _spell_section("Other", other_rows)
-        )
-        body = (
-            f"<h1>Spells</h1>{search_box}"
-            f"<p class='muted' style='margin-bottom:4px'>{total} spell{'s' if total != 1 else ''}</p>"
-            f"{sections}"
-        )
-    else:
-        title = "Wizard Spells" if caster == "wizard" else "Priest Spells"
-        body = (
-            f"<h1>{title}</h1>{search_box}"
-            f"<p class='muted' style='margin-bottom:4px'>{len(rows)} spell{'s' if len(rows) != 1 else ''}</p>"
-            + "".join(_spell_card(r) for r in rows)
-        )
-
+    body = (
+        f"<h1>Spells</h1>{controls}"
+        f'<div id="spell-results">{_spell_results_html(rows, caster)}</div>'
+        + _SPELLS_JS
+    )
     return render("Spells", body)
 
 
@@ -1178,10 +1251,7 @@ def spell_detail(spell_id: int):
         + "</table>"
     )
 
-    desc_html = ""
-    if row["description"]:
-        paras = [p.strip() for p in row["description"].split("\n") if p.strip()]
-        desc_html = "".join(f"<p>{html.escape(p)}</p>" for p in paras)
+    desc_html = _markdown_to_html(row["description"]) if row["description"] else ""
 
     body = (
         f'<p><a href="/spells">← Spells</a></p>'
@@ -1330,15 +1400,269 @@ def class_detail(slug: str):
 
 
 # ---------------------------------------------------------------------------
+# Items
+# ---------------------------------------------------------------------------
+
+_ITEM_TYPE_LABELS = {
+    "armor":                    "Armor",
+    "weapon_melee":             "Melee Weapon",
+    "weapon_ranged":            "Ranged Weapon",
+    "weapon_ammo":              "Ammunition",
+    "misc_equipment":           "Equipment",
+    "provisions":               "Provisions",
+    "clothing":                 "Clothing",
+    "item_food_lodging":        "Food & Lodging",
+    "services":                 "Services",
+    "animals":                  "Animals",
+    "tack_harness":             "Tack & Harness",
+    "scroll":                   "Scroll",
+    "potion":                   "Potion",
+    "ring":                     "Ring",
+    "rod":                      "Rod",
+    "staff":                    "Staff",
+    "wand":                     "Wand",
+    "magic_item_armor_special": "Magic Armor",
+    "magic_item_weapon_special":"Magic Weapon",
+    "misc_magic_bags_bottles_pouch": "Bags & Bottles",
+    "misc_magic_books":         "Books",
+    "misc_magic_boots_gloves":  "Boots & Gloves",
+    "misc_magic_candles_etc":   "Candles & Misc",
+    "misc_magic_cloaks_robes":  "Cloaks & Robes",
+    "misc_magic_girdle_hats_helms": "Girdles, Hats & Helms",
+    "misc_magic_household_tools":"Household Tools",
+    "misc_magic_jewelry":       "Jewelry",
+    "misc_magic_musical_instruments": "Instruments",
+    "misc_magic_weird":         "Weird Magic",
+}
+
+_ITEM_TYPE_GROUPS = {
+    "Mundane": ["armor", "weapon_melee", "weapon_ranged", "weapon_ammo",
+                "misc_equipment", "provisions", "clothing", "item_food_lodging",
+                "services", "animals", "tack_harness"],
+    "Magic":   ["scroll", "potion", "ring", "rod", "staff", "wand",
+                "magic_item_armor_special", "magic_item_weapon_special",
+                "misc_magic_bags_bottles_pouch", "misc_magic_books",
+                "misc_magic_boots_gloves", "misc_magic_candles_etc",
+                "misc_magic_cloaks_robes", "misc_magic_girdle_hats_helms",
+                "misc_magic_household_tools", "misc_magic_jewelry",
+                "misc_magic_musical_instruments", "misc_magic_weird"],
+}
+
+
+def _rarity_label(r: int) -> str:
+    if r <= 5:   return "Common"
+    if r <= 20:  return "Uncommon"
+    if r <= 40:  return "Rare"
+    if r <= 55:  return "Very Rare"
+    if r <= 70:  return "Legendary"
+    return "Artifact"
+
+
+def _item_query(q: str, itype: str, min_r: int, max_r: int):
+    if not _2E_DB.exists():
+        return []
+    conn = sqlite3.connect(str(_2E_DB))
+    conn.row_factory = sqlite3.Row
+    where, params = ["rarity BETWEEN ? AND ?"], [min_r, max_r]
+    if q:
+        where.append("name LIKE ? COLLATE NOCASE")
+        params.append(f"%{q}%")
+    if itype:
+        where.append("item_type = ?")
+        params.append(itype)
+    rows = conn.execute(
+        f"SELECT id, name, item_type, cost, rarity FROM items "
+        f"WHERE {' AND '.join(where)} ORDER BY rarity, item_type, name",
+        params,
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def _item_card(r) -> str:
+    type_label = _ITEM_TYPE_LABELS.get(r["item_type"], r["item_type"] or "—")
+    rarity_str = _rarity_label(r["rarity"])
+    return (
+        f'<div class="card" style="padding:8px 14px">'
+        f'<h2 style="margin:0 0 2px">'
+        f'<a href="/items/{r["id"]}">{html.escape(r["name"])}</a></h2>'
+        f'<p class="muted" style="margin:0;font-size:.9em">'
+        f'{html.escape(type_label)} &nbsp;·&nbsp; '
+        + (f'Cost:&nbsp;{html.escape(r["cost"])} &nbsp;·&nbsp; ' if r["cost"] else "")
+        + f'{html.escape(rarity_str)}'
+        f'</p></div>'
+    )
+
+
+def _item_results_html(rows) -> str:
+    if not rows:
+        return "<p class='muted'>No results.</p>"
+    count = f"<p class='muted' style='margin-bottom:12px'>{len(rows)} item{'s' if len(rows) != 1 else ''}</p>"
+    return count + "".join(_item_card(r) for r in rows)
+
+
+_ITEMS_JS = r"""
+<script>
+let _itimer = null;
+function iSchedule() {
+  clearTimeout(_itimer);
+  _itimer = setTimeout(iDoFetch, 280);
+}
+async function iDoFetch() {
+  const q      = document.getElementById("item-q").value.trim();
+  const itype  = document.getElementById("item-type").value;
+  const min_r  = document.getElementById("item-min-rarity").value;
+  if (q.length > 0 && q.length < 3) return;
+  const p = new URLSearchParams();
+  if (q)     p.set("q",          q);
+  if (itype) p.set("type",       itype);
+  if (min_r) p.set("min_rarity", min_r);
+  const r = await fetch("/api/items/cards?" + p.toString());
+  document.getElementById("item-results").innerHTML = await r.text();
+}
+document.getElementById("item-q").addEventListener("input", iSchedule);
+document.getElementById("item-type").addEventListener("change", iSchedule);
+document.getElementById("item-min-rarity").addEventListener("change", iSchedule);
+</script>
+"""
+
+
+@app.route("/api/items/cards")
+def api_item_cards():
+    q     = request.args.get("q", "").strip()
+    itype = request.args.get("type", "").strip()
+    try:
+        min_r = int(request.args.get("min_rarity", "0"))
+        max_r = int(request.args.get("max_rarity", "100"))
+    except ValueError:
+        min_r, max_r = 0, 100
+    rows = _item_query(q, itype, min_r, max_r)
+    return Response(_item_results_html(rows), mimetype="text/html")
+
+
+@app.route("/items")
+def items_list():
+    q       = request.args.get("q", "").strip()
+    itype   = request.args.get("type", "").strip()
+    min_rar = request.args.get("min_rarity", "0").strip()
+
+    if not _2E_DB.exists():
+        body = "<h1>Items</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
+        return render("Items", body)
+
+    try:
+        min_r = int(min_rar)
+    except ValueError:
+        min_r = 0
+    rows = _item_query(q, itype, min_r, 100)
+
+    type_opts = '<option value="">All types</option>'
+    for group, types in _ITEM_TYPE_GROUPS.items():
+        type_opts += f'<optgroup label="{html.escape(group)}">'
+        for t in types:
+            label = _ITEM_TYPE_LABELS.get(t, t)
+            sel = "selected" if itype == t else ""
+            type_opts += f'<option value="{t}" {sel}>{html.escape(label)}</option>'
+        type_opts += '</optgroup>'
+
+    rarity_opts = (
+        '<option value="0">Any rarity</option>'
+        + f'<option value="30" {"selected" if min_rar == "30" else ""}>Rare+</option>'
+        + f'<option value="45" {"selected" if min_rar == "45" else ""}>Very Rare+</option>'
+    )
+
+    controls = (
+        f'<div style="margin-bottom:20px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        f'<input id="item-q" value="{html.escape(q)}" placeholder="Search items…" {INPUT_STYLE} autocomplete="off">'
+        f'<select id="item-type" {SELECT_STYLE}>{type_opts}</select>'
+        f'<select id="item-min-rarity" {SELECT_STYLE}>{rarity_opts}</select>'
+        f'</div>'
+    )
+
+    body = (
+        f"<h1>Items</h1>{controls}"
+        f'<div id="item-results">{_item_results_html(rows)}</div>'
+        + _ITEMS_JS
+    )
+    return render("Items", body)
+
+
+@app.route("/items/<int:item_id>")
+def item_detail(item_id: int):
+    if not _2E_DB.exists():
+        abort(404)
+
+    conn = sqlite3.connect(str(_2E_DB))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    conn.close()
+
+    if row is None:
+        abort(404)
+
+    def stat(label, val):
+        if val is None or val == "":
+            return ""
+        return (
+            f'<tr><th style="width:160px;white-space:nowrap">{html.escape(label)}</th>'
+            f'<td>{html.escape(str(val))}</td></tr>'
+        )
+
+    type_label = _ITEM_TYPE_LABELS.get(row["item_type"], row["item_type"] or "—")
+    table = (
+        "<table>"
+        + stat("Type",    type_label)
+        + stat("Cost",    row["cost"])
+        + stat("Weight",  row["weight"])
+        + stat("Rarity",  _rarity_label(row["rarity"]))
+        + stat("Source",  row["source"])
+    )
+    if row["ac"] is not None:
+        table += stat("Armour Class", row["ac"])
+    if row["speed"] is not None:
+        table += (
+            stat("Size",       row["size"])
+            + stat("Type",     row["weapon_type"])
+            + stat("Speed",    row["speed"])
+            + stat("Dmg S/M",  row["damage_sm"])
+            + stat("Dmg L",    row["damage_l"])
+        )
+        if row["rof"]:
+            table += (
+                stat("Rate of Fire", row["rof"])
+                + stat("Range S",   row["range_s"])
+                + stat("Range M",   row["range_m"])
+                + stat("Range L",   row["range_l"])
+            )
+    if row["xp_value"] is not None:
+        table += stat("XP Value", row["xp_value"])
+    table += "</table>"
+
+    desc_html = _markdown_to_html(row["description"]) if row["description"] else ""
+
+    body = (
+        f'<p><a href="/items">← Items</a></p>'
+        f'<h1>{html.escape(row["name"])}</h1>'
+        f'<div class="card">{table}</div>'
+        + (f'<div class="card" style="margin-top:12px">{desc_html}</div>' if desc_html else "")
+    )
+    return render(f'{html.escape(row["name"])} — Items', body)
+
+
+# ---------------------------------------------------------------------------
 # Combat map
 # ---------------------------------------------------------------------------
 
 _COMBAT_CSS = """
 <style>
-.combat-layout{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+.container{max-width:1400px}
+.combat-layout{display:flex;gap:20px;align-items:flex-start;flex-wrap:nowrap}
 .combat-canvas-wrap{flex:1 1 auto;overflow-x:auto;min-width:0}
 #cmap{display:block;cursor:crosshair;border:1px solid #4a3828;border-radius:4px}
-.combat-sidebar{flex:0 0 200px;width:200px}
+.combat-sidebar{flex:0 0 210px;width:210px;flex-shrink:0}
+.zoom-btn{background:#2a2018;border:1px solid #4a3828;color:#c8a96e;padding:2px 9px;
+  border-radius:3px;cursor:pointer;font-size:1em;line-height:1.4}
+.zoom-btn:hover{background:#3a3020}
 .init-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;
   margin:2px 0;border-left:3px solid transparent}
 .init-row.party{border-left-color:#4a8c4a}
@@ -1358,6 +1682,11 @@ _COMBAT_CSS = """
 _COMBAT_JS = (
     'var map = new CombatMap(document.getElementById("cmap"), {cellPx: 36});\n'
     'var initListEl = document.getElementById("init-list");\n'
+    '\n'
+    'map.onZoom = function(z) {\n'
+    '  var el = document.getElementById("zoom-label");\n'
+    '  if (el) el.textContent = Math.round(z*100)+"%";\n'
+    '};\n'
     '\n'
     'map.onHover = function(x, y) {\n'
     '  document.getElementById("coords").textContent = "("+x+", "+y+") — click to copy";\n'
@@ -1404,20 +1733,27 @@ def combat_view():
     body = (
         _COMBAT_CSS
         + f'<h1>Combat Map</h1>'
-        + '<div style="display:flex;gap:16px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px">'
+        + '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px">'
         + '  <span id="round-info" style="color:#c8a96e;font-weight:bold">Loading…</span>'
         + '  <span id="turn-info" style="color:#d4c5a9"></span>'
-        + '  <span id="coords" style="color:#8a7a60;font-size:.85em;margin-left:auto">'
-        + 'hover map for coordinates</span>'
+        + '  <span style="margin-left:auto;display:flex;gap:5px;align-items:center">'
+        + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*1.25)">+</button>'
+        + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*0.8)">−</button>'
+        + '    <button class="zoom-btn" onclick="map.setZoom(1)" title="Reset zoom">□</button>'
+        + '    <span id="zoom-label" style="color:#8a7a60;font-size:.8em;min-width:36px;text-align:right">100%</span>'
+        + '  </span>'
+        + '</div>'
+        + '<div style="color:#8a7a60;font-size:.8em;margin-bottom:8px">'
+        + '  <span id="coords">hover map for coordinates · scroll to zoom</span>'
         + '</div>'
         + '<div class="combat-layout">'
-        + '  <div class="combat-canvas-wrap">'
-        + '    <canvas id="cmap"></canvas>'
-        + '    <div id="unplaced" style="margin-top:6px"></div>'
-        + '  </div>'
         + '  <div class="combat-sidebar">'
         + '    <h3 style="margin:0 0 8px;font-size:.95em;color:#c8a96e">Initiative Order</h3>'
         + '    <div id="init-list"></div>'
+        + '  </div>'
+        + '  <div class="combat-canvas-wrap">'
+        + '    <canvas id="cmap"></canvas>'
+        + '    <div id="unplaced" style="margin-top:6px"></div>'
         + '  </div>'
         + '</div>'
         + '<script src="/static/combat-map.js"></script>'

@@ -1,5 +1,6 @@
 """Combat map — DSL parser, grid state, combatant positioning."""
 import json
+import re
 from pathlib import Path
 
 import _campaign as _c
@@ -9,12 +10,12 @@ BASE_DIR = Path(__file__).parent.parent
 
 # Built-in terrain styles — override or extend with STYLE declarations in DSL
 _DEFAULT_STYLES: dict[str, dict] = {
-    "WALL":   {"color": "#5C3D2E", "symbol": "█", "passable": "no"},
-    "DOOR":   {"color": "#8B6914", "symbol": "D", "passable": "yes"},
+    "WALL":   {"color": "#5C3D2E", "symbol": "█", "passable": "no",  "texture": "/static/textures/stone.png"},
+    "DOOR":   {"color": "#8B6914", "symbol": "D", "passable": "yes", "texture": "/static/textures/wood.png"},
     "ROCK":   {"color": "#696969", "symbol": "◆", "passable": "no"},
     "PILLAR": {"color": "#808080", "symbol": "O", "passable": "no"},
     "COLUMN": {"color": "#808080", "symbol": "O", "passable": "no"},
-    "TABLE":  {"color": "#7B5C3A", "symbol": "T", "passable": "no"},
+    "TABLE":  {"color": "#7B5C3A", "symbol": "T", "passable": "no",  "texture": "/static/textures/wood.png"},
     "WATER":  {"color": "#4169E1", "symbol": "~", "passable": "slow"},
     "PIT":    {"color": "#1a1a1a", "symbol": "○", "passable": "fall"},
     "TREE":   {"color": "#228B22", "symbol": "♠", "passable": "no"},
@@ -35,7 +36,27 @@ _DEFAULT_STYLES: dict[str, dict] = {
 
 
 def _parse_dsl(dsl: str) -> dict:
-    """Parse map DSL → grid dict. Unknown terrain types without a prior STYLE are an error."""
+    """Parse map DSL → grid dict.
+
+    Supports two style syntaxes:
+
+    Inline (single line):
+        STYLE WALL color=#5C3D2E symbol=█ passable=no texture=/static/textures/stone.png
+
+    Block (Structurizr-style):
+        styles {
+            WALL {
+                color   #5C3D2E
+                symbol  █
+                passable no
+                texture /static/textures/stone.png
+            }
+            DOOR {
+                color   #8B6914
+                texture /static/textures/wood.png
+            }
+        }
+    """
     width  = 20
     height = 15
     scale  = "5ft"
@@ -43,15 +64,50 @@ def _parse_dsl(dsl: str) -> dict:
     cells:  dict[str, str]  = {}
     errors: list[str]       = []
 
-    for lineno, raw in enumerate(dsl.splitlines(), 1):
+    lines   = dsl.splitlines()
+    lineno  = 0
+    n_lines = len(lines)
+
+    while lineno < n_lines:
+        raw  = lines[lineno]
+        lineno += 1
         line = raw.strip()
+
         if not line or line.startswith("#"):
             continue
 
         tokens = line.split()
         cmd    = tokens[0].upper()
 
-        if cmd == "MAP":
+        # ── Block style syntax: styles { WALL { ... } } ──────────────────────
+        if cmd == "STYLES" and len(tokens) >= 2 and tokens[1] == "{":
+            while lineno < n_lines:
+                inner = lines[lineno].strip()
+                lineno += 1
+                if inner == "}":
+                    break
+                if not inner or inner.startswith("#"):
+                    continue
+                itok  = inner.split()
+                stype = itok[0].upper()
+                if len(itok) >= 2 and itok[1] == "{":
+                    # Read key-value pairs until closing }
+                    attrs: dict = {}
+                    while lineno < n_lines:
+                        prop = lines[lineno].strip()
+                        lineno += 1
+                        if prop == "}":
+                            break
+                        if not prop or prop.startswith("#"):
+                            continue
+                        ptok = prop.split(None, 1)
+                        if len(ptok) == 2:
+                            attrs[ptok[0].lower()] = ptok[1].strip()
+                    merged = dict(styles.get(stype, {}))
+                    merged.update(attrs)
+                    styles[stype] = merged
+
+        elif cmd == "MAP":
             try:
                 w_str, h_str = tokens[1].lower().split("x")
                 width, height = int(w_str), int(h_str)
@@ -62,11 +118,12 @@ def _parse_dsl(dsl: str) -> dict:
             scale = tokens[1] if len(tokens) > 1 else "5ft"
 
         elif cmd == "STYLE":
+            # Inline: STYLE TYPE key=value ...
             if len(tokens) < 2:
                 errors.append(f"L{lineno}: STYLE requires a type name")
                 continue
             stype = tokens[1].upper()
-            attrs: dict = {}
+            attrs = {}
             for tok in tokens[2:]:
                 if "=" in tok:
                     k, v = tok.split("=", 1)
@@ -118,7 +175,9 @@ def _portrait_url(key: str | None, name: str, side: str) -> str | None:
                 pass
 
     # Monster portrait: global/monsters/<slug>.<ext>
-    slug = name.lower().replace(" ", "_").replace("'", "").replace("-", "_")
+    # Strip trailing " #N" counters ("Goblin #2" → "goblin") then normalise.
+    base = re.sub(r'\s*#\d+\s*$', '', name).strip()
+    slug = re.sub(r'[^a-z0-9]+', '_', base.lower()).strip('_')
     for ext in ("png", "jpg", "webp"):
         if (BASE_DIR / "global" / "monsters" / f"{slug}.{ext}").exists():
             return f"/monsters/portraits/{slug}.{ext}"
