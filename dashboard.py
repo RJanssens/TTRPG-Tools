@@ -15,6 +15,7 @@ import _campaign as _c
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
+_2E_DB        = Path(__file__).parent / "global" / "2e.db"
 
 # ---------------------------------------------------------------------------
 # Global state — set in main()
@@ -152,6 +153,9 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/characters">Characters</a>
   <a href="/locations">Locations</a>
   <a href="/monsters">Monsters</a>
+  <a href="/spells">Spells</a>
+  <a href="/classes">Classes</a>
+  <a href="/combat">Combat</a>
 </nav>
 <div class="container">
 {body}
@@ -979,6 +983,459 @@ def monster_detail(slug: str):
         + (f'<div class="card" style="margin-top:12px">{desc_html}</div>' if desc_html else "")
     )
     return render(f"{html.escape(name)} — Monsters", body)
+
+
+# ---------------------------------------------------------------------------
+# Spells
+# ---------------------------------------------------------------------------
+
+_SPELL_SCHOOLS = [
+    "Abjuration", "Alteration", "Conjuration", "Divination",
+    "Enchantment", "Evocation", "Illusion", "Necromancy",
+]
+
+SELECT_STYLE = (
+    'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
+    'padding:6px 10px;border-radius:4px;font-size:1em"'
+)
+INPUT_STYLE = (
+    'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
+    'padding:6px 10px;border-radius:4px;width:220px;font-size:1em"'
+)
+BTN_STYLE = (
+    'style="background:#3a2818;border:1px solid #5a4030;color:#c8a96e;'
+    'padding:6px 14px;border-radius:4px;cursor:pointer"'
+)
+
+
+def _spell_card(r) -> str:
+    return (
+        f'<div class="card" style="padding:8px 14px">'
+        f'<h2 style="margin:0 0 2px">'
+        f'<a href="/spells/{r["id"]}">{html.escape(r["name"])}</a></h2>'
+        f'<p class="muted" style="margin:0;font-size:.9em">'
+        f'Level&nbsp;{html.escape(str(r["level"] or "—"))} &nbsp;·&nbsp; '
+        f'{html.escape(r["school"] or "—")} &nbsp;·&nbsp; '
+        f'CT&nbsp;{html.escape(str(r["casting_time"] or "—"))}'
+        f'</p></div>'
+    )
+
+
+def _spell_section(title: str, rows) -> str:
+    if not rows:
+        return ""
+    cards = "".join(_spell_card(r) for r in rows)
+    count = f"<span class='muted' style='font-size:.85em;margin-left:8px'>({len(rows)})</span>"
+    return f"<h2 style='margin-top:24px'>{html.escape(title)}{count}</h2>{cards}"
+
+
+@app.route("/spells")
+def spells():
+    q      = request.args.get("q", "").strip()
+    caster = request.args.get("caster", "").strip().lower()
+    level  = request.args.get("level", "").strip()
+    school = request.args.get("school", "").strip()
+
+    if not _2E_DB.exists():
+        body = "<h1>Spells</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
+        return render("Spells", body)
+
+    conn = sqlite3.connect(str(_2E_DB))
+    conn.row_factory = sqlite3.Row
+
+    where, params = ["1=1"], []
+    if q:
+        where.append("name LIKE ? COLLATE NOCASE")
+        params.append(f"%{q}%")
+    if caster:
+        where.append("lower(caster) = ?")
+        params.append(caster)
+    if level.isdigit():
+        where.append("level = ?")
+        params.append(int(level))
+    if school:
+        where.append("school LIKE ? COLLATE NOCASE")
+        params.append(f"%{school}%")
+
+    rows = conn.execute(
+        f"SELECT id, name, level, school, caster, casting_time FROM spells "
+        f"WHERE {' AND '.join(where)} ORDER BY level, name",
+        params,
+    ).fetchall()
+    conn.close()
+
+    # Build filter form
+    school_opts = '<option value="">All schools</option>' + "".join(
+        f'<option value="{s}" {"selected" if school == s else ""}>{s}</option>'
+        for s in _SPELL_SCHOOLS
+    )
+    level_opts = '<option value="">All levels</option>' + "".join(
+        f'<option value="{i}" {"selected" if level == str(i) else ""}>Level {i}</option>'
+        for i in range(1, 10)
+    )
+    def _radio(val, label, current):
+        chk = "checked" if current == val else ""
+        return (
+            f'<label style="display:inline-flex;align-items:center;gap:4px;'
+            f'cursor:pointer;color:#d4c5a9;font-size:.95em">'
+            f'<input type="radio" name="caster" value="{val}" {chk} '
+            f'style="accent-color:#c8a96e"> {label}</label>'
+        )
+
+    radios = (
+        f'<div style="display:flex;gap:14px;align-items:center;'
+        f'background:#2a2018;border:1px solid #4a3828;border-radius:4px;padding:6px 12px">'
+        + _radio("", "Both", caster)
+        + _radio("wizard", "Wizard", caster)
+        + _radio("priest", "Priest", caster)
+        + f'</div>'
+    )
+
+    search_box = (
+        f'<form method="get" style="margin-bottom:20px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+        f'<input name="q" value="{html.escape(q)}" placeholder="Search by name…" {INPUT_STYLE}>'
+        f'{radios}'
+        f'<select name="school" {SELECT_STYLE}>{school_opts}</select>'
+        f'<select name="level" {SELECT_STYLE}>{level_opts}</select>'
+        f'<button type="submit" {BTN_STYLE}>Filter</button>'
+        f'</form>'
+    )
+
+    if not rows:
+        body = f"<h1>Spells</h1>{search_box}<p class='muted'>No results.</p>"
+        return render("Spells", body)
+
+    # Separate into wizard / priest when no caster filter is active
+    if not caster:
+        wizard_rows  = [r for r in rows if (r["caster"] or "").lower() == "wizard"]
+        priest_rows  = [r for r in rows if (r["caster"] or "").lower() == "priest"]
+        other_rows   = [r for r in rows if (r["caster"] or "").lower() not in ("wizard", "priest")]
+        total = len(rows)
+        sections = (
+            _spell_section("Wizard Spells", wizard_rows)
+            + _spell_section("Priest Spells", priest_rows)
+            + _spell_section("Other", other_rows)
+        )
+        body = (
+            f"<h1>Spells</h1>{search_box}"
+            f"<p class='muted' style='margin-bottom:4px'>{total} spell{'s' if total != 1 else ''}</p>"
+            f"{sections}"
+        )
+    else:
+        title = "Wizard Spells" if caster == "wizard" else "Priest Spells"
+        body = (
+            f"<h1>{title}</h1>{search_box}"
+            f"<p class='muted' style='margin-bottom:4px'>{len(rows)} spell{'s' if len(rows) != 1 else ''}</p>"
+            + "".join(_spell_card(r) for r in rows)
+        )
+
+    return render("Spells", body)
+
+
+@app.route("/spells/<int:spell_id>")
+def spell_detail(spell_id: int):
+    if not _2E_DB.exists():
+        abort(404)
+
+    conn = sqlite3.connect(str(_2E_DB))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM spells WHERE id=?", (spell_id,)).fetchone()
+    conn.close()
+
+    if row is None:
+        abort(404)
+
+    def stat(label, val):
+        if not val and val != 0:
+            return ""
+        return (
+            f'<tr><th style="width:160px;white-space:nowrap">{html.escape(label)}</th>'
+            f'<td>{html.escape(str(val))}</td></tr>'
+        )
+
+    components = []
+    if row["verbal"]:  components.append("V")
+    if row["somatic"]: components.append("S")
+    if row["material"]:components.append("M")
+    comp_str = ", ".join(components) or "—"
+    if row["materials"]:
+        comp_str += f" ({html.escape(row['materials'])})"
+
+    table = (
+        "<table>"
+        + stat("Caster",       (row["caster"] or "").capitalize())
+        + stat("Level",        row["level"])
+        + stat("School",       row["school"])
+        + stat("Casting Time", row["casting_time"])
+        + stat("Range",        row["range"])
+        + stat("Area of Effect", row["aoe"])
+        + stat("Duration",     row["duration"])
+        + stat("Saving Throw", row["save"])
+        + stat("Damage",       row["damage"])
+        + f'<tr><th>Components</th><td>{comp_str}</td></tr>'
+        + stat("Reversible",   "Yes" if row["reversible"] else None)
+        + stat("Source",       f"{row['source']} p.{row['page']}" if row["source"] else None)
+        + "</table>"
+    )
+
+    desc_html = ""
+    if row["description"]:
+        paras = [p.strip() for p in row["description"].split("\n") if p.strip()]
+        desc_html = "".join(f"<p>{html.escape(p)}</p>" for p in paras)
+
+    body = (
+        f'<p><a href="/spells">← Spells</a></p>'
+        f'<h1>{html.escape(row["name"])}</h1>'
+        f'<div class="card">{table}</div>'
+        + (f'<div class="card" style="margin-top:12px">{desc_html}</div>' if desc_html else "")
+    )
+    return render(f'{html.escape(row["name"])} — Spells', body)
+
+
+# ---------------------------------------------------------------------------
+# Classes
+# ---------------------------------------------------------------------------
+
+@app.route("/classes")
+def classes():
+    if not _2E_DB.exists():
+        body = "<h1>Classes</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
+        return render("Classes", body)
+
+    conn = sqlite3.connect(str(_2E_DB))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT id, name, hit_die, prime_requisite FROM classes ORDER BY name").fetchall()
+    conn.close()
+
+    cards = []
+    for r in rows:
+        slug = re.sub(r"[^a-z0-9]+", "-", r["name"].lower()).strip("-")
+        try:
+            pr = json.loads(r["prime_requisite"] or "[]")
+            pr_str = ", ".join(pr).capitalize() if pr else "—"
+        except (json.JSONDecodeError, TypeError):
+            pr_str = str(r["prime_requisite"] or "—")
+        cards.append(
+            f'<div class="card" style="padding:10px 14px">'
+            f'<h2 style="margin:0 0 2px">'
+            f'<a href="/classes/{html.escape(slug)}">{html.escape(r["name"])}</a></h2>'
+            f'<p class="muted" style="margin:0;font-size:.9em">'
+            f'Hit Die: {html.escape(r["hit_die"] or "—")} &nbsp;·&nbsp; '
+            f'Prime Requisite: {html.escape(pr_str)}'
+            f'</p></div>'
+        )
+
+    body = "<h1>Classes</h1>" + "".join(cards)
+    return render("Classes", body)
+
+
+@app.route("/classes/<slug>")
+def class_detail(slug: str):
+    if not _2E_DB.exists():
+        abort(404)
+
+    name_pattern = slug.replace("-", " ")
+    conn = sqlite3.connect(str(_2E_DB))
+    conn.row_factory = sqlite3.Row
+    cls_row = conn.execute(
+        "SELECT * FROM classes WHERE lower(replace(name,' ','-')) = ? "
+        "OR name LIKE ? COLLATE NOCASE LIMIT 1",
+        (slug, f"%{name_pattern}%"),
+    ).fetchone()
+
+    if cls_row is None:
+        conn.close()
+        abort(404)
+
+    level_rows = conn.execute(
+        "SELECT * FROM class_levels WHERE class_id=? ORDER BY level",
+        (cls_row["id"],),
+    ).fetchall()
+    conn.close()
+
+    try:
+        pr = json.loads(cls_row["prime_requisite"] or "[]")
+        pr_str = ", ".join(str(p).capitalize() for p in pr) if pr else "—"
+    except (json.JSONDecodeError, TypeError):
+        pr_str = str(cls_row["prime_requisite"] or "—")
+
+    try:
+        abilities = json.loads(cls_row["special_abilities"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        abilities = []
+
+    # Build XP / progression table
+    has_spells    = any(r["spell_slots"] for r in level_rows)
+    has_turn      = any(r["turn_undead"] for r in level_rows)
+
+    header_cells = "<tr><th>Level</th><th>XP</th><th>HD</th><th>THAC0</th>"
+    header_cells += "<th>Para</th><th>RSW</th><th>Pet</th><th>Brth</th><th>Spell</th>"
+    if has_spells:
+        header_cells += "<th>Spell Slots</th>"
+    header_cells += "</tr>"
+
+    tbody = ""
+    for r in level_rows:
+        slots_str = ""
+        if has_spells and r["spell_slots"]:
+            try:
+                slots = json.loads(r["spell_slots"])
+                slots_str = " / ".join(str(v) for k, v in sorted(slots.items()) if v)
+            except Exception:
+                slots_str = "—"
+
+        xp = f"{r['xp_required']:,}" if r["xp_required"] is not None else "—"
+        tbody += (
+            f"<tr>"
+            f"<td>{r['level']}</td>"
+            f"<td>{xp}</td>"
+            f"<td>{html.escape(r['hit_dice'] or '—')}</td>"
+            f"<td>{r['thac0'] or '—'}</td>"
+            f"<td>{r['save_paralysis'] or '—'}</td>"
+            f"<td>{r['save_rsw'] or '—'}</td>"
+            f"<td>{r['save_petrify'] or '—'}</td>"
+            f"<td>{r['save_breath'] or '—'}</td>"
+            f"<td>{r['save_spell'] or '—'}</td>"
+            + (f"<td>{slots_str or '—'}</td>" if has_spells else "")
+            + "</tr>"
+        )
+
+    prog_table = f"<table><thead>{header_cells}</thead><tbody>{tbody}</tbody></table>"
+
+    abilities_html = ""
+    if abilities:
+        items = "".join(f"<li>{html.escape(str(a))}</li>" for a in abilities)
+        abilities_html = f"<h2>Special Abilities</h2><ul>{items}</ul>"
+
+    desc_html = ""
+    if cls_row["description"]:
+        paras = [p.strip() for p in cls_row["description"].split("\n") if p.strip()]
+        desc_html = "".join(f"<p>{html.escape(p)}</p>" for p in paras[:4])
+        if len(paras) > 4:
+            desc_html += f"<p class='muted'>…{len(paras)-4} more paragraphs</p>"
+
+    body = (
+        f'<p><a href="/classes">← Classes</a></p>'
+        f'<h1>{html.escape(cls_row["name"])}</h1>'
+        f'<div class="card">'
+        f'<p><strong>Hit Die:</strong> {html.escape(cls_row["hit_die"] or "—")} &nbsp;·&nbsp; '
+        f'<strong>Prime Requisite:</strong> {html.escape(pr_str)}</p>'
+        + (f"<hr>{desc_html}" if desc_html else "")
+        + f'</div>'
+        f'<h2 style="margin-top:20px">Progression</h2>'
+        f'<div class="card" style="overflow-x:auto">{prog_table}</div>'
+        + (f'<div class="card">{abilities_html}</div>' if abilities_html else "")
+    )
+    return render(f'{html.escape(cls_row["name"])} — Classes', body)
+
+
+# ---------------------------------------------------------------------------
+# Combat map
+# ---------------------------------------------------------------------------
+
+_COMBAT_CSS = """
+<style>
+.combat-layout{display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap}
+.combat-canvas-wrap{flex:1 1 auto;overflow-x:auto;min-width:0}
+#cmap{display:block;cursor:crosshair;border:1px solid #4a3828;border-radius:4px}
+.combat-sidebar{flex:0 0 200px;width:200px}
+.init-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:4px;
+  margin:2px 0;border-left:3px solid transparent}
+.init-row.party{border-left-color:#4a8c4a}
+.init-row.enemy{border-left-color:#8c2a2a}
+.init-current{background:#2a2218}
+.init-portrait{width:34px;height:34px;border-radius:50%;overflow:hidden;flex-shrink:0;
+  background:#3a2818;display:flex;align-items:center;justify-content:center;
+  color:#d4c5a9;font-weight:bold;font-size:14px;border:2px solid #666}
+.init-portrait img{width:100%;height:100%;object-fit:cover}
+.init-info{flex:1;display:flex;justify-content:space-between;align-items:center;min-width:0}
+.init-name{font-size:.88em;color:#d4c5a9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.init-current .init-name{color:#c8a96e;font-weight:bold}
+.init-val{color:#8a7a60;font-size:.85em;font-family:monospace;margin-left:6px;flex-shrink:0}
+</style>
+"""
+
+_COMBAT_JS = (
+    'var map = new CombatMap(document.getElementById("cmap"), {cellPx: 36});\n'
+    'var initListEl = document.getElementById("init-list");\n'
+    '\n'
+    'map.onHover = function(x, y) {\n'
+    '  document.getElementById("coords").textContent = "("+x+", "+y+") — click to copy";\n'
+    '};\n'
+    '\n'
+    'map.onClick = function(x, y) {\n'
+    '  document.getElementById("coords").textContent = \'place_combatant("name", \'+x+", "+y+")";\n'
+    '};\n'
+    '\n'
+    'async function refresh() {\n'
+    '  try {\n'
+    '    var r = await fetch("/combat-state");\n'
+    '    var data = await r.json();\n'
+    '    if (!data.active || !data.grid) {\n'
+    '      document.getElementById("round-info").textContent = "No active combat map";\n'
+    '      document.getElementById("turn-info").textContent = "";\n'
+    '      initListEl.innerHTML = \'<p class="muted" style="font-size:.85em">No combat active</p>\';\n'
+    '      return;\n'
+    '    }\n'
+    '    document.getElementById("round-info").textContent = "Round " + data.round;\n'
+    '    document.getElementById("turn-info").textContent = "▶ " + (data.current || "");\n'
+    '    map.render(data);\n'
+    '    map.renderInitList(initListEl, data.combatants || []);\n'
+    '    var unplaced = (data.combatants || []).filter(function(c){\n'
+    '      return c.x === null || c.x === undefined;\n'
+    '    });\n'
+    '    document.getElementById("unplaced").innerHTML = unplaced.length\n'
+    '      ? \'<span style="color:#8a7a60;font-size:.85em">Unplaced: \'\n'
+    '        + unplaced.map(function(c){ return c.name; }).join(", ")\n'
+    '        + \'</span>\'\n'
+    '      : "";\n'
+    '  } catch(e) {\n'
+    '    document.getElementById("round-info").textContent = "Waiting for combat…";\n'
+    '  }\n'
+    '}\n'
+    'refresh();\n'
+    'setInterval(refresh, 2000);\n'
+)
+
+
+@app.route("/combat")
+def combat_view():
+    name = html.escape(cfg.get("name", "Campaign"))
+    body = (
+        _COMBAT_CSS
+        + f'<h1>Combat Map</h1>'
+        + '<div style="display:flex;gap:16px;align-items:baseline;flex-wrap:wrap;margin-bottom:12px">'
+        + '  <span id="round-info" style="color:#c8a96e;font-weight:bold">Loading…</span>'
+        + '  <span id="turn-info" style="color:#d4c5a9"></span>'
+        + '  <span id="coords" style="color:#8a7a60;font-size:.85em;margin-left:auto">'
+        + 'hover map for coordinates</span>'
+        + '</div>'
+        + '<div class="combat-layout">'
+        + '  <div class="combat-canvas-wrap">'
+        + '    <canvas id="cmap"></canvas>'
+        + '    <div id="unplaced" style="margin-top:6px"></div>'
+        + '  </div>'
+        + '  <div class="combat-sidebar">'
+        + '    <h3 style="margin:0 0 8px;font-size:.95em;color:#c8a96e">Initiative Order</h3>'
+        + '    <div id="init-list"></div>'
+        + '  </div>'
+        + '</div>'
+        + '<script src="/static/combat-map.js"></script>'
+        + '<script>' + _COMBAT_JS + '</script>'
+    )
+    return render(f"Combat — {name}", body)
+
+
+@app.route("/combat-state")
+def combat_state():
+    cs = cfg.get("_dir", Path(".")) / "combat_state.json"
+    if cs.exists():
+        try:
+            data = json.loads(cs.read_text(encoding="utf-8"))
+            return jsonify(data)
+        except Exception:
+            pass
+    return jsonify({"active": False})
 
 
 # ---------------------------------------------------------------------------
