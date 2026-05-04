@@ -18,13 +18,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp.server.fastmcp import FastMCP
-from tools import dice, party, combat, world, lore, log, lookup, images, campaign_mgmt
+from tools import dice, party, combat, combat_map, world, lore, log, lookup, images, campaign_mgmt
 
 mcp = FastMCP("TTRPG Campaign Manager")
 
 dice.register(mcp)
 party.register(mcp)
 combat.register(mcp)
+combat_map.register(mcp)
 world.register(mcp)
 lore.register(mcp)
 log.register(mcp)

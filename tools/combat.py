@@ -72,6 +72,7 @@ def register(mcp):
             "round":       1,
             "current_idx": 0,
             "combatants":  [],
+            "grid":        None,
         }
 
         party_loaded = []
@@ -93,6 +94,8 @@ def register(mcp):
                 "init":         None,
                 "conditions":   conditions,
                 "_key":         key,
+                "x":            None,
+                "y":            None,
             })
             party_loaded.append(char["label"])
 
@@ -129,6 +132,8 @@ def register(mcp):
             "side":         side,
             "init":         None,
             "conditions":   [],
+            "x":            None,
+            "y":            None,
         })
 
         return {"name": name, "hp": hp, "ac": ac, "thac0": thac0, "side": side}
@@ -491,6 +496,11 @@ def register(mcp):
             "rounds":   rounds,
             "party_hp": party_hp,
         })
+
+        # Remove dashboard map state file
+        cs_file = cfg["_dir"] / "combat_state.json"
+        if cs_file.exists():
+            cs_file.unlink()
 
         _session = None
         return {"saved": saved, "rounds": rounds}

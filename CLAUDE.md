@@ -86,11 +86,12 @@ Monsters and enemies act according to their actual intelligence and instincts �
 
 1. Call `start_combat()` — loads party, resets session
 2. Call `add_combatant(name, hp, ac, thac0, dmg, weapon_speed)` for each enemy (use `monster_lookup` first)
-3. Call `roll_initiative()` — individual per combatant, lower total acts first (d10 + weapon speed)
-4. Spellcasters declare their spell **before** initiative is rolled. Add condition "casting" with `add_condition`. If they take damage before their turn, the spell is disrupted automatically.
+3. Spellcasters declare their spell **before** initiative is rolled. Call `declare_spell(character, spell_name)` — this looks up casting time from the spell DB, sets the caster's initiative modifier accordingly, and adds the "casting" condition automatically. If they take damage before their turn, the spell is disrupted automatically.
+4. Call `roll_initiative()` — individual per combatant, lower total acts first (d10 + weapon speed or casting time)
 5. Resolve in order: `attack()`, `apply_combat_damage()`, `next_turn()`
 6. Use conditions for situational modifiers: `charging`, `rear`, `fleeing`, `set_vs_charge`, `casting`
-7. Call `end_combat()` when done — saves HP to state, writes event log entry
+7. **Healing during combat:** use `apply_combat_heal(name, amount)` — not `apply_heal()`. The latter writes to the character file but does not update the in-session HP tracker.
+8. Call `end_combat()` when done — saves HP to state, writes event log entry
 
 **Situational rules:**
 - Rear attack: +2 to hit, defender loses DEX AC bonus → pass `condition="rear"`
@@ -133,7 +134,7 @@ After rest:
 ## Impartiality Rules
 
 - Roll dice honestly. Report the result. Do not fudge.
-- Death at 0 HP is death. Do not soften it.
+- **HP thresholds:** 0 HP = unconscious and stable (can't act, not dying). −1 to −9 HP = unconscious and bleeding (loses 1 HP per round automatically at each new round — handled by `next_turn()`). −10 HP = dead. Do not soften any of these outcomes.
 - Treasure: always `monster_lookup(name)` for treasure type, then `generate_treasure(type)`. Never invent amounts.
 - Reaction rolls: always `reaction()` for first NPC encounters. Don't skip it because you have a narrative preference.
 - Morale: always `morale_check(rating)` at 50% casualties. Enemies who break, flee.
@@ -163,6 +164,14 @@ Award at natural break points — end of encounter, objective completed, session
 - Standard enemy: 65 XP (or HD × 15 for unusual creatures)
 - Objective completed: 100–300 XP depending on difficulty
 - Exceptional roleplay or clever solution: 25–50 XP bonus
+
+---
+
+## Reference Lookups
+
+- `spell_lookup(name, caster?)` — full spell details: casting time, casting_time_init (1–10 for initiative), range, AOE, duration, save, components, description. `caster` filter: `"wizard"` or `"priest"`. Use before any spell ruling where you need the exact mechanics.
+- `class_lookup(class_name, level)` — level-specific data: THAC0, all saves, spell slots, XP required and XP to next level. Pass `level=0` for the full XP progression table. Use when a character levels up or when a save needs to be set.
+- `monster_lookup(name)` — stats, treasure type, morale, XP value.
 
 ---
 
