@@ -1,0 +1,55 @@
+{
+  "current_day": 1,
+  "current_session": 1,
+  "coin": {
+    "gp": 0,
+    "ep": 0,
+    "sp": 0,
+    "cp": 0
+  },
+  "characters": {
+    "torven": {
+      "hp": 0,
+      "xp": 0,
+      "conditions": [],
+      "memorized_spells": []
+    },
+    "maren": {
+      "hp": 0,
+      "xp": 0,
+      "conditions": [],
+      "spell_slots": {
+        "1": 0
+      },
+      "memorized_spells": [
+        {
+          "name": "cure light wounds",
+          "level": 1,
+          "cast": true
+        }
+      ]
+    },
+    "peck": {
+      "hp": 0,
+      "xp": 0,
+      "conditions": [],
+      "memorized_spells": []
+    },
+    "zara": {
+      "hp": 0,
+      "xp": 0,
+      "conditions": [],
+      "spell_slots": {
+        "1": 1
+      },
+      "memorized_spells": [
+        {
+          "name": "sleep",
+          "level": 1,
+          "cast": false
+        }
+      ]
+    }
+  },
+  "combat": null
+}

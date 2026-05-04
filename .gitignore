@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Generated binary data (regeneratable)
+global/*.db
+global/monsters/
+
+# Copyrighted reference material
+campaigns/*/reference/
+global/reference/dmg.txt
+global/reference/monstermanual.txt
+global/reference/phb.txt
+
+# Generated images (regeneratable via API)
+campaigns/*/images/*.png
+campaigns/*/images/*.jpg
+campaigns/*/images/*.webp

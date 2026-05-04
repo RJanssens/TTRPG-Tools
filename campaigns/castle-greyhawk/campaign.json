@@ -1,0 +1,300 @@
+{
+  "name": "Castle Greyhawk",
+  "system": "AD&D 2nd Edition",
+  "world": "Greyhawk (the Flanaess)",
+  "tone": "high fantasy",
+  "data_dir": ".",
+  "default_character": "torven",
+  "session_log_file": "adventure_log.md",
+  "chronicle_file": "adventure_log.md",
+  "initial_coin": {
+    "gp": 0,
+    "ep": 0,
+    "sp": 0,
+    "cp": 0
+  },
+  "characters": {
+    "torven": {
+      "label": "Torven",
+      "cls": "Fighter",
+      "race": "human",
+      "gender": "male",
+      "hp_max": 9,
+      "thac0": 20,
+      "ac": 4,
+      "weapon": "1d8",
+      "weapon_speed": 5,
+      "bonus_hit": 1,
+      "bonus_dmg": 1,
+      "saves": [
+        14,
+        16,
+        15,
+        17,
+        17
+      ],
+      "level": 1,
+      "ability_scores": {
+        "str": 16,
+        "dex": 13,
+        "con": 15,
+        "int": 10,
+        "wis": 9,
+        "cha": 11
+      },
+      "background": "A former soldier of the Wild Coast militia, Torven mustered out after a border skirmish left his unit disbanded. He fights for coin now, but old instincts die hard \u2014 he still sleeps light and checks exits first.",
+      "attacks": [
+        {
+          "name": "Longsword",
+          "speed": 5,
+          "attacks": "1",
+          "thac0": 19,
+          "damage_sm": "1d8+2",
+          "damage_l": "1d12+2"
+        },
+        {
+          "name": "Dagger",
+          "speed": 2,
+          "attacks": "1",
+          "thac0": 19,
+          "damage_sm": "1d4+2",
+          "damage_l": "1d3+2",
+          "range": "10/20/30"
+        }
+      ],
+      "weapon_profs": [
+        "Longsword",
+        "Dagger",
+        "Light Crossbow"
+      ],
+      "nwps": [
+        "Riding, Land (WIS)",
+        "Endurance (CON)",
+        "Alertness (WIS)"
+      ],
+      "natural_abilities": [],
+      "portrait_prompt": "Portrait of a male human fighter, late 20s, battle-scarred face, short dark beard, wearing chain mail hauberk and carrying a heater shield, longsword at hip. Hard watchful eyes, compact muscular build. Wild Coast mercenary look."
+    },
+    "maren": {
+      "label": "Sister Maren",
+      "cls": "Cleric",
+      "race": "human",
+      "gender": "female",
+      "hp_max": 7,
+      "thac0": 20,
+      "ac": 5,
+      "weapon": "1d6+1",
+      "weapon_speed": 7,
+      "bonus_hit": 0,
+      "bonus_dmg": 0,
+      "saves": [
+        10,
+        14,
+        13,
+        16,
+        15
+      ],
+      "spell_slots": {
+        "1": 1
+      },
+      "memorized_spells": [
+        "cure light wounds"
+      ],
+      "level": 1,
+      "ability_scores": {
+        "str": 10,
+        "dex": 12,
+        "con": 13,
+        "int": 14,
+        "wis": 16,
+        "cha": 13
+      },
+      "background": "An acolyte of Pelor raised in a temple orphanage in Greyhawk City. Sister Maren took her vows young and has spent her novitiate tending the sick in the Artisan's Quarter. This is her first venture outside the city walls.",
+      "attacks": [
+        {
+          "name": "Mace",
+          "speed": 7,
+          "attacks": "1",
+          "thac0": 20,
+          "damage_sm": "1d6+1",
+          "damage_l": "1d6"
+        }
+      ],
+      "weapon_profs": [
+        "Mace",
+        "Flail",
+        "Staff"
+      ],
+      "nwps": [
+        "Healing (WIS)",
+        "Religion (INT)",
+        "Reading/Writing (INT)"
+      ],
+      "natural_abilities": [
+        "Turn Undead (as 1st-level cleric)"
+      ],
+      "portrait_prompt": "Portrait of a female human cleric of Pelor, early 20s, auburn hair in a practical braid, wearing chain mail with a golden sun medallion over it, mace at belt. Earnest warm expression, clear grey eyes, slight build. Young acolyte, not yet worn by the world."
+    },
+    "peck": {
+      "label": "Peck",
+      "cls": "Thief",
+      "race": "halfling",
+      "gender": "male",
+      "hp_max": 5,
+      "thac0": 20,
+      "ac": 7,
+      "weapon": "1d6",
+      "weapon_speed": 3,
+      "bonus_hit": 0,
+      "bonus_dmg": 0,
+      "saves": [
+        13,
+        14,
+        12,
+        16,
+        15
+      ],
+      "skills": {
+        "pick_pockets": 15,
+        "open_locks": 10,
+        "find_traps": 5,
+        "move_silently": 10,
+        "hide_shadows": 5,
+        "hear_noise": 15,
+        "climb_walls": 60,
+        "read_languages": 0
+      },
+      "level": 1,
+      "ability_scores": {
+        "str": 9,
+        "dex": 17,
+        "con": 12,
+        "int": 13,
+        "wis": 11,
+        "cha": 14
+      },
+      "background": "Peck spent three years as a fence for the Thieves' Guild in Greyhawk's Thieves' Quarter before a deal went sour. He left in a hurry with a small purse and a large debt, and has been keeping his distance from the city ever since.",
+      "attacks": [
+        {
+          "name": "Short Sword",
+          "speed": 3,
+          "attacks": "1",
+          "thac0": 20,
+          "damage_sm": "1d6",
+          "damage_l": "1d8"
+        },
+        {
+          "name": "Dagger (thrown)",
+          "speed": 2,
+          "attacks": "1",
+          "thac0": 20,
+          "damage_sm": "1d4",
+          "damage_l": "1d3",
+          "range": "10/20/30"
+        }
+      ],
+      "weapon_profs": [
+        "Short Sword",
+        "Dagger",
+        "Sling"
+      ],
+      "nwps": [
+        "Disguise (CHA)",
+        "Appraising (INT)",
+        "Alertness (WIS)"
+      ],
+      "natural_abilities": [
+        "+4 to all saving throws vs. magic and poison (halfling bonus)",
+        "+1 to hit with slings and thrown weapons",
+        "Move Silently as per thief skills (racial bonus included)",
+        "Detect sloping passages, unsafe construction (2-in-6)"
+      ],
+      "portrait_prompt": "Portrait of a male halfling thief, apparent age mid-20s (halfling), curly red hair, bright mischievous green eyes, wide roguish grin showing a chipped tooth. Wearing supple leather armour with many small pockets, short sword at hip. Small and wiry, quick-looking, slightly dusty."
+    },
+    "zara": {
+      "label": "Zara",
+      "cls": "Magic-User",
+      "race": "human",
+      "gender": "female",
+      "hp_max": 4,
+      "thac0": 20,
+      "ac": 10,
+      "weapon": "1d4",
+      "weapon_speed": 2,
+      "bonus_hit": 0,
+      "bonus_dmg": 0,
+      "saves": [
+        14,
+        11,
+        13,
+        15,
+        12
+      ],
+      "spell_slots": {
+        "1": 1
+      },
+      "memorized_spells": [
+        "sleep"
+      ],
+      "level": 1,
+      "ability_scores": {
+        "str": 8,
+        "dex": 14,
+        "con": 11,
+        "int": 17,
+        "wis": 12,
+        "cha": 13
+      },
+      "background": "Apprenticed to a sage in the University District of Greyhawk City, Zara copied texts and ground components for six years before her master died insolvent. She took his spellbook and his debts and decided adventuring was the faster path to solvency.",
+      "attacks": [
+        {
+          "name": "Dagger",
+          "speed": 2,
+          "attacks": "1",
+          "thac0": 20,
+          "damage_sm": "1d4",
+          "damage_l": "1d3",
+          "range": "10/20/30"
+        }
+      ],
+      "weapon_profs": [
+        "Dagger"
+      ],
+      "nwps": [
+        "Reading/Writing (INT)",
+        "Ancient History (INT)",
+        "Spellcraft (INT)"
+      ],
+      "natural_abilities": [],
+      "portrait_prompt": "Portrait of a female human magic-user, mid-20s, dark olive skin, sharp intelligent dark eyes, black hair pulled back with a quill tucked in it, ink stains on her fingers. Plain dark travelling robes, a well-worn spellbook tucked under one arm, small dagger at belt. Quietly intense expression."
+    }
+  },
+  "encounter_tables": {
+    "dungeon_l1": [],
+    "road": [],
+    "wilderness": [],
+    "urban": []
+  },
+  "encounter_frequency": {
+    "dungeon": {
+      "die": 6,
+      "threshold": 1,
+      "interval_minutes": 10
+    },
+    "wilderness": {
+      "die": 6,
+      "threshold": 1,
+      "interval_minutes": 240
+    },
+    "road": {
+      "die": 6,
+      "threshold": 1,
+      "interval_minutes": 60
+    },
+    "urban": {
+      "die": 20,
+      "threshold": 1,
+      "interval_minutes": 120
+    }
+  }
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "type": "combat",
+    "outcome": "ended",
+    "rounds": 2,
+    "party_hp": {
+      "Torven": 0,
+      "Peck": 0,
+      "Zara": 0,
+      "Sister Maren": 0
+    },
+    "day": 1,
+    "session": 1,
+    "timestamp": "2026-05-04T18:11:37"
+  }
+]

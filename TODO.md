@@ -1,0 +1,2 @@
+- Add store generator MCP (with price modifier & category/rarity specification - e.g. weapons, cheap, common)
+- Tactical combat map generator (show surroundings & players/NPCs on combat map in dashboard as well as initiative order)
