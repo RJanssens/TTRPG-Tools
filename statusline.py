@@ -8,16 +8,30 @@ BASE = Path(__file__).parent
 ACTIVE_FILE = BASE / ".active"
 CAMPAIGNS_DIR = BASE / "campaigns"
 
+# ANSI colours
+_R = "\033[0m"
+_GREEN  = "\033[32m"
+_YELLOW = "\033[33m"
+_RED    = "\033[31m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
 
-def _hp_str(cur: int, max_hp: int) -> str:
+
+def _c(text: str, *codes: str) -> str:
+    return "".join(codes) + text + _R
+
+
+def _hp_color(cur: int, max_hp: int) -> str:
     if max_hp == 0:
-        return str(cur)
+        return _c(str(cur), _DIM)
     if cur <= 0:
-        return f"0/{max_hp}†"
+        return _c(f"0/{max_hp}†", _RED, _BOLD)
     ratio = cur / max_hp
     if ratio <= 0.25:
-        return f"!{cur}/{max_hp}"
-    return f"{cur}/{max_hp}"
+        return _c(f"{cur}/{max_hp}", _RED)
+    if ratio <= 0.60:
+        return _c(f"{cur}/{max_hp}", _YELLOW)
+    return _c(f"{cur}/{max_hp}", _GREEN)
 
 
 def main():
@@ -47,7 +61,7 @@ def main():
 
         if status == "closed":
             reason = cfg.get("closed_reason", "closed")
-            print(f"[{name}] CLOSED ({reason})")
+            print(_c(f"[{name}] CLOSED ({reason})", _DIM))
             return
 
         state_path = camp_dir / "state.json"
@@ -65,11 +79,11 @@ def main():
             cur_hp = char_states.get(key, {}).get("hp", max_hp)
             label = char.get("label", key).split()[0]
             conds = char_states.get(key, {}).get("conditions", [])
-            cond_str = f"({','.join(c[:3] for c in conds)})" if conds else ""
-            hp_parts.append(f"{label} {_hp_str(cur_hp, max_hp)}{cond_str}")
+            cond_str = _c(f"({','.join(c[:3] for c in conds)})", _DIM) if conds else ""
+            hp_parts.append(f"{label} {_hp_color(cur_hp, max_hp)}{cond_str}")
         hp_str = " · ".join(hp_parts)
 
-        # Current location — last location_visited event
+        # Current location
         location_str = ""
         events_path = camp_dir / "events.json"
         if events_path.exists():
@@ -83,10 +97,19 @@ def main():
 
         # Alerts
         in_combat = bool(state.get("combat"))
-        combat_str = " [COMBAT]" if in_combat else ""
-        ctx_str = f" [{ctx_pct:.0f}%ctx]" if ctx_pct >= 75 else ""
+        combat_str = _c(" [COMBAT]", _RED, _BOLD) if in_combat else ""
 
-        print(f"[{name}] S{session} Day {day}{location_str}{combat_str} | {hp_str}{ctx_str}")
+        if ctx_pct >= 75:
+            ctx_str = _c(f" [{ctx_pct:.0f}%ctx]", _RED)
+        elif ctx_pct >= 50:
+            ctx_str = _c(f" [{ctx_pct:.0f}%ctx]", _YELLOW)
+        elif ctx_pct > 0:
+            ctx_str = _c(f" [{ctx_pct:.0f}%ctx]", _DIM)
+        else:
+            ctx_str = ""
+
+        header = _c(f"[{name}]", _BOLD) + f" S{session} Day {day}{location_str}"
+        print(f"{header}{combat_str} | {hp_str}{ctx_str}")
 
     except Exception as e:
         print(f"[ttrpg] err: {e}")
