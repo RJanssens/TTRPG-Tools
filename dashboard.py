@@ -111,6 +111,42 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   }}
   .hp-bar .filled {{ color: #6db86d; }}
   .hp-bar .empty  {{ color: #5a3a3a; }}
+  .info-bar {{
+    background: #221a12;
+    border: 1px solid #4a3828;
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 0 0 16px 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px 24px;
+    font-size: 0.95em;
+  }}
+  .info-bar .item strong {{ color: #c8a96e; margin-right: 4px; }}
+  .clock {{
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 3px;
+    border: 1px solid #4a3828;
+    background: #2a2018;
+    font-size: 0.9em;
+    margin: 2px 4px 2px 0;
+  }}
+  .clock.urgent {{ border-color: #b56a3a; color: #e8b487; background: #3a2418; }}
+  .clock.expired {{ border-color: #6a2818; color: #ff7a5a; background: #3a1812; }}
+  .truth-true        {{ color: #6db86d; font-size: 0.8em; }}
+  .truth-partly_true {{ color: #c8a96e; font-size: 0.8em; }}
+  .truth-false       {{ color: #c87a7a; font-size: 0.8em; }}
+  .truth-fabrication {{ color: #ff5a4a; font-size: 0.8em; font-weight: bold; }}
+  .secret-card {{
+    background: #2a1818;
+    border: 1px solid #6a3828;
+    border-left: 4px solid #c8503a;
+    padding: 12px 16px;
+    margin: 8px 0;
+    border-radius: 4px;
+  }}
+  .scope-warning {{ color: #e8b487; font-size: 0.85em; }}
   .tag {{
     display: inline-block;
     background: #3a2818;
@@ -143,12 +179,27 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   table {{ width: 100%; border-collapse: collapse; margin: 12px 0; }}
   th, td {{ border: 1px solid #4a3828; padding: 6px 10px; text-align: left; }}
   th {{ background: #2a2018; color: #c8a96e; }}
+  img:not(#lb-img) {{ cursor: zoom-in; }}
+  #lb {{
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.88); z-index: 9999;
+    align-items: center; justify-content: center;
+    padding: 20px; cursor: zoom-out;
+  }}
+  #lb.open {{ display: flex; }}
+  #lb img {{
+    max-width: 90vw; max-height: 90vh; object-fit: contain;
+    border-radius: 6px; border: 2px solid #5a4030;
+    box-shadow: 0 8px 40px rgba(0,0,0,.9); cursor: zoom-out;
+  }}
 </style>
 </head>
 <body>
 <nav>
   <a href="/">Gallery</a>
   <a href="/party">Party</a>
+  <a href="/world">World</a>
+  <a href="/quests">Quests</a>
   <a href="/log">Chronicle</a>
   <a href="/characters">Characters</a>
   <a href="/locations">Locations</a>
@@ -161,6 +212,19 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <div class="container">
 {body}
 </div>
+<div id="lb"><img id="lb-img" src="" alt=""></div>
+<script>
+(function(){{
+  var lb=document.getElementById('lb');
+  var li=document.getElementById('lb-img');
+  document.addEventListener('click',function(e){{
+    var t=e.target;
+    if(lb.classList.contains('open')){{lb.classList.remove('open');return;}}
+    if(t.tagName==='IMG'&&t.id!=='lb-img'){{li.src=t.src;li.alt=t.alt;lb.classList.add('open');}}
+  }});
+  document.addEventListener('keydown',function(e){{if(e.key==='Escape')lb.classList.remove('open');}});
+}})();
+</script>
 </body>
 </html>"""
 
@@ -355,6 +419,59 @@ def _markdown_to_html(md: str) -> str:
     return "\n".join(out)
 
 
+def _period_for_hour(h: int) -> str:
+    if h < 5:    return "night"
+    if h < 8:    return "dawn"
+    if h < 12:   return "morning"
+    if h < 14:   return "midday"
+    if h < 18:   return "afternoon"
+    if h < 21:   return "evening"
+    return "night"
+
+
+def _world_info_bar(state: dict) -> str:
+    """Render the day/time/weather/season/clocks summary used on multiple pages."""
+    day = state.get("current_day", 1)
+    session = state.get("current_session", 0)
+    h = state.get("current_hour", 6)
+    m = state.get("current_minute", 0)
+    period = _period_for_hour(h)
+    season = state.get("current_season", "spring")
+    weather = state.get("current_weather", "—")
+    weather_label = weather.split(" (", 1)[0] if weather else "—"
+
+    coin = state.get("coin", {})
+    coin_parts = []
+    for denom in ("gp", "ep", "sp", "cp"):
+        v = coin.get(denom, 0)
+        if v:
+            coin_parts.append(f"{v} {denom}")
+    coin_str = ", ".join(coin_parts) if coin_parts else "0 gp"
+
+    clocks_active = [c for c in state.get("faction_clocks", []) if c.get("days_remaining", 0) > 0]
+    next_clock_html = ""
+    if clocks_active:
+        c0 = sorted(clocks_active, key=lambda c: c["days_remaining"])[0]
+        days = c0["days_remaining"]
+        cls = "urgent" if days <= 7 else ""
+        next_clock_html = (
+            f'<span class="item"><strong>Next clock:</strong>'
+            f'<span class="clock {cls}">{html.escape(c0.get("label","?"))} ({days}d)</span></span>'
+        )
+
+    return (
+        '<div class="info-bar">'
+        f'<span class="item"><strong>Day:</strong>{day}</span>'
+        f'<span class="item"><strong>Session:</strong>{session}</span>'
+        f'<span class="item"><strong>Time:</strong>{h:02d}:{m:02d} <em class="muted">({period})</em></span>'
+        f'<span class="item"><strong>Season:</strong>{html.escape(season)}</span>'
+        f'<span class="item"><strong>Weather:</strong>{html.escape(weather_label)}</span>'
+        f'<span class="item"><strong>Coin:</strong>{html.escape(coin_str)}</span>'
+        f'{next_clock_html}'
+        '</div>'
+    )
+
+
 def _hp_bar(current: int, maximum: int, width: int = 10) -> str:
     if maximum <= 0:
         return ""
@@ -497,12 +614,265 @@ def party():
             f"</div>"
         )
 
+    # Loot pile staged from award_treasure
+    loot_pile = state.get("loot_pile", [])
+    loot_html = ""
+    if loot_pile:
+        rows = []
+        for i, item in enumerate(loot_pile):
+            kind = html.escape(item.get("kind", "?"))
+            desc = html.escape(item.get("description", "?"))
+            val = item.get("value_gp", 0)
+            cat = html.escape(item.get("category", ""))
+            cat_str = f' <span class="tag">{cat}</span>' if cat else ""
+            rows.append(
+                f'<li>[{i}] <strong>{desc}</strong> '
+                f'<span class="muted">— {kind}, {val} gp</span>{cat_str}</li>'
+            )
+        loot_html = (
+            f'<div class="card"><h2>Loot Pile <span class="muted">'
+            f'({len(loot_pile)} items)</span></h2>'
+            f'<ul>{"".join(rows)}</ul>'
+            f'<p class="muted" style="font-size:0.85em">'
+            f'Distribute via <code>claim_loot(index, character)</code>.</p></div>'
+        )
+
+    # Tracked consumables per character
+    consumables = state.get("consumables", {})
+    consumables_rows = []
+    for key, items in consumables.items():
+        if not items:
+            continue
+        char = cfg.get("characters", {}).get(key) or cfg.get("npcs", {}).get(key, {})
+        label = char.get("label", key)
+        item_strs = ", ".join(f"{html.escape(name)}×{qty}" for name, qty in items.items())
+        consumables_rows.append(f"<li><strong>{html.escape(label)}:</strong> {item_strs}</li>")
+    consumables_html = ""
+    if consumables_rows:
+        consumables_html = (
+            f'<div class="card"><h2>Consumables</h2>'
+            f'<ul>{"".join(consumables_rows)}</ul></div>'
+        )
+
+    # Light sources
+    lights = state.get("light_sources", [])
+    lit = [s for s in lights if s.get("lit")]
+    light_html = ""
+    if lit:
+        rows = []
+        for s in lit:
+            mins = s.get("minutes_remaining", 0)
+            cls = "urgent" if mins <= 5 else ""
+            holder = html.escape(s.get("holder", "?"))
+            stype = html.escape(s.get("type", "?"))
+            rows.append(f'<span class="clock {cls}">{stype} ({holder}, {mins} min)</span>')
+        light_html = (
+            f'<div class="card"><h2>Light Sources</h2>{"".join(rows)}</div>'
+        )
+
     body = (
         f"<h1>{html.escape(campaign_name)} — Party</h1>"
-        f"<p class='muted'>Day {day} &nbsp;·&nbsp; Session {session} &nbsp;·&nbsp; Coin: {html.escape(coin_str)}</p>"
+        + _world_info_bar(state)
         + "".join(cards)
+        + light_html
+        + consumables_html
+        + loot_html
     )
     return render(f"{campaign_name} — Party", body)
+
+
+@app.route("/world")
+def world_view():
+    state = _c.load_state(cfg)
+    campaign_name = cfg.get("name", "Campaign")
+
+    # Factions
+    factions = cfg.get("factions", {})
+    faction_state = state.get("faction_state", {})
+    faction_cards = []
+    for slug, f in factions.items():
+        fs = faction_state.get(slug, {})
+        rep = fs.get("reputation", 0)
+        strength = fs.get("strength", 100)
+        rep_color = "#6db86d" if rep > 20 else ("#c87a7a" if rep < -20 else "#c8a96e")
+        known_tag = '<span class="tag">known</span>' if f.get("known_to_party") else \
+                    '<span class="tag" style="background:#3a1818;color:#c87a7a">hidden</span>'
+        faction_cards.append(
+            f'<div class="card">'
+            f'<h2>{html.escape(f.get("name", slug))} '
+            f'<span class="muted" style="font-size:0.7em">[{html.escape(f.get("alignment",""))}]</span></h2>'
+            f'<p class="muted">{html.escape(f.get("scope","local"))} scope · slug: <code>{html.escape(slug)}</code> {known_tag}</p>'
+            f'<p>{html.escape(f.get("goals",""))}</p>'
+            f'<p><strong>Strength:</strong> {strength}% '
+            f'&nbsp;·&nbsp; <strong>Reputation:</strong> '
+            f'<span style="color:{rep_color}">{rep:+d}</span></p>'
+            f'</div>'
+        )
+    factions_html = ("".join(faction_cards) if faction_cards
+                     else '<p class="muted">No factions registered. Use add_faction to seed.</p>')
+
+    # Clocks
+    clocks = state.get("faction_clocks", [])
+    clocks_active = sorted(
+        [c for c in clocks if c.get("days_remaining", 0) > 0],
+        key=lambda c: c["days_remaining"],
+    )
+    clocks_done = [c for c in clocks if c.get("days_remaining", 0) <= 0]
+
+    clock_rows = []
+    for c in clocks_active:
+        days = c["days_remaining"]
+        cls = "urgent" if days <= 7 else ""
+        fac = c.get("faction", "")
+        fac_html = f' · {html.escape(fac)}' if fac else ""
+        on_complete = c.get("on_complete", "")
+        oc_html = f'<br><span class="muted">{html.escape(on_complete)}</span>' if on_complete else ""
+        clock_rows.append(
+            f'<div class="clock {cls}" style="display:block;padding:10px 14px;margin:6px 0">'
+            f'<strong>{html.escape(c.get("label","?"))}</strong> '
+            f'<span style="float:right">{days} days</span>{fac_html}{oc_html}'
+            f'</div>'
+        )
+    expired_rows = []
+    for c in clocks_done:
+        expired_rows.append(
+            f'<div class="clock expired" style="display:block;padding:10px 14px;margin:6px 0">'
+            f'<strong>{html.escape(c.get("label","?"))}</strong> '
+            f'<span style="float:right">expired</span>'
+            f'</div>'
+        )
+    clocks_html = ""
+    if clock_rows:
+        clocks_html += "".join(clock_rows)
+    if expired_rows:
+        clocks_html += "<h3>Expired (consequences pending)</h3>" + "".join(expired_rows)
+    if not clocks_html:
+        clocks_html = '<p class="muted">No active clocks.</p>'
+
+    # Rumors (DM view — show truth tier)
+    rumors = cfg.get("rumors", [])
+    rumor_rows = []
+    for r in rumors[-15:]:
+        truth = r.get("truth", "partly_true")
+        rumor_rows.append(
+            f'<li><span class="truth-{html.escape(truth)}">[{html.escape(truth)}]</span> '
+            f'{html.escape(r.get("text",""))}'
+            f'</li>'
+        )
+    rumors_html = (
+        f'<ul>{"".join(rumor_rows)}</ul>' if rumor_rows
+        else '<p class="muted">No rumors stored.</p>'
+    )
+
+    # Secrets (DM-only)
+    secrets_path = cfg["_dir"] / "secrets.json"
+    secret_rows = []
+    if secrets_path.exists():
+        try:
+            recs = json.loads(secrets_path.read_text(encoding="utf-8"))
+            for r in recs[-15:]:
+                tags = r.get("tags", [])
+                tag_html = "".join(f'<span class="tag">{html.escape(t)}</span>' for t in tags)
+                rel = r.get("related_to", "")
+                rel_html = f' <span class="muted">→ {html.escape(rel)}</span>' if rel else ""
+                revealed = r.get("revealed")
+                rev_html = '<span class="tag" style="background:#1a3a18;color:#6db86d">revealed</span>' if revealed else ""
+                secret_rows.append(
+                    f'<div class="secret-card">'
+                    f'<p>{html.escape(r.get("text",""))}{rel_html}</p>'
+                    f'<p class="muted" style="font-size:0.8em">'
+                    f'#{r.get("id","?")} · day {r.get("day","?")} {tag_html} {rev_html}</p>'
+                    f'</div>'
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+    secrets_html = (
+        "".join(secret_rows) if secret_rows
+        else '<p class="muted">No DM-only notes recorded.</p>'
+    )
+
+    body = (
+        f"<h1>{html.escape(campaign_name)} — World</h1>"
+        + _world_info_bar(state)
+        + "<h2>Factions</h2>" + factions_html
+        + "<h2>World Clocks</h2>" + clocks_html
+        + "<h2>Rumors <span class='muted' style='font-size:0.6em'>(DM view — shows truth tier)</span></h2>"
+        + rumors_html
+        + "<h2>DM-Only Notes <span class='muted' style='font-size:0.6em'>(never narrate to player)</span></h2>"
+        + secrets_html
+    )
+    return render(f"{campaign_name} — World", body)
+
+
+@app.route("/quests")
+def quests_view():
+    state = _c.load_state(cfg)
+    campaign_name = cfg.get("name", "Campaign")
+    quests = cfg.get("quests", {})
+
+    chars = cfg.get("characters", {})
+    avg_level = (sum(int(c.get("level", 1)) for c in chars.values()) / len(chars)) if chars else 1.0
+
+    def _scope_warn(scope: str) -> str:
+        if scope == "regional" and avg_level < 4:
+            return f"⚠ regional scope on L{avg_level:.1f} party"
+        if scope == "continental" and avg_level < 8:
+            return f"⚠ continental scope on L{avg_level:.1f} party"
+        return ""
+
+    by_status: dict[str, list] = {"active": [], "paused": [], "complete": [], "failed": []}
+    for slug, q in quests.items():
+        by_status.setdefault(q.get("status", "active"), []).append((slug, q))
+
+    def _render_quest(slug: str, q: dict) -> str:
+        scope = q.get("scope", "local")
+        warn = _scope_warn(scope)
+        warn_html = f'<p class="scope-warning">{html.escape(warn)}</p>' if warn else ""
+        log = q.get("notes_log", [])
+        log_html = ""
+        if log:
+            items = "".join(
+                f"<li><span class='muted'>day {entry.get('day','?')}:</span> "
+                f"{html.escape(entry.get('text',''))}</li>"
+                for entry in log[-5:]
+            )
+            log_html = f"<details><summary class='muted'>Recent notes</summary><ul>{items}</ul></details>"
+        related = []
+        for kind in ("npcs", "factions", "locations"):
+            v = q.get(f"related_{kind}", [])
+            if v:
+                related.append(f"<strong>{kind}:</strong> {', '.join(html.escape(s) for s in v)}")
+        rel_html = f"<p class='muted'>{' &nbsp;·&nbsp; '.join(related)}</p>" if related else ""
+        giver = q.get("giver", "")
+        giver_html = f"<p class='muted'>Given by <code>{html.escape(giver)}</code></p>" if giver else ""
+        return (
+            f'<div class="card">'
+            f'<h2>{html.escape(q.get("title", slug))} '
+            f'<span class="tag">{html.escape(scope)}</span></h2>'
+            f'{warn_html}{giver_html}'
+            f'<p>{html.escape(q.get("stakes",""))}</p>'
+            f'{rel_html}{log_html}'
+            f'</div>'
+        )
+
+    sections = []
+    for status_key in ("active", "paused", "complete", "failed"):
+        items = by_status.get(status_key, [])
+        if not items:
+            continue
+        sections.append(f"<h2>{status_key.title()}</h2>")
+        for slug, q in sorted(items, key=lambda kv: kv[1].get("started_day", 0)):
+            sections.append(_render_quest(slug, q))
+
+    if not sections:
+        sections.append("<p class='muted'>No quests recorded yet. Use add_quest to start.</p>")
+
+    body = (
+        f"<h1>{html.escape(campaign_name)} — Quests</h1>"
+        f"<p class='muted'>Average party level: {avg_level:.1f}</p>"
+        + "".join(sections)
+    )
+    return render(f"{campaign_name} — Quests", body)
 
 
 @app.route("/log")
@@ -799,7 +1169,12 @@ def generate_monster_portrait(slug: str):
 
     tone = cfg.get("tone", "high fantasy")
     tone_clause = TONE_STYLES.get(tone, tone)
-    full_prompt = f"{STYLE_BASE} {tone_clause}. {prompt}"
+
+    custom_prompt = ""
+    if request.is_json:
+        custom_prompt = ((request.get_json(silent=True) or {}).get("prompt") or "").strip()
+    subject = custom_prompt if custom_prompt else prompt
+    full_prompt = f"{STYLE_BASE} {tone_clause}. {subject}"
 
     _MONSTERS_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{slug}.png"
@@ -953,20 +1328,30 @@ def monster_detail(slug: str):
     btn_label = "Regenerate Portrait" if portrait_path else "Generate Portrait"
     gen_button = (
         f'<div style="margin:0 0 12px">'
+        f'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
         f'<button id="gen-portrait-btn" '
         f'onclick="generateMonsterPortrait(\'{esc_slug}\')" '
         f'style="background:#3a2818;border:1px solid #5a4030;color:#c8a96e;'
-        f'padding:6px 16px;border-radius:4px;cursor:pointer;font-size:0.9em">'
+        f'padding:6px 16px;border-radius:4px;cursor:pointer;font-size:0.9em;white-space:nowrap">'
         f'{btn_label}</button>'
-        f'<span id="gen-portrait-status" style="margin-left:10px;font-size:0.85em;color:#8a7a60"></span>'
+        f'<input id="custom-portrait-prompt" type="text" '
+        f'placeholder="Custom prompt — overrides auto-generated description" '
+        f'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
+        f'padding:5px 10px;border-radius:4px;font-size:0.85em;flex:1;min-width:200px">'
+        f'</div>'
+        f'<span id="gen-portrait-status" style="font-size:0.85em;color:#8a7a60"></span>'
         f'</div>'
         f'<script>'
         f'async function generateMonsterPortrait(slug){{'
         f'  const btn=document.getElementById("gen-portrait-btn");'
         f'  const status=document.getElementById("gen-portrait-status");'
+        f'  const cp=document.getElementById("custom-portrait-prompt").value.trim();'
         f'  btn.disabled=true; btn.textContent="Generating…";'
         f'  try{{'
-        f'    const r=await fetch("/monsters/"+slug+"/generate-portrait",{{method:"POST"}});'
+        f'    const opts={{method:"POST"}};'
+        f'    if(cp){{opts.headers={{"Content-Type":"application/json"}};'
+        f'         opts.body=JSON.stringify({{prompt:cp}});}}'
+        f'    const r=await fetch("/monsters/"+slug+"/generate-portrait",opts);'
         f'    const d=await r.json();'
         f'    if(d.error){{status.textContent="Error: "+d.error;btn.disabled=false;btn.textContent="{btn_label}";  }}'
         f'    else{{location.reload();}}'
@@ -1458,9 +1843,12 @@ def _rarity_label(r: int) -> str:
     return "Artifact"
 
 
-def _item_query(q: str, itype: str, min_r: int, max_r: int):
+_ITEMS_PER_PAGE = 20
+
+
+def _item_query(q: str, itype: str, min_r: int, max_r: int, page: int = 1):
     if not _2E_DB.exists():
-        return []
+        return [], 0
     conn = sqlite3.connect(str(_2E_DB))
     conn.row_factory = sqlite3.Row
     where, params = ["rarity BETWEEN ? AND ?"], [min_r, max_r]
@@ -1470,13 +1858,16 @@ def _item_query(q: str, itype: str, min_r: int, max_r: int):
     if itype:
         where.append("item_type = ?")
         params.append(itype)
+    clause = f"WHERE {' AND '.join(where)}"
+    total = conn.execute(f"SELECT COUNT(*) FROM items {clause}", params).fetchone()[0]
+    offset = (page - 1) * _ITEMS_PER_PAGE
     rows = conn.execute(
-        f"SELECT id, name, item_type, cost, rarity FROM items "
-        f"WHERE {' AND '.join(where)} ORDER BY rarity, item_type, name",
+        f"SELECT id, name, item_type, cost, rarity FROM items {clause} "
+        f"ORDER BY rarity, item_type, name LIMIT {_ITEMS_PER_PAGE} OFFSET {offset}",
         params,
     ).fetchall()
     conn.close()
-    return rows
+    return rows, total
 
 
 def _item_card(r) -> str:
@@ -1494,29 +1885,81 @@ def _item_card(r) -> str:
     )
 
 
-def _item_results_html(rows) -> str:
+def _item_pagination(page: int, total_pages: int) -> str:
+    _btn = (
+        'style="background:#3a2818;border:1px solid #5a4030;color:#c8a96e;'
+        'padding:5px 12px;border-radius:4px;cursor:pointer;font-size:.9em"'
+    )
+    _btn_off = (
+        'style="background:#2a2018;border:1px solid #3a2818;color:#5a4040;'
+        'padding:5px 12px;border-radius:4px;font-size:.9em;cursor:default" disabled'
+    )
+    parts = []
+    parts.append(
+        f'<button onclick="iGoTo({page-1})" {_btn}>← Prev</button>'
+        if page > 1 else f'<button {_btn_off}>← Prev</button>'
+    )
+    # Page window: show up to 7 page numbers centred on current
+    lo = max(1, page - 3)
+    hi = min(total_pages, lo + 6)
+    lo = max(1, hi - 6)
+    if lo > 1:
+        parts.append(f'<button onclick="iGoTo(1)" {_btn}>1</button>')
+        if lo > 2:
+            parts.append('<span style="color:#8a7a60;padding:0 4px">…</span>')
+    for n in range(lo, hi + 1):
+        if n == page:
+            parts.append(
+                f'<button {_btn_off} style="background:#3a2818;border:1px solid #5a4030;'
+                f'color:#c8a96e;padding:5px 12px;border-radius:4px;font-size:.9em;'
+                f'font-weight:bold;cursor:default">{n}</button>'
+            )
+        else:
+            parts.append(f'<button onclick="iGoTo({n})" {_btn}>{n}</button>')
+    if hi < total_pages:
+        if hi < total_pages - 1:
+            parts.append('<span style="color:#8a7a60;padding:0 4px">…</span>')
+        parts.append(f'<button onclick="iGoTo({total_pages})" {_btn}>{total_pages}</button>')
+    parts.append(
+        f'<button onclick="iGoTo({page+1})" {_btn}>Next →</button>'
+        if page < total_pages else f'<button {_btn_off}>Next →</button>'
+    )
+    return (
+        f'<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:12px">'
+        + "".join(parts) + "</div>"
+    )
+
+
+def _item_results_html(rows, total: int, page: int) -> str:
     if not rows:
         return "<p class='muted'>No results.</p>"
-    count = f"<p class='muted' style='margin-bottom:12px'>{len(rows)} item{'s' if len(rows) != 1 else ''}</p>"
-    return count + "".join(_item_card(r) for r in rows)
+    total_pages = (total + _ITEMS_PER_PAGE - 1) // _ITEMS_PER_PAGE
+    count = f"<p class='muted' style='margin-bottom:12px'>{total} item{'s' if total != 1 else ''}</p>"
+    cards = "".join(_item_card(r) for r in rows)
+    pager = _item_pagination(page, total_pages) if total_pages > 1 else ""
+    return count + cards + pager
 
 
 _ITEMS_JS = r"""
 <script>
 let _itimer = null;
+let _iPage  = 1;
+function iGoTo(n) { _iPage = n; iDoFetch(); }
 function iSchedule() {
+  _iPage = 1;
   clearTimeout(_itimer);
   _itimer = setTimeout(iDoFetch, 280);
 }
 async function iDoFetch() {
-  const q      = document.getElementById("item-q").value.trim();
-  const itype  = document.getElementById("item-type").value;
-  const min_r  = document.getElementById("item-min-rarity").value;
+  const q     = document.getElementById("item-q").value.trim();
+  const itype = document.getElementById("item-type").value;
+  const min_r = document.getElementById("item-min-rarity").value;
   if (q.length > 0 && q.length < 3) return;
   const p = new URLSearchParams();
-  if (q)     p.set("q",          q);
-  if (itype) p.set("type",       itype);
-  if (min_r) p.set("min_rarity", min_r);
+  if (q)          p.set("q",          q);
+  if (itype)      p.set("type",       itype);
+  if (min_r)      p.set("min_rarity", min_r);
+  if (_iPage > 1) p.set("page",       _iPage);
   const r = await fetch("/api/items/cards?" + p.toString());
   document.getElementById("item-results").innerHTML = await r.text();
 }
@@ -1534,10 +1977,11 @@ def api_item_cards():
     try:
         min_r = int(request.args.get("min_rarity", "0"))
         max_r = int(request.args.get("max_rarity", "100"))
+        page  = max(1, int(request.args.get("page", "1")))
     except ValueError:
-        min_r, max_r = 0, 100
-    rows = _item_query(q, itype, min_r, max_r)
-    return Response(_item_results_html(rows), mimetype="text/html")
+        min_r, max_r, page = 0, 100, 1
+    rows, total = _item_query(q, itype, min_r, max_r, page)
+    return Response(_item_results_html(rows, total, page), mimetype="text/html")
 
 
 @app.route("/items")
@@ -1554,7 +1998,7 @@ def items_list():
         min_r = int(min_rar)
     except ValueError:
         min_r = 0
-    rows = _item_query(q, itype, min_r, 100)
+    rows, total = _item_query(q, itype, min_r, 100, page=1)
 
     type_opts = '<option value="">All types</option>'
     for group, types in _ITEM_TYPE_GROUPS.items():
@@ -1569,6 +2013,7 @@ def items_list():
         '<option value="0">Any rarity</option>'
         + f'<option value="30" {"selected" if min_rar == "30" else ""}>Rare+</option>'
         + f'<option value="45" {"selected" if min_rar == "45" else ""}>Very Rare+</option>'
+        + f'<option value="65" {"selected" if min_rar == "65" else ""}>Legendary+</option>'
     )
 
     controls = (
@@ -1581,7 +2026,7 @@ def items_list():
 
     body = (
         f"<h1>Items</h1>{controls}"
-        f'<div id="item-results">{_item_results_html(rows)}</div>'
+        f'<div id="item-results">{_item_results_html(rows, total, 1)}</div>'
         + _ITEMS_JS
     )
     return render("Items", body)
@@ -1657,8 +2102,9 @@ _COMBAT_CSS = """
 <style>
 .container{max-width:1400px}
 .combat-layout{display:flex;gap:20px;align-items:flex-start;flex-wrap:nowrap}
-.combat-canvas-wrap{flex:1 1 auto;overflow-x:auto;min-width:0}
-#cmap{display:block;cursor:crosshair;border:1px solid #4a3828;border-radius:4px}
+.combat-canvas-wrap{flex:1 1 auto;overflow:hidden;min-width:0;height:560px;
+  border:1px solid #4a3828;border-radius:4px}
+#cmap{display:block;cursor:grab;outline:none}
 .combat-sidebar{flex:0 0 210px;width:210px;flex-shrink:0}
 .zoom-btn{background:#2a2018;border:1px solid #4a3828;color:#c8a96e;padding:2px 9px;
   border-radius:3px;cursor:pointer;font-size:1em;line-height:1.4}
@@ -1688,8 +2134,17 @@ _COMBAT_JS = (
     '  if (el) el.textContent = Math.round(z*100)+"%";\n'
     '};\n'
     '\n'
-    'map.onHover = function(x, y) {\n'
-    '  document.getElementById("coords").textContent = "("+x+", "+y+") — click to copy";\n'
+    'map.onHover = function(x, y, label) {\n'
+    '  var txt = "("+x+", "+y+")";\n'
+    '  if (label) txt += " — " + label;\n'
+    '  else txt += " — click to copy";\n'
+    '  document.getElementById("coords").textContent = txt;\n'
+    '};\n'
+    '\n'
+    'map.onTokenClick = function(c) {\n'
+    '  var el = document.getElementById("coords");\n'
+    '  if (c) el.textContent = c.name + " — movement: " + (c.movement||6) + " cells (click again to deselect)";\n'
+    '  else el.textContent = "hover map for coordinates · scroll to zoom";\n'
     '};\n'
     '\n'
     'map.onClick = function(x, y) {\n'

@@ -79,6 +79,8 @@ def save_state(cfg: dict, state: dict):
 def _seed_state(cfg: dict) -> dict:
     state: dict = {
         "current_day":     1,
+        "current_hour":    6,    # dawn
+        "current_minute":  0,
         "current_session": 1,
         "coin": dict(cfg.get("initial_coin", {"gp": 0, "ep": 0, "sp": 0, "cp": 0})),
         "characters": {},

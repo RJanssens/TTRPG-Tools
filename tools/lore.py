@@ -102,31 +102,51 @@ def register(mcp):
 
     @mcp.tool()
     def active_quests() -> dict:
-        """Return quests that are currently open (have a quest_update event with no matching complete).
-        A quest is closed if any of its events has status='complete'."""
-        cfg    = _c.load_campaign()
-        events = _c.load_events(cfg)
+        """Return open quests. Prefers the structured campaign.json[quests]
+        schema (use add_quest / update_quest); falls back to legacy
+        quest_update events for older campaigns."""
+        cfg = _c.load_campaign()
+        structured = cfg.get("quests", {})
 
+        quests = []
+        if structured:
+            for slug, q in structured.items():
+                if q.get("status", "active") != "active":
+                    continue
+                latest_note = ""
+                log = q.get("notes_log", [])
+                if log:
+                    latest_note = log[-1].get("text", "")
+                quests.append({
+                    "slug":   slug,
+                    "title":  q.get("title", slug),
+                    "scope":  q.get("scope", ""),
+                    "stakes": q.get("stakes", ""),
+                    "giver":  q.get("giver", ""),
+                    "notes":  latest_note,
+                    "day":    q.get("started_day", 0),
+                })
+            quests.sort(key=lambda q: q["day"])
+            return {"quests": quests, "source": "structured"}
+
+        # Legacy fallback
+        events = _c.load_events(cfg)
         quest_events: dict[str, list[dict]] = {}
         for e in events:
             if e.get("type") == "quest_update":
                 slug = e.get("slug", "")
                 quest_events.setdefault(slug, []).append(e)
-
-        quests = []
         for slug, evts in quest_events.items():
             completed = any(e.get("status") == "complete" for e in evts)
             if not completed:
-                # Use the most recent event for the summary
                 latest = max(evts, key=lambda e: (e.get("day", 0), e.get("session", 0)))
                 quests.append({
                     "slug":  slug,
                     "notes": latest.get("notes", ""),
                     "day":   latest.get("day", 0),
                 })
-
         quests.sort(key=lambda q: q["day"])
-        return {"quests": quests}
+        return {"quests": quests, "source": "events"}
 
     @mcp.tool()
     def party_timeline(session_from: int = 1, session_to: int = 0) -> dict:
@@ -204,11 +224,26 @@ def register(mcp):
             if headings:
                 last_session_title = headings[-1].strip()
 
+        # --- Active world clocks (urgent first) ---
+        clocks = state.get("faction_clocks", [])
+        active_clocks = sorted(
+            [c for c in clocks if c.get("days_remaining", 0) > 0],
+            key=lambda c: c.get("days_remaining", 999),
+        )[:5]
+
+        # --- Time of day ---
+        h = state.get("current_hour", 6)
+        m = state.get("current_minute", 0)
+        time_str = f"{h:02d}:{m:02d}"
+
         return {
             "current_day":         state.get("current_day", 1),
+            "current_time":        time_str,
             "current_session":     state.get("current_session", 1),
+            "current_weather":     state.get("current_weather", ""),
             "party":               party,
             "last_events":         last_events,
             "active_quests":       open_quests,
+            "active_clocks":       active_clocks,
             "last_session_title":  last_session_title,
         }

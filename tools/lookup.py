@@ -244,3 +244,239 @@ def register(mcp):
             "result": result.stdout,
             "error":  result.stderr if result.stderr else None,
         }
+
+    @mcp.tool()
+    def award_treasure(treasure_types: str, log_note: str = "") -> dict:
+        """Generate treasure AND auto-route the result into the campaign state.
+        Coins (cp/sp/ep/gp) are added to state.coin directly. Gems, art objects,
+        and magic items are staged in state.loot_pile for the DM to distribute
+        to PC inventories via add_inventory.
+
+        treasure_types: space-separated AD&D treasure types ('A B' or 'Qx5 S')
+        log_note:       free-form note appended to events.json
+
+        Returns the parsed parcel + the new coin totals + the staged loot list."""
+        types_list = treasure_types.split()
+        if not types_list:
+            return {"error": "No treasure types provided."}
+
+        treasure_candidates = [
+            BASE_DIR / "treasure.py",
+            BASE_DIR.parent / "ttrpg" / "treasure.py",
+        ]
+        treasure_py = next((p for p in treasure_candidates if p.exists()), None)
+        if treasure_py is None:
+            return {"error": "treasure.py not found."}
+
+        result = subprocess.run(
+            ["python3", str(treasure_py)] + types_list,
+            capture_output=True,
+            text=True,
+            cwd=str(treasure_py.parent),
+        )
+        text = result.stdout
+
+        # ── Parse ────────────────────────────────────────────────────────
+        import re as _re
+        coin_added = {"cp": 0, "sp": 0, "ep": 0, "gp": 0}
+        gems       = []
+        art        = []
+        magic      = []
+
+        # Lines of form: '  Gold (gp): 1,736 (25% ✓)' — only parse when value is numeric
+        for m in _re.finditer(
+            r'\b(Copper|Silver|Electrum|Gold)\s*\((cp|sp|ep|gp)\):\s+([\d,]+)\b',
+            text,
+        ):
+            denom = m.group(2)
+            val = int(m.group(3).replace(",", ""))
+            coin_added[denom] = coin_added.get(denom, 0) + val
+
+        # Gems: numbered list under "Gems (...)"
+        in_gems = False
+        in_art  = False
+        in_magic = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Gems"):
+                in_gems, in_art, in_magic = True, False, False
+                continue
+            if stripped.startswith("Art Objects"):
+                in_gems, in_art, in_magic = False, True, False
+                continue
+            if stripped.startswith("Magic Items"):
+                in_gems, in_art, in_magic = False, False, True
+                continue
+            if stripped.startswith("==="):
+                in_gems = in_art = in_magic = False
+                continue
+
+            entry_m = _re.match(r'^\d+\.\s+(.*?)(\s+—\s+([\d,]+)\s*gp)?(\s*\[(.*?)\])?\s*(\(\+?\d+%\))?\s*$', stripped)
+            if entry_m and (in_gems or in_art or in_magic):
+                desc = entry_m.group(1).strip()
+                gp_val = int(entry_m.group(3).replace(",", "")) if entry_m.group(3) else 0
+                tag = (entry_m.group(5) or "").strip()
+                rec = {"description": desc, "value_gp": gp_val}
+                if tag:
+                    rec["category"] = tag
+                if in_gems:    gems.append(rec)
+                elif in_art:   art.append(rec)
+                elif in_magic: magic.append(rec)
+
+        # ── Apply to state ───────────────────────────────────────────────
+        cfg = _c.load_campaign()
+        state = _c.load_state(cfg)
+        coin = state.setdefault("coin", {"gp": 0, "ep": 0, "sp": 0, "cp": 0})
+        for denom, val in coin_added.items():
+            coin[denom] = coin.get(denom, 0) + val
+
+        loot_pile = state.setdefault("loot_pile", [])
+        for g in gems:    loot_pile.append({"kind": "gem",   **g})
+        for a in art:     loot_pile.append({"kind": "art",   **a})
+        for mi in magic:  loot_pile.append({"kind": "magic", **mi})
+
+        _c.save_state(cfg, state)
+        _c.append_event(cfg, {
+            "type":  "treasure_awarded",
+            "notes": log_note or f"Types: {treasure_types}",
+            "coin":  dict(coin_added),
+            "gems":  len(gems),
+            "art":   len(art),
+            "magic": len(magic),
+        })
+
+        return {
+            "types":          treasure_types,
+            "coin_added":     coin_added,
+            "coin_total":     dict(coin),
+            "gems":           gems,
+            "art":            art,
+            "magic_items":    magic,
+            "loot_pile_size": len(loot_pile),
+            "raw_output":     text,
+            "stderr":         result.stderr or None,
+        }
+
+    @mcp.tool()
+    def loot_pile() -> dict:
+        """Return the staged loot pile (gems, art, magic items not yet
+        distributed). Use to remind the party of pending decisions."""
+        cfg = _c.load_campaign()
+        state = _c.load_state(cfg)
+        return {"loot_pile": list(state.get("loot_pile", []))}
+
+    @mcp.tool()
+    def claim_loot(index: int, character: str) -> dict:
+        """Remove an item from the loot pile by index and assign it to a PC's
+        markdown inventory (appends a line to the character file).
+        For consumable magic items (potions, scrolls), prefer add_inventory."""
+        cfg = _c.load_campaign()
+        state = _c.load_state(cfg)
+        pile = state.setdefault("loot_pile", [])
+        if not (0 <= index < len(pile)):
+            return {"error": f"Index {index} out of range (pile has {len(pile)} items)."}
+
+        item = pile.pop(index)
+        _c.save_state(cfg, state)
+
+        # Append to character markdown
+        key, char = _c.char_key_for(cfg, character)
+        if key is None:
+            return {"error": f"Character '{character}' not found.", "item": item}
+        char.setdefault("inventory", []).append(
+            f"{item.get('description', '?')} ({item.get('kind', '?')}, {item.get('value_gp', 0)} gp)"
+        )
+        _c.save_campaign(cfg)
+        _c.write_character_sheet(cfg, key, char)
+        return {"claimed_by": char.get("label", key), "item": item}
+
+    @mcp.tool()
+    def item_lookup(name: str, item_type: str = "", max_rarity: int = 100) -> list:
+        """Look up items in the AD&D 2e item database.
+        Returns up to 20 matching items with stats, cost, weight, and description.
+        item_type: optional filter — armor, weapon_melee, weapon_ranged, weapon_ammo,
+          misc_equipment, provisions, clothing, scroll, potion, ring, rod, staff, wand,
+          magic_item_armor_special, magic_item_weapon_special, misc_magic_* categories.
+        max_rarity: 0=common only, 100=all items including artifacts.
+        rarity scale: 0=common, 10=uncommon, 30=rare, 50=very rare, 65=legendary, 100=artifact.
+        Supports partial/case-insensitive name matching."""
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return [{"error": "2e.db not found."}]
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            where, params = ["name LIKE ? COLLATE NOCASE", "rarity <= ?"], [f"%{name}%", max_rarity]
+            if item_type:
+                where.append("item_type LIKE ? COLLATE NOCASE")
+                params.append(f"%{item_type}%")
+            rows = conn.execute(
+                f"SELECT * FROM items WHERE {' AND '.join(where)} ORDER BY rarity, name LIMIT 20",
+                params,
+            ).fetchall()
+            if not rows:
+                return [{"error": f"No items matching '{name}'" + (f" of type '{item_type}'" if item_type else "") + " found."}]
+
+            results = []
+            for r in rows:
+                item = {
+                    "id":           r["id"],
+                    "name":         r["name"],
+                    "item_type":    r["item_type"],
+                    "cost":         r["cost"],
+                    "weight":       r["weight"],
+                    "rarity":       r["rarity"],
+                    "description":  r["description"],
+                    "source":       r["source"],
+                }
+                if r["ac"] is not None:
+                    item["ac"] = r["ac"]
+                if r["speed"] is not None:
+                    item.update({"size": r["size"], "weapon_type": r["weapon_type"],
+                                 "speed": r["speed"], "damage_sm": r["damage_sm"],
+                                 "damage_l": r["damage_l"]})
+                    if r["rof"]:
+                        item.update({"rof": r["rof"], "range_s": r["range_s"],
+                                     "range_m": r["range_m"], "range_l": r["range_l"]})
+                if r["xp_value"] is not None:
+                    item["xp_value"] = r["xp_value"]
+                results.append(item)
+            return results
+        finally:
+            conn.close()
+
+    @mcp.tool()
+    def item_update(item_id: int, rarity: int = None, cost: str = None, description: str = None) -> dict:
+        """Update an item's rarity, cost, or description in the database.
+        rarity: 0=common, 10=uncommon, 30=rare, 50=very rare, 65=legendary, 100=artifact.
+        Note: rebuilding 2e.db with build_2e_db.py resets rarity to defaults.
+        At least one field must be provided."""
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+        if rarity is None and cost is None and description is None:
+            return {"error": "No fields to update provided."}
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            sets, params = [], []
+            if rarity is not None:
+                sets.append("rarity = ?")
+                params.append(max(0, min(100, rarity)))
+            if cost is not None:
+                sets.append("cost = ?")
+                params.append(cost)
+            if description is not None:
+                sets.append("description = ?")
+                params.append(description)
+            params.append(item_id)
+            with conn:
+                cur = conn.execute(
+                    f"UPDATE items SET {', '.join(sets)} WHERE id = ?", params
+                )
+            if cur.rowcount == 0:
+                return {"error": f"No item with id {item_id} found."}
+            return {"updated": item_id, "fields": {k.split(" =")[0]: v for k, v in zip(sets, params[:-1])}}
+        finally:
+            conn.close()
