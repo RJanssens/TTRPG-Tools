@@ -84,7 +84,7 @@ def register(mcp):
 
     @mcp.tool()
     def advance_calendar(days: int) -> dict:
-        """Advance the in-game calendar by a number of days."""
+        """Advance the in-game calendar by a number of days. Time of day is preserved."""
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
@@ -97,3 +97,86 @@ def register(mcp):
             "days_advanced": days,
             "new_day": new_day,
         }
+
+    @mcp.tool()
+    def advance_time(minutes: int) -> dict:
+        """Advance the in-game clock by N minutes.
+        Rolls into the next day at hour 24. Decrements every lit light source's
+        minutes_remaining and extinguishes any that reach zero (returned in `extinguished`).
+
+        Use whenever significant time passes:
+        - Searching a room: 10 min
+        - Picking a lock: 1d10 min
+        - Travelling between dungeon rooms: 1 min per 30 ft
+        - Resting (short): 30 min
+        - Memorising a spell: 60 min (1st-level), 90 min (3rd), 2 hr (5th+)
+        - Travel between settlements: hours; for full days use travel() instead
+
+        For long rests use rest() — that handles HP/slots; this tool only handles
+        the clock and consumables.
+        """
+        cfg = _c.load_campaign()
+        state = _c.load_state(cfg)
+
+        cur_h = state.get("current_hour", 6)
+        cur_m = state.get("current_minute", 0)
+        cur_d = state.get("current_day", 1)
+
+        total = cur_h * 60 + cur_m + int(minutes)
+        days_passed = total // (24 * 60)
+        rem = total % (24 * 60)
+        cur_d += days_passed
+        cur_h = rem // 60
+        cur_m = rem % 60
+
+        state["current_day"]    = cur_d
+        state["current_hour"]   = cur_h
+        state["current_minute"] = cur_m
+
+        # Decrement lit light sources
+        extinguished = []
+        for s in state.get("light_sources", []):
+            if not s.get("lit") or s.get("minutes_remaining", -1) < 0:
+                continue
+            s["minutes_remaining"] -= int(minutes)
+            if s["minutes_remaining"] <= 0:
+                s["lit"] = False
+                s["minutes_remaining"] = 0
+                extinguished.append(dict(s))
+
+        _c.save_state(cfg, state)
+
+        # Period of day for narrative cues
+        if cur_h < 5:           period = "night"
+        elif cur_h < 8:         period = "dawn"
+        elif cur_h < 12:        period = "morning"
+        elif cur_h < 14:        period = "midday"
+        elif cur_h < 18:        period = "afternoon"
+        elif cur_h < 21:        period = "evening"
+        else:                   period = "night"
+
+        result = {
+            "minutes_advanced": minutes,
+            "day":              cur_d,
+            "time":             f"{cur_h:02d}:{cur_m:02d}",
+            "period":           period,
+        }
+        if extinguished:
+            result["extinguished"] = extinguished
+        if days_passed:
+            result["days_passed"] = days_passed
+        return result
+
+    @mcp.tool()
+    def set_time(hour: int, minute: int = 0) -> dict:
+        """Explicitly set the clock without advancing day. Use for narrative jumps:
+        'they sleep through the night and wake at dawn' → set_time(6).
+        For 'next morning' across days, use advance_calendar(1) then set_time(6)."""
+        cfg = _c.load_campaign()
+        state = _c.load_state(cfg)
+        h = max(0, min(23, int(hour)))
+        m = max(0, min(59, int(minute)))
+        state["current_hour"] = h
+        state["current_minute"] = m
+        _c.save_state(cfg, state)
+        return {"day": state.get("current_day", 1), "time": f"{h:02d}:{m:02d}"}

@@ -1,8 +1,50 @@
 """World-building tools: NPCs, locations, and area management."""
+import json
+import random
 import re
+import sqlite3
 from pathlib import Path
 import _campaign as _c
 import names
+
+BASE_DIR = Path(__file__).parent.parent
+_2E_DB   = BASE_DIR / "global" / "2e.db"
+
+
+def _roll_hd(notation: str) -> int:
+    """Roll a hit-dice expression like '1d8', '3d10+1'."""
+    m = re.match(r'^(\d+)d(\d+)([+-]\d+)?$', notation.strip().lower())
+    if not m:
+        return 4
+    n, sides, mod = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+    return max(1, sum(random.randint(1, sides) for _ in range(n)) + mod)
+
+
+_DEFAULT_AC = {
+    "fighter": 5, "ranger": 6, "paladin": 4, "cleric": 5, "druid": 7,
+    "thief": 8, "bard": 7, "mage": 10, "wizard": 10, "illusionist": 10,
+}
+_DEFAULT_WEAPON = {
+    "fighter": ("long sword", "1d8", 5),
+    "paladin": ("long sword", "1d8", 5),
+    "ranger":  ("long sword", "1d8", 5),
+    "cleric":  ("mace", "1d6+1", 7),
+    "druid":   ("club", "1d6", 4),
+    "thief":   ("short sword", "1d6", 3),
+    "bard":    ("short sword", "1d6", 3),
+    "mage":    ("dagger", "1d4", 2),
+    "wizard":  ("dagger", "1d4", 2),
+    "illusionist": ("dagger", "1d4", 2),
+}
+_RACE_ADJ = {
+    "dwarf":    {"con": 1, "cha": -1},
+    "elf":      {"dex": 1, "con": -1},
+    "halfling": {"dex": 1, "str": -1},
+    "gnome":    {"int": 1, "wis": -1},
+    "halfelf":  {},
+    "halforc":  {"str": 1, "con": 1, "cha": -2},
+    "human":    {},
+}
 
 
 def register(mcp):
@@ -120,6 +162,151 @@ def register(mcp):
         return {"slug": slug, "label": label, "updated": True}
 
     @mcp.tool()
+    def quick_npc(
+        cls:          str,
+        level:        int = 1,
+        race:         str = "human",
+        gender:       str = "",
+        description:  str = "",
+        ac:           int = 0,
+        weapon:       str = "",
+    ) -> dict:
+        """Generate a fully-statted NPC in one call. Synthesises stats from
+        class_lookup (THAC0, saves, spell slots, HD) and applies sensible
+        defaults for AC and weapon based on class. Use for incidental NPCs
+        (guards, hirelings, bandits) instead of inventing numbers.
+
+        cls:         class name (Fighter, Mage, Cleric, Thief, ...)
+        level:       class level (1+)
+        race:        human / elf / dwarf / halfling / gnome / halfelf / halforc
+        gender:      'male' / 'female' / blank for random
+        description: role/notes appended to the character file (e.g. 'town guard')
+        ac:          override the class-default AC
+        weapon:      override the class-default weapon ('long sword', etc.)
+
+        The NPC gets a generated name, character file, stat block in
+        campaign.json[npcs], and a portrait (best-effort)."""
+        if not _2E_DB.exists():
+            return {"error": "2e.db not found. Run tools/build_2e_db.py first."}
+
+        cfg = _c.load_campaign()
+        female = gender.lower() == "female"
+        npc_name = names.generate(race=race, female=female)
+
+        base_slug = re.sub(r"[^a-z0-9]", "", npc_name.lower().split()[0])
+        chars_dir = cfg["_data_dir"] / "characters"
+        chars_dir.mkdir(parents=True, exist_ok=True)
+        slug = base_slug
+        ctr = 2
+        while (chars_dir / f"{slug}.md").exists():
+            slug = f"{base_slug}{ctr}"
+            ctr += 1
+
+        # ── Pull class data ──────────────────────────────────────────────
+        conn = sqlite3.connect(str(_2E_DB))
+        conn.row_factory = sqlite3.Row
+        try:
+            cls_row = conn.execute(
+                "SELECT id, name, hit_die FROM classes WHERE name LIKE ? COLLATE NOCASE LIMIT 1",
+                (f"%{cls}%",),
+            ).fetchone()
+            if cls_row is None:
+                return {"error": f"Class '{cls}' not found in 2e.db."}
+            class_id = cls_row["id"]
+            class_name = cls_row["name"]
+            hit_die = cls_row["hit_die"] or "1d8"
+
+            lvl_row = conn.execute(
+                "SELECT thac0, save_paralysis, save_rsw, save_petrify, save_breath, save_spell, "
+                "spell_slots, hit_dice FROM class_levels WHERE class_id=? AND level=?",
+                (class_id, level),
+            ).fetchone()
+            if lvl_row is None:
+                return {"error": f"No level-{level} data for {class_name}."}
+            thac0 = lvl_row["thac0"]
+            saves = [lvl_row["save_paralysis"], lvl_row["save_rsw"], lvl_row["save_petrify"],
+                     lvl_row["save_breath"], lvl_row["save_spell"]]
+            spell_slots = json.loads(lvl_row["spell_slots"]) if lvl_row["spell_slots"] else None
+            hd_notation = lvl_row["hit_dice"] or hit_die
+        finally:
+            conn.close()
+
+        # ── Roll HP ──────────────────────────────────────────────────────
+        # NPCs get average rolls (avoid extreme outliers)
+        hp_max = max(level, _roll_hd(hd_notation))
+
+        # ── Defaults ─────────────────────────────────────────────────────
+        cls_lower = class_name.lower()
+        kw = next((k for k in _DEFAULT_AC if k in cls_lower), "fighter")
+        default_ac = _DEFAULT_AC.get(kw, 8)
+        weapon_name, weapon_dmg, weapon_speed = _DEFAULT_WEAPON.get(kw, ("club", "1d6", 4))
+
+        final_ac = ac if ac else default_ac
+        final_weapon = weapon if weapon else weapon_name
+
+        # ── Stat block ───────────────────────────────────────────────────
+        npc_data = {
+            "label":        npc_name,
+            "slug":         slug,
+            "cls":          class_name,
+            "race":         race,
+            "gender":       gender or "male",
+            "level":        level,
+            "hp_max":       hp_max,
+            "ac":           final_ac,
+            "thac0":        thac0,
+            "saves":        saves,
+            "weapon":       final_weapon,
+            "weapon_speed": weapon_speed,
+            "weapon_dmg":   weapon_dmg,
+            "bonus_hit":    0,
+            "bonus_dmg":    0,
+            "background":   description,
+        }
+        if spell_slots:
+            npc_data["spell_slots"] = {str(k): int(v) for k, v in spell_slots.items()}
+
+        # ── Persist ──────────────────────────────────────────────────────
+        race_line = race.capitalize()
+        if description:
+            race_line += f" — {description}"
+        content = f"# {npc_name}\n*{race_line}*  \n**{class_name} (Level {level})**\n\n## Status\nAlive\n\n## Notes\n\n"
+        (chars_dir / f"{slug}.md").write_text(content, encoding="utf-8")
+
+        cfg.setdefault("npcs", {})[slug] = npc_data
+        _c.save_campaign(cfg)
+        _c.write_character_sheet(cfg, slug, npc_data)
+
+        _c.append_event(cfg, {
+            "type":  "npc_met",
+            "slug":  slug,
+            "name":  npc_name,
+            "race":  race,
+            "notes": f"{class_name} L{level} — {description}".strip(),
+        })
+
+        # Best-effort portrait
+        try:
+            from images import generate_portrait_for
+            portrait_prompt = f"{gender or 'person'} {race} {class_name.lower()} {description}".strip()
+            generate_portrait_for(cfg, slug, portrait_prompt)
+        except Exception:
+            pass
+
+        return {
+            "name":         npc_name,
+            "slug":         slug,
+            "class":        class_name,
+            "level":        level,
+            "hp_max":       hp_max,
+            "ac":           final_ac,
+            "thac0":        thac0,
+            "saves":        saves,
+            "weapon":       final_weapon,
+            "spell_slots":  spell_slots,
+        }
+
+    @mcp.tool()
     def refresh_sheet(key: str) -> dict:
         """Regenerate the markdown sheet for a PC or NPC from stored campaign.json data.
         key: character key (from 'characters' or 'npcs' in campaign.json)
@@ -135,6 +322,57 @@ def register(mcp):
             }
         _c.write_character_sheet(cfg, key, char)
         return {"key": key, "label": char.get("label", key), "refreshed": True}
+
+    @mcp.tool()
+    def set_disposition(slug: str, value: int, reason: str = "", faction: str = "") -> dict:
+        """Set or adjust a named NPC's persistent disposition toward the party.
+        Range: -100 (sworn enemy) to +100 (devoted ally). 0 = neutral.
+        Disposition feeds into reaction(npc=slug) automatically (disposition/20
+        becomes the modifier, so ±100 = ±5 to the 2d10 roll).
+
+        Use after meaningful interactions:
+        - +20 to +40 for significant favours, gifts, helpful actions
+        - -20 to -40 for slights, broken promises, theft witnessed
+        - ±60+ for life-changing events (saved their child, killed their kin)
+
+        reason:  one-line note logged to the NPC's history
+        faction: optional faction slug — links the NPC to a faction so reaction()
+                 also picks up the faction-wide reputation."""
+        cfg = _c.load_campaign()
+        slug = slug.lower().strip()
+        npcs = cfg.setdefault("npcs", {})
+        npc = npcs.get(slug)
+        if not npc:
+            # Allow setting on an NPC that has only a markdown file but no stat block
+            md_path = cfg["_data_dir"] / "characters" / f"{slug}.md"
+            if not md_path.exists():
+                return {"error": f"No NPC '{slug}' found (no stat block, no character file)."}
+            label = md_path.read_text(encoding="utf-8").splitlines()[0].lstrip("#").strip() or slug
+            npcs[slug] = {"label": label, "slug": slug}
+            npc = npcs[slug]
+
+        before = int(npc.get("disposition", 0))
+        npc["disposition"] = max(-100, min(100, int(value)))
+        if faction:
+            npc["faction"] = faction.lower().strip()
+        _c.save_campaign(cfg)
+
+        _c.append_event(cfg, {
+            "type":   "disposition_change",
+            "slug":   slug,
+            "before": before,
+            "after":  npc["disposition"],
+            "notes":  reason or f"disposition {before:+d} → {npc['disposition']:+d}",
+        })
+
+        return {
+            "slug":       slug,
+            "label":      npc.get("label", slug),
+            "before":     before,
+            "after":      npc["disposition"],
+            "faction":    npc.get("faction", ""),
+            "modifier_applied_to_reaction": npc["disposition"] // 20,
+        }
 
     @mcp.tool()
     def get_character(slug: str) -> dict:

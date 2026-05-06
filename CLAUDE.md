@@ -5,7 +5,9 @@
 
 ## Session Start
 
-**Always call `session_primer()` at the start of every session.** It returns current day, party HP, open quests, recent events, and last session summary. Use it to orient yourself before the first player message.
+**Always call `session_primer()` at the start of every session.** It returns current day, time, weather, party HP, open quests, active world clocks, recent events, and last session summary. Use it to orient yourself before the first player message.
+
+**Track time, not just days.** Use `advance_time(minutes)` for any non-trivial in-fiction action: searching a room (10 min), picking a lock (1d10 min), travelling between dungeon rooms, memorising spells, light meals. Use `advance_calendar(days)` for multi-day jumps. Use `set_time(hour)` for narrative jumps ("at dawn" → `set_time(6)`). Time of day determines light, NPC presence, encounter frequency, and tone — don't leave it implicit.
 
 ---
 
@@ -46,6 +48,16 @@ Prefer: someone is missing, a location is dangerous, a merchant needs an escort,
 
 ---
 
+## Factions and World Clocks
+
+The world has its own momentum. Things happen whether or not the party is watching.
+
+- **Register meaningful organisations** with `add_faction(slug, name, alignment, goals, scope, known_to_party)`. Scope must match level: `local` for L1–3, `regional` for L4–7, `continental` for L8+. Stake size is a fairness lever — do not introduce continental factions to a low-level party uninvited.
+- **For any time-bound threat, set a clock**: `add_faction_clock(label, days, faction?, on_complete?)`. Examples: ritual completes in 30 days, siege lifts in 14, plague reaches the next village in 10. Clocks make the world breathe.
+- **At session start (after `session_primer`), call `tick_world(days_since_last_session)`** — this surfaces clocks that have expired or are within 7 days of expiring. Narrate their consequences.
+- **Use `dm_note(..., related_to=faction_slug)` to record hidden faction motives.**
+- Factions and clocks must be advanced honestly. If 30 days passed in-game, 30 days passed for the cult too.
+
 ## NPCs
 
 **Before naming any NPC, call `introduce_npc(race, gender)`** — no exceptions, no freehand names. This generates the name AND creates the character file automatically. Only skip for names that appear verbatim in a published module (e.g. Elmo, Terjon).
@@ -55,6 +67,8 @@ This applies to every named character: guards, merchants, hirelings, prisoners, 
 **This rule applies equally when writing narrative prose, adventure hooks, intro blurbs, or any other creative content.** Do not invent a name as a placeholder and fill it in later. If you need to reference an NPC who requires a name, call `introduce_npc()` first, then write the content. If the MCP is unreachable, use a descriptor instead ("the tanner", "a worried farmer") and call `introduce_npc()` before that NPC is named in play.
 
 After any significant NPC interaction, call `update_character(slug, content)` to record what the party learned.
+
+**NPC disposition is persistent.** When the party meets a known NPC again, do NOT roll fresh — call `reaction(npc=slug)` which auto-applies their stored disposition and faction reputation as a modifier. After any meaningful interaction (favour, slight, gift, theft, betrayal, rescue), call `set_disposition(slug, value, reason, faction?)`. Range -100..+100. Typical adjustments: ±20 for routine actions, ±40 for significant ones, ±60+ for life-changing. The world remembers.
 
 ---
 
@@ -100,9 +114,28 @@ Monsters and enemies act according to their actual intelligence and instincts �
 - Fleeing: automatic hit on fleeing character → pass `condition="fleeing"`
 - Natural 20 always hits. Natural 1 always misses.
 
+**Surprise:** At the start of any encounter where one side may catch the other unaware, call `surprise_check(party_modifier, enemy_modifier)` BEFORE rolling initiative. If a side is surprised, narrate the free-action segments before initiative begins. Don't skip this — surprise is a key fairness lever and is easy to forget.
+
 **Morale:** After losing 50% of a group, call `morale_check(rating)`. If it breaks, enemies flee or surrender.
 
+**Active effects:** For any spell or condition with a duration (bless, prayer, stinking cloud, haste, slow, web, sleep, hold person, shield, web), call `apply_effect(target, name, duration_rounds, to_hit?, ac?, dmg?, save?)`. Numeric modifiers are auto-applied to subsequent attacks; the duration auto-decrements at each new round and the effect expires on its own. Use `remove_effect(target, name)` for early termination (dispel, save succeeded, moved out of AOE).
+
 ---
+
+## Survival Resources
+
+Track consumables that should run out. Without this, dungeon attrition silently disappears.
+
+- **At session start (or first dungeon entry):** add expected supplies — `add_inventory(character, item, qty)`. Common items: `torch`, `oil`, `rations`, `arrow`, `holy_water`, `oil_flask`.
+- **When the party lights a torch or lantern:** `light_torch(character, "torch"|"lantern")`. This consumes one from inventory and starts a timer. Check `light_state()` periodically; the timer ticks down via `advance_time`.
+- **When supplies are used:** `consume(character, item, qty)`. Fire arrows: 1 per shot. Eat: 1 ration per character per day. Drink potion: 1 of that potion. Pour holy water: 1 holy_water.
+- **Don't quietly forget consumables.** A failing torch in a dungeon is a believability anchor — the world has to push back.
+
+## Travel and Weather
+
+For overland travel, use `travel(destination, terrain, days|distance_miles, base_pace_mpd, forced_march)`. It runs each day in order: rolls weather, rolls encounter, consumes one ration per PC, advances the calendar, and ticks every world clock. Resolve any flagged encounters and narrate any completed clocks before the party arrives.
+
+Roll `weather_check(terrain)` at the start of any travel day, on terrain change, and at session start. Apply mechanical effects (missile penalties, pace multipliers, fatigue) to subsequent rolls. Set `set_season(season)` when in-game time crosses a seasonal boundary.
 
 ## Encounter Checks
 
@@ -169,9 +202,13 @@ Award at natural break points — end of encounter, objective completed, session
 
 ## Reference Lookups
 
+- `rules_lookup(query, source?, limit?)` — FTS5 search over PHB / DMG / Monstrous Manual text. Use this BEFORE narrating a rule the player might dispute, instead of recalling from training data. `source`: `'phb'`, `'dmg'`, `'mm'`, or blank. `query` supports phrase quoting (`'"saving throw vs spell"'`), wildcards (`turn*`), boolean (`OR`).
+- `rules_section(source, section)` — fetch the full body text of a section after a lookup hit.
 - `spell_lookup(name, caster?)` — full spell details: casting time, casting_time_init (1–10 for initiative), range, AOE, duration, save, components, description. `caster` filter: `"wizard"` or `"priest"`. Use before any spell ruling where you need the exact mechanics.
 - `class_lookup(class_name, level)` — level-specific data: THAC0, all saves, spell slots, XP required and XP to next level. Pass `level=0` for the full XP progression table. Use when a character levels up or when a save needs to be set.
 - `monster_lookup(name)` — stats, treasure type, morale, XP value.
+- `item_lookup(name, item_type?, max_rarity?)` — equipment and magic item details: cost, weight, AC (armor), combat stats (weapons), XP value (magic items). `item_type` filter e.g. `"ring"`, `"scroll"`, `"weapon_melee"`. `max_rarity` 0–100 (0=common only, default 100=all).
+- `item_update(item_id, rarity?)` — set rarity on an item (0=common … 100=artifact). Use when stocking stores or seeding encounter treasure.
 
 ---
 
@@ -205,6 +242,16 @@ Run `python3 dashboard.py [--port 5000]` for the web interface:
 - `/sheets/<slug>` — character sheet
 
 ---
+
+## Hidden State
+
+Some facts are known to you (the DM) but not to the player. Examples: the innkeeper's hidden allegiance, a foreshadowed truth, a failed perception roll the player should not realise they failed, the actual truth value of a rumour the party has heard.
+
+**Use `dm_note(text, tags, related_to)` to record any such fact.** These are stored in `secrets.json` and never appear in the chronicle, search results, or any tool output the player might see. Use `dm_secrets(tag, related_to, contains)` to recall them.
+
+**Never narrate the contents of a DM note.** They exist so you can stay consistent across sessions without leaking knowledge to the player. When a secret is revealed in play (the player learns it), call `dm_secret_update(id, revealed=True)` — that promotes it to the public event log so `search_lore` can find it normally.
+
+When in doubt, save it as a secret. It is far worse to leak information than to over-record it.
 
 ## Out-of-Character
 

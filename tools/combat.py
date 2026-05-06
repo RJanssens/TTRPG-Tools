@@ -17,6 +17,41 @@ def get_session() -> dict | None:
     return _session
 
 
+def _sum_modifier(combatant: dict, key: str) -> int:
+    """Total a numeric effect modifier across all active effects on a combatant."""
+    total = 0
+    for eff in combatant.get("effects", []):
+        v = eff.get(key)
+        if isinstance(v, int):
+            total += v
+    return total
+
+
+def _check_morale_trigger(side: str) -> dict | None:
+    """Return a one-shot morale-due notice when `side` first crosses 50% casualties.
+    Tracks fired sides on the session so each threshold fires only once."""
+    if _session is None or side == "party":
+        return None
+    members = [c for c in _session["combatants"] if c.get("side") == side]
+    if not members:
+        return None
+    down = sum(1 for c in members if c.get("hp", 0) <= 0)
+    if down * 2 < len(members):
+        return None
+    fired = _session.setdefault("morale_triggered_sides", [])
+    if side in fired:
+        return None
+    fired.append(side)
+    return {
+        "side":     side,
+        "down":     down,
+        "total":    len(members),
+        "message":  f"Morale check due: {down}/{len(members)} of side '{side}' down. "
+                    f"Call morale_check(rating) using the group's morale rating "
+                    f"(monster_lookup → 'morale').",
+    }
+
+
 def _roll_dice(notation: str) -> int:
     m = re.match(r'^(\d*)d(\d+)(([+-]\d+)*)$', notation.strip().lower())
     if not m:
@@ -93,9 +128,11 @@ def register(mcp):
                 "side":         "party",
                 "init":         None,
                 "conditions":   conditions,
+                "effects":      [],
                 "_key":         key,
                 "x":            None,
                 "y":            None,
+                "movement":     char.get("movement_rate", 12) // 2,
             })
             party_loaded.append(char["label"])
 
@@ -113,6 +150,7 @@ def register(mcp):
         dmg:          str = "1d6",
         side:         str = "enemy",
         weapon_speed: int = 5,
+        movement:     int = 6,
     ) -> dict:
         """Add a combatant (usually an enemy) to the active combat session.
         Call start_combat first. dmg is a dice notation string e.g. '2d6'."""
@@ -132,8 +170,10 @@ def register(mcp):
             "side":         side,
             "init":         None,
             "conditions":   [],
+            "effects":      [],
             "x":            None,
             "y":            None,
+            "movement":     movement,
         })
 
         return {"name": name, "hp": hp, "ac": ac, "thac0": thac0, "side": side}
@@ -230,6 +270,15 @@ def register(mcp):
             roll      = random.randint(1, 20)
             hit_bonus = atk["bonus_hit"]
 
+            # Active-effect modifiers on attacker (to_hit) and target (ac)
+            atk_eff_hit = _sum_modifier(atk, "to_hit")
+            tgt_eff_ac  = _sum_modifier(tgt, "ac")
+            if atk_eff_hit:
+                hit_bonus += atk_eff_hit
+                notes.append(f"{atk_eff_hit:+d} to hit (active effects on {atk['name']}).")
+            if tgt_eff_ac:
+                notes.append(f"{tgt_eff_ac:+d} AC modifier on {tgt['name']} (active effects).")
+
             if cond == "rear":
                 hit_bonus += 2
                 notes.append("+2 to hit (rear attack).")
@@ -247,7 +296,7 @@ def register(mcp):
                 notes.append("Natural 1 — automatic miss!")
             else:
                 effective_roll = roll + hit_bonus
-                target_ac = tgt["ac"]
+                target_ac = tgt["ac"] + tgt_eff_ac
                 if cond == "rear":
                     target_ac += 2
                 hit = effective_roll >= (atk["thac0"] - target_ac)
@@ -265,7 +314,10 @@ def register(mcp):
         dead     = False
 
         if hit:
-            raw_dmg = _roll_dice(atk["dmg"]) + atk["bonus_dmg"]
+            atk_eff_dmg = _sum_modifier(atk, "dmg")
+            raw_dmg = _roll_dice(atk["dmg"]) + atk["bonus_dmg"] + atk_eff_dmg
+            if atk_eff_dmg:
+                notes.append(f"{atk_eff_dmg:+d} damage (active effects).")
             if cond == "set_vs_charge":
                 raw_dmg *= 2
                 notes.append("Set vs. charge — double damage!")
@@ -281,7 +333,7 @@ def register(mcp):
                 if tgt["hp"] < 0:
                     notes.append(f"Bleeding: loses 1 HP/round until stabilised or dead at -10.")
 
-        return {
+        result = {
             "attacker":        atk["name"],
             "target":          tgt["name"],
             "roll":            roll,
@@ -293,6 +345,11 @@ def register(mcp):
             "spell_disrupted": spell_disrupted,
             "notes":           notes,
         }
+        if downed:
+            morale = _check_morale_trigger(tgt["side"])
+            if morale:
+                result["morale_due"] = morale
+        return result
 
     @mcp.tool()
     def apply_combat_damage(name: str, amount: int) -> dict:
@@ -316,7 +373,7 @@ def register(mcp):
         downed    = c["hp"] <= 0
         dead      = c["hp"] <= -10
 
-        return {
+        result = {
             "name":            c["name"],
             "hp_before":       hp_before,
             "hp_after":        c["hp"],
@@ -324,6 +381,11 @@ def register(mcp):
             "dead":            dead,
             "spell_disrupted": spell_disrupted,
         }
+        if downed:
+            morale = _check_morale_trigger(c["side"])
+            if morale:
+                result["morale_due"] = morale
+        return result
 
     @mcp.tool()
     def apply_combat_heal(name: str, amount: int) -> dict:
@@ -387,6 +449,67 @@ def register(mcp):
         return {"name": c["name"], "conditions": list(c["conditions"])}
 
     @mcp.tool()
+    def apply_effect(
+        target:    str,
+        name:      str,
+        duration:  int,
+        to_hit:    int = 0,
+        ac:        int = 0,
+        dmg:       int = 0,
+        save:      int = 0,
+        source:    str = "",
+    ) -> dict:
+        """Attach a timed effect (buff or debuff) to a combatant.
+        Auto-decrements at the start of each new round and expires when duration hits 0.
+        Numeric modifiers are auto-applied:
+          to_hit: delta to attacker's d20 attack roll (e.g. bless +1)
+          ac:     delta to AC when targeted (negative = harder to hit; e.g. shield -1)
+          dmg:    delta to damage rolls
+          save:   not auto-applied — saving_throw() does not consult effects;
+                  surfaced for the DM's reference when calling it manually
+        duration: rounds remaining; 1 = expires at start of next round.
+        Examples:
+          apply_effect("Maren", "bless", 6, to_hit=1)
+          apply_effect("Goblin #2", "stinking cloud", 3, to_hit=-2)
+          apply_effect("Torven", "haste", 9, to_hit=0)  # mark, narrate doubled actions
+        """
+        if _session is None:
+            return {"error": "No active combat session. Call start_combat first."}
+
+        c = _find_combatant(target)
+        if c is None:
+            return {"error": f"Combatant '{target}' not found."}
+
+        eff = {"name": name, "duration": int(duration)}
+        if to_hit: eff["to_hit"] = int(to_hit)
+        if ac:     eff["ac"]     = int(ac)
+        if dmg:    eff["dmg"]    = int(dmg)
+        if save:   eff["save"]   = int(save)
+        if source: eff["source"] = source
+
+        c.setdefault("effects", []).append(eff)
+        return {"target": c["name"], "effect": eff, "active_count": len(c["effects"])}
+
+    @mcp.tool()
+    def remove_effect(target: str, name: str) -> dict:
+        """Remove a named effect from a combatant before its natural expiry
+        (e.g. dispel magic, save succeeded on next round, target moved out of AOE).
+        Removes only the first matching effect; call again if duplicates exist."""
+        if _session is None:
+            return {"error": "No active combat session. Call start_combat first."}
+
+        c = _find_combatant(target)
+        if c is None:
+            return {"error": f"Combatant '{target}' not found."}
+
+        effects = c.get("effects", [])
+        for i, eff in enumerate(effects):
+            if eff.get("name", "").lower() == name.lower():
+                removed = effects.pop(i)
+                return {"target": c["name"], "removed": removed, "remaining": len(effects)}
+        return {"error": f"No active effect named '{name}' on {c['name']}."}
+
+    @mcp.tool()
     def next_turn() -> dict:
         """Advance to the next combatant in initiative order, skipping those who cannot act
         (HP <= 0). Wraps to round start and increments the round counter.
@@ -416,6 +539,17 @@ def register(mcp):
                         c["hp"] = max(-10, c["hp"] - 1)
                         status = "dead" if c["hp"] <= -10 else f"hp now {c['hp']}"
                         bleeding_report.append(f"{c['name']} bleeds 1 HP ({status})")
+                # Decrement active effects; remove expired
+                for c in combatants:
+                    surviving = []
+                    for eff in c.get("effects", []):
+                        d = eff.get("duration", 0)
+                        if d <= 1:
+                            bleeding_report.append(f"{c['name']}: '{eff.get('name','effect')}' expires.")
+                        else:
+                            eff["duration"] = d - 1
+                            surviving.append(eff)
+                    c["effects"] = surviving
 
             c = combatants[idx]
             if c["hp"] > 0:
@@ -453,6 +587,7 @@ def register(mcp):
                 "ac":         c["ac"],
                 "init":       c["init"],
                 "conditions": list(c["conditions"]),
+                "effects":    list(c.get("effects", [])),
                 "status":     status,
                 "current":    i == _session["current_idx"],
             })
