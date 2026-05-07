@@ -108,17 +108,6 @@ def main():
         in_combat = bool(state.get("combat"))
         combat_str = _c(" [COMBAT]", _RED, _BOLD) if in_combat else ""
 
-        # Urgent world clock (≤7 days remaining)
-        clock_str = ""
-        clocks = state.get("faction_clocks", [])
-        urgent = sorted(
-            [c for c in clocks if 0 < c.get("days_remaining", 999) <= 7],
-            key=lambda c: c.get("days_remaining", 999),
-        )
-        if urgent:
-            c0 = urgent[0]
-            clock_str = _c(f" ⏳ {c0.get('label','?')[:24]} ({c0['days_remaining']}d)", _YELLOW)
-
         if ctx_pct >= 75:
             ctx_str = _c(f" [{ctx_pct:.0f}%ctx]", _RED)
         elif ctx_pct >= 50:
@@ -129,7 +118,7 @@ def main():
             ctx_str = ""
 
         header = _c(f"[{name}]", _BOLD) + f" S{session} Day {day} {time_str}{weather_seg}{location_str}"
-        print(f"{header}{combat_str}{clock_str} | {hp_str}{ctx_str}")
+        print(f"{header}{combat_str} | {hp_str}{ctx_str}")
 
     except Exception as e:
         print(f"[ttrpg] err: {e}")
