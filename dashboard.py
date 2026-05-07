@@ -17,11 +17,59 @@ _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
 _2E_DB        = Path(__file__).parent / "global" / "2e.db"
 
+# Cached read-only connections. The reference DBs (monsters/2e/rules) are
+# read-only at runtime, so a single connection per DB shared across Flask
+# threads is safe with check_same_thread=False. Avoids the per-request
+# connect cost on hot endpoints like /combat-state.
+_db_connections: dict[str, sqlite3.Connection] = {}
+
+
+def _db(path: Path) -> sqlite3.Connection:
+    """Get a cached read-only connection to a reference SQLite DB."""
+    key = str(path)
+    conn = _db_connections.get(key)
+    if conn is None:
+        conn = sqlite3.connect(key, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        _db_connections[key] = conn
+    return conn
+
 # ---------------------------------------------------------------------------
 # Global state — set in main()
 # ---------------------------------------------------------------------------
 cfg: dict = {}
 app = Flask(__name__)
+
+
+_cfg_mtime: float = 0.0
+
+
+def _reload_cfg() -> None:
+    """Re-read campaign.json so quests/characters/factions added mid-session
+    via MCP tools show up without restarting the dashboard. mtime-gated:
+    only re-reads when campaign.json has changed since the last refresh."""
+    global _cfg_mtime
+    if not cfg:
+        return
+    p = cfg["_dir"] / "campaign.json"
+    try:
+        m = p.stat().st_mtime
+    except OSError:
+        return
+    if m == _cfg_mtime:
+        return
+    # Pass the name to bypass load_campaign's module cache and return a fresh
+    # dict — the cached dict is shared with the MCP tools and clearing it
+    # there would empty `cfg` too.
+    fresh = _c.load_campaign(cfg["_name"])
+    cfg.clear()
+    cfg.update(fresh)
+    _cfg_mtime = m
+
+
+@app.before_request
+def _refresh_before_request() -> None:
+    _reload_cfg()
 
 # ---------------------------------------------------------------------------
 # Shared HTML base template
@@ -448,17 +496,6 @@ def _world_info_bar(state: dict) -> str:
             coin_parts.append(f"{v} {denom}")
     coin_str = ", ".join(coin_parts) if coin_parts else "0 gp"
 
-    clocks_active = [c for c in state.get("faction_clocks", []) if c.get("days_remaining", 0) > 0]
-    next_clock_html = ""
-    if clocks_active:
-        c0 = sorted(clocks_active, key=lambda c: c["days_remaining"])[0]
-        days = c0["days_remaining"]
-        cls = "urgent" if days <= 7 else ""
-        next_clock_html = (
-            f'<span class="item"><strong>Next clock:</strong>'
-            f'<span class="clock {cls}">{html.escape(c0.get("label","?"))} ({days}d)</span></span>'
-        )
-
     return (
         '<div class="info-bar">'
         f'<span class="item"><strong>Day:</strong>{day}</span>'
@@ -467,7 +504,6 @@ def _world_info_bar(state: dict) -> str:
         f'<span class="item"><strong>Season:</strong>{html.escape(season)}</span>'
         f'<span class="item"><strong>Weather:</strong>{html.escape(weather_label)}</span>'
         f'<span class="item"><strong>Coin:</strong>{html.escape(coin_str)}</span>'
-        f'{next_clock_html}'
         '</div>'
     )
 
@@ -1114,261 +1150,8 @@ def serve_image(filename: str):
     return send_from_directory(str(images_dir), filename)
 
 
-# ---------------------------------------------------------------------------
-# Monsters
-# ---------------------------------------------------------------------------
-
-def _monster_row_to_dict(row) -> dict:
-    keys = ["id","name","frequency","no_appearing","armor_class","move","hit_dice",
-            "thac0","pct_in_lair","treasure_type","no_of_attacks","damage_attack",
-            "special_attacks","special_defenses","magic_resistance","intelligence",
-            "alignment","size","psionic_ability","attack_defense_modes","description",
-            "climate_terrain","morale","xp_value"]
-    return {k: row[k] for k in keys if k in row.keys()}
-
-
-@app.route("/monsters/portraits/<filename>")
-def serve_monster_portrait(filename: str):
-    return send_from_directory(str(_MONSTERS_DIR), filename)
-
-
-@app.route("/monsters/<slug>/generate-portrait", methods=["POST"])
-def generate_monster_portrait(slug: str):
-    if not _MONSTERS_DB.exists():
-        return jsonify({"error": "monsters.db not found"}), 404
-
-    conn = sqlite3.connect(str(_MONSTERS_DB))
-    conn.row_factory = sqlite3.Row
-    name_pattern = slug.replace("-", "%")
-    row = conn.execute(
-        "SELECT * FROM monsters WHERE replace(lower(name),' ','-') LIKE ? "
-        "OR replace(lower(name),' ','%') LIKE ? COLLATE NOCASE LIMIT 1",
-        (slug, name_pattern),
-    ).fetchone()
-    conn.close()
-
-    if row is None:
-        return jsonify({"error": "Monster not found"}), 404
-
-    m = _monster_row_to_dict(row)
-    name = m["name"]
-
-    desc = (m.get("description") or "").strip()
-    prompt_parts = [f"Full body illustration of a {name}"]
-    if m.get("size") and str(m["size"]).upper() not in ("M", "MEDIUM"):
-        prompt_parts.append(f"{m['size'].lower()}-sized creature")
-    if desc:
-        prompt_parts.append(desc)
-    prompt = ". ".join(prompt_parts)
-
-    try:
-        from tools.images import _load_replicate, _generate_image, STYLE_BASE, TONE_STYLES
-        replicate = _load_replicate()
-    except (ImportError, EnvironmentError) as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    tone = cfg.get("tone", "high fantasy")
-    tone_clause = TONE_STYLES.get(tone, tone)
-
-    custom_prompt = ""
-    if request.is_json:
-        custom_prompt = ((request.get_json(silent=True) or {}).get("prompt") or "").strip()
-    subject = custom_prompt if custom_prompt else prompt
-    full_prompt = f"{STYLE_BASE} {tone_clause}. {subject}"
-
-    _MONSTERS_DIR.mkdir(parents=True, exist_ok=True)
-    filename = f"{slug}.png"
-    try:
-        _generate_image(replicate, full_prompt, _MONSTERS_DIR, filename)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    return jsonify({"filename": filename, "slug": slug})
-
-
-@app.route("/monsters")
-def monsters():
-    q = request.args.get("q", "").strip()
-    campaign_name = cfg.get("name", "Campaign")
-
-    if not _MONSTERS_DB.exists():
-        body = "<h1>Monsters</h1><p class='muted'>monsters.db not found.</p>"
-        return render("Monsters", body)
-
-    conn = sqlite3.connect(str(_MONSTERS_DB))
-    conn.row_factory = sqlite3.Row
-
-    if q:
-        rows = conn.execute(
-            "SELECT * FROM monsters WHERE name LIKE ? COLLATE NOCASE ORDER BY name",
-            (f"%{q}%",),
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM monsters ORDER BY name").fetchall()
-    conn.close()
-
-    search_box = (
-        '<form method="get" style="margin-bottom:16px">'
-        '<input name="q" value="{q}" placeholder="Search monsters…" '
-        'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
-        'padding:6px 10px;border-radius:4px;width:300px;font-size:1em">'
-        ' <button type="submit" style="background:#3a2818;border:1px solid #5a4030;'
-        'color:#c8a96e;padding:6px 14px;border-radius:4px;cursor:pointer">Search</button>'
-        '</form>'
-    ).format(q=html.escape(q))
-
-    if not rows:
-        body = f"<h1>Monsters</h1>{search_box}<p class='muted'>No results for '{html.escape(q)}'.</p>"
-        return render("Monsters", body)
-
-    portraits = _monster_portraits_dict()
-
-    cards = []
-    for r in rows:
-        slug = re.sub(r"[^a-z0-9]+", "-", r["name"].lower()).strip("-")
-        portrait_icon = ""
-        if slug in portraits:
-            fn = html.escape(portraits[slug])
-            portrait_icon = (
-                f' <img src="/monsters/portraits/{fn}" alt="" loading="lazy" '
-                f'style="width:32px;height:32px;object-fit:cover;border-radius:3px;'
-                f'vertical-align:middle;margin-left:6px;border:1px solid #4a3828">'
-            )
-        cards.append(
-            f'<div class="card" style="padding:10px 14px">'
-            f'<h2 style="margin:0 0 4px">'
-            f'<a href="/monsters/{html.escape(slug)}">{html.escape(r["name"])}</a>'
-            f'{portrait_icon}</h2>'
-            f'<p class="muted" style="margin:0;font-size:.9em">'
-            f'HD&nbsp;{html.escape(str(r["hit_dice"] or "—"))} &nbsp;·&nbsp; '
-            f'AC&nbsp;{html.escape(str(r["armor_class"] or "—"))} &nbsp;·&nbsp; '
-            f'THAC0&nbsp;{html.escape(str(r["thac0"] or "—"))} &nbsp;·&nbsp; '
-            f'Dmg&nbsp;{html.escape(str(r["damage_attack"] or "—"))} &nbsp;·&nbsp; '
-            f'{html.escape(str(r["alignment"] or "—"))}'
-            f'</p></div>'
-        )
-
-    count_note = f"<p class='muted' style='margin-bottom:12px'>{len(rows)} monster{'s' if len(rows)!=1 else ''}</p>"
-    body = f"<h1>Monsters</h1>{search_box}{count_note}" + "".join(cards)
-    return render("Monsters", body)
-
-
-@app.route("/monsters/<slug>")
-def monster_detail(slug: str):
-    # Convert slug back to a name pattern for lookup
-    name_pattern = slug.replace("-", "%")
-
-    if not _MONSTERS_DB.exists():
-        abort(404)
-
-    conn = sqlite3.connect(str(_MONSTERS_DB))
-    conn.row_factory = sqlite3.Row
-    row = conn.execute(
-        "SELECT * FROM monsters WHERE replace(lower(name),' ','-') LIKE ? "
-        "OR replace(lower(name),' ','%') LIKE ? COLLATE NOCASE LIMIT 1",
-        (slug, name_pattern),
-    ).fetchone()
-    conn.close()
-
-    if row is None:
-        abort(404)
-
-    m = _monster_row_to_dict(row)
-    name = m["name"]
-
-    def stat(label, val):
-        if not val or val == "None":
-            return ""
-        return (
-            f'<tr><th style="width:170px;white-space:nowrap">{html.escape(label)}</th>'
-            f'<td>{html.escape(str(val))}</td></tr>'
-        )
-
-    desc_html = ""
-    if m.get("description"):
-        paras = [p.strip() for p in m["description"].split("\n") if p.strip()]
-        desc_html = "".join(f"<p>{html.escape(p)}</p>" for p in paras)
-
-    table = (
-        "<table>"
-        + stat("Frequency",        m["frequency"])
-        + stat("No. Appearing",    m["no_appearing"])
-        + stat("Climate/Terrain",  m["climate_terrain"])
-        + stat("Armour Class",     m["armor_class"])
-        + stat("Movement",         m["move"])
-        + stat("Hit Dice",         m["hit_dice"])
-        + stat("THAC0",            m["thac0"])
-        + stat("No. of Attacks",   m["no_of_attacks"])
-        + stat("Damage/Attack",    m["damage_attack"])
-        + stat("Special Attacks",  m["special_attacks"])
-        + stat("Special Defenses", m["special_defenses"])
-        + stat("Magic Resistance", m["magic_resistance"])
-        + stat("Intelligence",     m["intelligence"])
-        + stat("Alignment",        m["alignment"])
-        + stat("Size",             m["size"])
-        + stat("Morale",           m["morale"])
-        + stat("% in Lair",        m["pct_in_lair"])
-        + stat("Treasure Type",    m["treasure_type"])
-        + stat("XP Value",         m["xp_value"])
-        + "</table>"
-    )
-
-    portrait_path = _monster_portrait_path(slug)
-    portrait_html = ""
-    if portrait_path:
-        fn = html.escape(portrait_path.name)
-        portrait_html = (
-            f'<div style="text-align:center;margin-bottom:16px">'
-            f'<img src="/monsters/portraits/{fn}" alt="{html.escape(name)}" '
-            f'style="max-width:320px;width:100%;border-radius:6px;border:1px solid #4a3828">'
-            f'</div>'
-        )
-
-    esc_slug = html.escape(slug)
-    btn_label = "Regenerate Portrait" if portrait_path else "Generate Portrait"
-    gen_button = (
-        f'<div style="margin:0 0 12px">'
-        f'<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">'
-        f'<button id="gen-portrait-btn" '
-        f'onclick="generateMonsterPortrait(\'{esc_slug}\')" '
-        f'style="background:#3a2818;border:1px solid #5a4030;color:#c8a96e;'
-        f'padding:6px 16px;border-radius:4px;cursor:pointer;font-size:0.9em;white-space:nowrap">'
-        f'{btn_label}</button>'
-        f'<input id="custom-portrait-prompt" type="text" '
-        f'placeholder="Custom prompt — overrides auto-generated description" '
-        f'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
-        f'padding:5px 10px;border-radius:4px;font-size:0.85em;flex:1;min-width:200px">'
-        f'</div>'
-        f'<span id="gen-portrait-status" style="font-size:0.85em;color:#8a7a60"></span>'
-        f'</div>'
-        f'<script>'
-        f'async function generateMonsterPortrait(slug){{'
-        f'  const btn=document.getElementById("gen-portrait-btn");'
-        f'  const status=document.getElementById("gen-portrait-status");'
-        f'  const cp=document.getElementById("custom-portrait-prompt").value.trim();'
-        f'  btn.disabled=true; btn.textContent="Generating…";'
-        f'  try{{'
-        f'    const opts={{method:"POST"}};'
-        f'    if(cp){{opts.headers={{"Content-Type":"application/json"}};'
-        f'         opts.body=JSON.stringify({{prompt:cp}});}}'
-        f'    const r=await fetch("/monsters/"+slug+"/generate-portrait",opts);'
-        f'    const d=await r.json();'
-        f'    if(d.error){{status.textContent="Error: "+d.error;btn.disabled=false;btn.textContent="{btn_label}";  }}'
-        f'    else{{location.reload();}}'
-        f'  }}catch(e){{status.textContent="Request failed";btn.disabled=false;btn.textContent="{btn_label}";}}'
-        f'}}'
-        f'</script>'
-    )
-
-    body = (
-        f'<p><a href="/monsters">← Monsters</a></p>'
-        f"<h1>{html.escape(name)}</h1>"
-        f"{portrait_html}"
-        f"{gen_button}"
-        f'<div class="card">{table}</div>'
-        + (f'<div class="card" style="margin-top:12px">{desc_html}</div>' if desc_html else "")
-    )
-    return render(f"{html.escape(name)} — Monsters", body)
+# Monster routes are defined in dashboard_monsters.py and registered at the
+# bottom of this module via dashboard_monsters.init(...).
 
 
 # ---------------------------------------------------------------------------
@@ -1402,8 +1185,7 @@ _ALL_SCHOOLS = sorted(set(_WIZARD_SCHOOLS + _PRIEST_SCHOOLS))
 def _spell_query(q: str, caster: str, school: str, level: str):
     if not _2E_DB.exists():
         return []
-    conn = sqlite3.connect(str(_2E_DB))
-    conn.row_factory = sqlite3.Row
+    conn = _db(_2E_DB)
     where, params = ["1=1"], []
     if q:
         where.append("name LIKE ? COLLATE NOCASE")
@@ -1422,7 +1204,6 @@ def _spell_query(q: str, caster: str, school: str, level: str):
         f"WHERE {' AND '.join(where)} ORDER BY level, name",
         params,
     ).fetchall()
-    conn.close()
     return rows
 
 
@@ -1595,10 +1376,8 @@ def spell_detail(spell_id: int):
     if not _2E_DB.exists():
         abort(404)
 
-    conn = sqlite3.connect(str(_2E_DB))
-    conn.row_factory = sqlite3.Row
+    conn = _db(_2E_DB)
     row = conn.execute("SELECT * FROM spells WHERE id=?", (spell_id,)).fetchone()
-    conn.close()
 
     if row is None:
         abort(404)
@@ -1657,10 +1436,8 @@ def classes():
         body = "<h1>Classes</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
         return render("Classes", body)
 
-    conn = sqlite3.connect(str(_2E_DB))
-    conn.row_factory = sqlite3.Row
+    conn = _db(_2E_DB)
     rows = conn.execute("SELECT id, name, hit_die, prime_requisite FROM classes ORDER BY name").fetchall()
-    conn.close()
 
     cards = []
     for r in rows:
@@ -1690,8 +1467,7 @@ def class_detail(slug: str):
         abort(404)
 
     name_pattern = slug.replace("-", " ")
-    conn = sqlite3.connect(str(_2E_DB))
-    conn.row_factory = sqlite3.Row
+    conn = _db(_2E_DB)
     cls_row = conn.execute(
         "SELECT * FROM classes WHERE lower(replace(name,' ','-')) = ? "
         "OR name LIKE ? COLLATE NOCASE LIMIT 1",
@@ -1699,14 +1475,12 @@ def class_detail(slug: str):
     ).fetchone()
 
     if cls_row is None:
-        conn.close()
         abort(404)
 
     level_rows = conn.execute(
         "SELECT * FROM class_levels WHERE class_id=? ORDER BY level",
         (cls_row["id"],),
     ).fetchall()
-    conn.close()
 
     try:
         pr = json.loads(cls_row["prime_requisite"] or "[]")
@@ -1784,314 +1558,9 @@ def class_detail(slug: str):
     return render(f'{html.escape(cls_row["name"])} — Classes', body)
 
 
-# ---------------------------------------------------------------------------
-# Items
-# ---------------------------------------------------------------------------
-
-_ITEM_TYPE_LABELS = {
-    "armor":                    "Armor",
-    "weapon_melee":             "Melee Weapon",
-    "weapon_ranged":            "Ranged Weapon",
-    "weapon_ammo":              "Ammunition",
-    "misc_equipment":           "Equipment",
-    "provisions":               "Provisions",
-    "clothing":                 "Clothing",
-    "item_food_lodging":        "Food & Lodging",
-    "services":                 "Services",
-    "animals":                  "Animals",
-    "tack_harness":             "Tack & Harness",
-    "scroll":                   "Scroll",
-    "potion":                   "Potion",
-    "ring":                     "Ring",
-    "rod":                      "Rod",
-    "staff":                    "Staff",
-    "wand":                     "Wand",
-    "magic_item_armor_special": "Magic Armor",
-    "magic_item_weapon_special":"Magic Weapon",
-    "misc_magic_bags_bottles_pouch": "Bags & Bottles",
-    "misc_magic_books":         "Books",
-    "misc_magic_boots_gloves":  "Boots & Gloves",
-    "misc_magic_candles_etc":   "Candles & Misc",
-    "misc_magic_cloaks_robes":  "Cloaks & Robes",
-    "misc_magic_girdle_hats_helms": "Girdles, Hats & Helms",
-    "misc_magic_household_tools":"Household Tools",
-    "misc_magic_jewelry":       "Jewelry",
-    "misc_magic_musical_instruments": "Instruments",
-    "misc_magic_weird":         "Weird Magic",
-}
-
-_ITEM_TYPE_GROUPS = {
-    "Mundane": ["armor", "weapon_melee", "weapon_ranged", "weapon_ammo",
-                "misc_equipment", "provisions", "clothing", "item_food_lodging",
-                "services", "animals", "tack_harness"],
-    "Magic":   ["scroll", "potion", "ring", "rod", "staff", "wand",
-                "magic_item_armor_special", "magic_item_weapon_special",
-                "misc_magic_bags_bottles_pouch", "misc_magic_books",
-                "misc_magic_boots_gloves", "misc_magic_candles_etc",
-                "misc_magic_cloaks_robes", "misc_magic_girdle_hats_helms",
-                "misc_magic_household_tools", "misc_magic_jewelry",
-                "misc_magic_musical_instruments", "misc_magic_weird"],
-}
-
-
-def _rarity_label(r: int) -> str:
-    if r <= 5:   return "Common"
-    if r <= 20:  return "Uncommon"
-    if r <= 40:  return "Rare"
-    if r <= 55:  return "Very Rare"
-    if r <= 70:  return "Legendary"
-    return "Artifact"
-
-
-_ITEMS_PER_PAGE = 20
-
-
-def _item_query(q: str, itype: str, min_r: int, max_r: int, page: int = 1):
-    if not _2E_DB.exists():
-        return [], 0
-    conn = sqlite3.connect(str(_2E_DB))
-    conn.row_factory = sqlite3.Row
-    where, params = ["rarity BETWEEN ? AND ?"], [min_r, max_r]
-    if q:
-        where.append("name LIKE ? COLLATE NOCASE")
-        params.append(f"%{q}%")
-    if itype:
-        where.append("item_type = ?")
-        params.append(itype)
-    clause = f"WHERE {' AND '.join(where)}"
-    total = conn.execute(f"SELECT COUNT(*) FROM items {clause}", params).fetchone()[0]
-    offset = (page - 1) * _ITEMS_PER_PAGE
-    rows = conn.execute(
-        f"SELECT id, name, item_type, cost, rarity FROM items {clause} "
-        f"ORDER BY rarity, item_type, name LIMIT {_ITEMS_PER_PAGE} OFFSET {offset}",
-        params,
-    ).fetchall()
-    conn.close()
-    return rows, total
-
-
-def _item_card(r) -> str:
-    type_label = _ITEM_TYPE_LABELS.get(r["item_type"], r["item_type"] or "—")
-    rarity_str = _rarity_label(r["rarity"])
-    return (
-        f'<div class="card" style="padding:8px 14px">'
-        f'<h2 style="margin:0 0 2px">'
-        f'<a href="/items/{r["id"]}">{html.escape(r["name"])}</a></h2>'
-        f'<p class="muted" style="margin:0;font-size:.9em">'
-        f'{html.escape(type_label)} &nbsp;·&nbsp; '
-        + (f'Cost:&nbsp;{html.escape(r["cost"])} &nbsp;·&nbsp; ' if r["cost"] else "")
-        + f'{html.escape(rarity_str)}'
-        f'</p></div>'
-    )
-
-
-def _item_pagination(page: int, total_pages: int) -> str:
-    _btn = (
-        'style="background:#3a2818;border:1px solid #5a4030;color:#c8a96e;'
-        'padding:5px 12px;border-radius:4px;cursor:pointer;font-size:.9em"'
-    )
-    _btn_off = (
-        'style="background:#2a2018;border:1px solid #3a2818;color:#5a4040;'
-        'padding:5px 12px;border-radius:4px;font-size:.9em;cursor:default" disabled'
-    )
-    parts = []
-    parts.append(
-        f'<button onclick="iGoTo({page-1})" {_btn}>← Prev</button>'
-        if page > 1 else f'<button {_btn_off}>← Prev</button>'
-    )
-    # Page window: show up to 7 page numbers centred on current
-    lo = max(1, page - 3)
-    hi = min(total_pages, lo + 6)
-    lo = max(1, hi - 6)
-    if lo > 1:
-        parts.append(f'<button onclick="iGoTo(1)" {_btn}>1</button>')
-        if lo > 2:
-            parts.append('<span style="color:#8a7a60;padding:0 4px">…</span>')
-    for n in range(lo, hi + 1):
-        if n == page:
-            parts.append(
-                f'<button {_btn_off} style="background:#3a2818;border:1px solid #5a4030;'
-                f'color:#c8a96e;padding:5px 12px;border-radius:4px;font-size:.9em;'
-                f'font-weight:bold;cursor:default">{n}</button>'
-            )
-        else:
-            parts.append(f'<button onclick="iGoTo({n})" {_btn}>{n}</button>')
-    if hi < total_pages:
-        if hi < total_pages - 1:
-            parts.append('<span style="color:#8a7a60;padding:0 4px">…</span>')
-        parts.append(f'<button onclick="iGoTo({total_pages})" {_btn}>{total_pages}</button>')
-    parts.append(
-        f'<button onclick="iGoTo({page+1})" {_btn}>Next →</button>'
-        if page < total_pages else f'<button {_btn_off}>Next →</button>'
-    )
-    return (
-        f'<div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:12px">'
-        + "".join(parts) + "</div>"
-    )
-
-
-def _item_results_html(rows, total: int, page: int) -> str:
-    if not rows:
-        return "<p class='muted'>No results.</p>"
-    total_pages = (total + _ITEMS_PER_PAGE - 1) // _ITEMS_PER_PAGE
-    count = f"<p class='muted' style='margin-bottom:12px'>{total} item{'s' if total != 1 else ''}</p>"
-    cards = "".join(_item_card(r) for r in rows)
-    pager = _item_pagination(page, total_pages) if total_pages > 1 else ""
-    return count + cards + pager
-
-
-_ITEMS_JS = r"""
-<script>
-let _itimer = null;
-let _iPage  = 1;
-function iGoTo(n) { _iPage = n; iDoFetch(); }
-function iSchedule() {
-  _iPage = 1;
-  clearTimeout(_itimer);
-  _itimer = setTimeout(iDoFetch, 280);
-}
-async function iDoFetch() {
-  const q     = document.getElementById("item-q").value.trim();
-  const itype = document.getElementById("item-type").value;
-  const min_r = document.getElementById("item-min-rarity").value;
-  if (q.length > 0 && q.length < 3) return;
-  const p = new URLSearchParams();
-  if (q)          p.set("q",          q);
-  if (itype)      p.set("type",       itype);
-  if (min_r)      p.set("min_rarity", min_r);
-  if (_iPage > 1) p.set("page",       _iPage);
-  const r = await fetch("/api/items/cards?" + p.toString());
-  document.getElementById("item-results").innerHTML = await r.text();
-}
-document.getElementById("item-q").addEventListener("input", iSchedule);
-document.getElementById("item-type").addEventListener("change", iSchedule);
-document.getElementById("item-min-rarity").addEventListener("change", iSchedule);
-</script>
-"""
-
-
-@app.route("/api/items/cards")
-def api_item_cards():
-    q     = request.args.get("q", "").strip()
-    itype = request.args.get("type", "").strip()
-    try:
-        min_r = int(request.args.get("min_rarity", "0"))
-        max_r = int(request.args.get("max_rarity", "100"))
-        page  = max(1, int(request.args.get("page", "1")))
-    except ValueError:
-        min_r, max_r, page = 0, 100, 1
-    rows, total = _item_query(q, itype, min_r, max_r, page)
-    return Response(_item_results_html(rows, total, page), mimetype="text/html")
-
-
-@app.route("/items")
-def items_list():
-    q       = request.args.get("q", "").strip()
-    itype   = request.args.get("type", "").strip()
-    min_rar = request.args.get("min_rarity", "0").strip()
-
-    if not _2E_DB.exists():
-        body = "<h1>Items</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
-        return render("Items", body)
-
-    try:
-        min_r = int(min_rar)
-    except ValueError:
-        min_r = 0
-    rows, total = _item_query(q, itype, min_r, 100, page=1)
-
-    type_opts = '<option value="">All types</option>'
-    for group, types in _ITEM_TYPE_GROUPS.items():
-        type_opts += f'<optgroup label="{html.escape(group)}">'
-        for t in types:
-            label = _ITEM_TYPE_LABELS.get(t, t)
-            sel = "selected" if itype == t else ""
-            type_opts += f'<option value="{t}" {sel}>{html.escape(label)}</option>'
-        type_opts += '</optgroup>'
-
-    rarity_opts = (
-        '<option value="0">Any rarity</option>'
-        + f'<option value="30" {"selected" if min_rar == "30" else ""}>Rare+</option>'
-        + f'<option value="45" {"selected" if min_rar == "45" else ""}>Very Rare+</option>'
-        + f'<option value="65" {"selected" if min_rar == "65" else ""}>Legendary+</option>'
-    )
-
-    controls = (
-        f'<div style="margin-bottom:20px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
-        f'<input id="item-q" value="{html.escape(q)}" placeholder="Search items…" {INPUT_STYLE} autocomplete="off">'
-        f'<select id="item-type" {SELECT_STYLE}>{type_opts}</select>'
-        f'<select id="item-min-rarity" {SELECT_STYLE}>{rarity_opts}</select>'
-        f'</div>'
-    )
-
-    body = (
-        f"<h1>Items</h1>{controls}"
-        f'<div id="item-results">{_item_results_html(rows, total, 1)}</div>'
-        + _ITEMS_JS
-    )
-    return render("Items", body)
-
-
-@app.route("/items/<int:item_id>")
-def item_detail(item_id: int):
-    if not _2E_DB.exists():
-        abort(404)
-
-    conn = sqlite3.connect(str(_2E_DB))
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
-    conn.close()
-
-    if row is None:
-        abort(404)
-
-    def stat(label, val):
-        if val is None or val == "":
-            return ""
-        return (
-            f'<tr><th style="width:160px;white-space:nowrap">{html.escape(label)}</th>'
-            f'<td>{html.escape(str(val))}</td></tr>'
-        )
-
-    type_label = _ITEM_TYPE_LABELS.get(row["item_type"], row["item_type"] or "—")
-    table = (
-        "<table>"
-        + stat("Type",    type_label)
-        + stat("Cost",    row["cost"])
-        + stat("Weight",  row["weight"])
-        + stat("Rarity",  _rarity_label(row["rarity"]))
-        + stat("Source",  row["source"])
-    )
-    if row["ac"] is not None:
-        table += stat("Armour Class", row["ac"])
-    if row["speed"] is not None:
-        table += (
-            stat("Size",       row["size"])
-            + stat("Type",     row["weapon_type"])
-            + stat("Speed",    row["speed"])
-            + stat("Dmg S/M",  row["damage_sm"])
-            + stat("Dmg L",    row["damage_l"])
-        )
-        if row["rof"]:
-            table += (
-                stat("Rate of Fire", row["rof"])
-                + stat("Range S",   row["range_s"])
-                + stat("Range M",   row["range_m"])
-                + stat("Range L",   row["range_l"])
-            )
-    if row["xp_value"] is not None:
-        table += stat("XP Value", row["xp_value"])
-    table += "</table>"
-
-    desc_html = _markdown_to_html(row["description"]) if row["description"] else ""
-
-    body = (
-        f'<p><a href="/items">← Items</a></p>'
-        f'<h1>{html.escape(row["name"])}</h1>'
-        f'<div class="card">{table}</div>'
-        + (f'<div class="card" style="margin-top:12px">{desc_html}</div>' if desc_html else "")
-    )
-    return render(f'{html.escape(row["name"])} — Items', body)
+# Item routes are defined in dashboard_items.py and registered at the end of
+# this module via dashboard_items.init(...) — keeps this file shorter without
+# changing any behaviour.
 
 
 # ---------------------------------------------------------------------------
@@ -2227,6 +1696,34 @@ def combat_state():
         except Exception:
             pass
     return jsonify({"active": False})
+
+
+# ---------------------------------------------------------------------------
+# Sub-module route registration
+# ---------------------------------------------------------------------------
+import dashboard_items as _dashboard_items
+import dashboard_monsters as _dashboard_monsters
+
+_dashboard_items.init(
+    app,
+    render=render,
+    db_get=_db,
+    _2E_DB=_2E_DB,
+    markdown_to_html=_markdown_to_html,
+    INPUT_STYLE=INPUT_STYLE,
+    SELECT_STYLE=SELECT_STYLE,
+)
+
+_dashboard_monsters.init(
+    app,
+    get_cfg=lambda: cfg,
+    render=render,
+    db_get=_db,
+    _MONSTERS_DB=_MONSTERS_DB,
+    _MONSTERS_DIR=_MONSTERS_DIR,
+    monster_portraits_dict=_monster_portraits_dict,
+    monster_portrait_path=_monster_portrait_path,
+)
 
 
 # ---------------------------------------------------------------------------

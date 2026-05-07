@@ -1,7 +1,9 @@
 """Monster lookup, spell lookup, class lookup, and treasure generation tools."""
+import io
 import json
 import sqlite3
-import subprocess
+import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 import _campaign as _c
 
@@ -22,6 +24,20 @@ def _find_db(candidates) -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def _generate_treasure_text(types_list: list[str]) -> str:
+    """Run treasure.generate_treasure for each type, capture printed output as a
+    single string. Replaces the previous subprocess+regex approach."""
+    if str(BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(BASE_DIR))
+    import treasure  # local import; first call pays parse cost, subsequent are free
+    expanded = treasure.expand_types(types_list)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        for t in expanded:
+            treasure.generate_treasure(t, verbose=True)
+    return buf.getvalue()
 
 
 def register(mcp):
@@ -224,25 +240,15 @@ def register(mcp):
         if not types_list:
             return {"error": "No treasure types provided."}
 
-        treasure_candidates = [
-            BASE_DIR / "treasure.py",
-            BASE_DIR.parent / "ttrpg" / "treasure.py",
-        ]
-        treasure_py = next((p for p in treasure_candidates if p.exists()), None)
-        if treasure_py is None:
-            return {"error": "treasure.py not found."}
-
-        result = subprocess.run(
-            ["python3", str(treasure_py)] + types_list,
-            capture_output=True,
-            text=True,
-            cwd=str(treasure_py.parent),
-        )
+        try:
+            text = _generate_treasure_text(types_list)
+        except Exception as e:
+            return {"error": f"treasure generation failed: {e}"}
 
         return {
             "types":  treasure_types,
-            "result": result.stdout,
-            "error":  result.stderr if result.stderr else None,
+            "result": text,
+            "error":  None,
         }
 
     @mcp.tool()
@@ -260,21 +266,10 @@ def register(mcp):
         if not types_list:
             return {"error": "No treasure types provided."}
 
-        treasure_candidates = [
-            BASE_DIR / "treasure.py",
-            BASE_DIR.parent / "ttrpg" / "treasure.py",
-        ]
-        treasure_py = next((p for p in treasure_candidates if p.exists()), None)
-        if treasure_py is None:
-            return {"error": "treasure.py not found."}
-
-        result = subprocess.run(
-            ["python3", str(treasure_py)] + types_list,
-            capture_output=True,
-            text=True,
-            cwd=str(treasure_py.parent),
-        )
-        text = result.stdout
+        try:
+            text = _generate_treasure_text(types_list)
+        except Exception as e:
+            return {"error": f"treasure generation failed: {e}"}
 
         # ── Parse ────────────────────────────────────────────────────────
         import re as _re
@@ -354,7 +349,6 @@ def register(mcp):
             "magic_items":    magic,
             "loot_pile_size": len(loot_pile),
             "raw_output":     text,
-            "stderr":         result.stderr or None,
         }
 
     @mcp.tool()

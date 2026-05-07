@@ -111,8 +111,6 @@ def register(mcp):
         urgent_clocks:    list = []
 
         for leg_n in range(1, int(days) + 1):
-            # Reload state fresh on each iteration so weather/clocks see the prior day
-            state = _c.load_state(cfg)
             season = state.get("current_season", "spring")
             table = _weather._terrain_table(season, terrain)
             w_label, w_effect = _weather._weighted_pick(table)

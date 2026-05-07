@@ -22,30 +22,29 @@ def register(mcp):
         content = chronicle_path.read_text(encoding="utf-8")
         bullet = f"- {text}\n"
 
-        # Find last ### Session heading
-        matches = list(re.finditer(r'^### Session', content, re.MULTILINE))
+        # Find last "### Session" heading by scanning from the end (rfind beats
+        # regex on a long, growing chronicle). Must start at column 0.
+        marker = "### Session"
+        last = content.rfind(marker)
+        while last > 0 and content[last - 1] != "\n":
+            last = content.rfind(marker, 0, last)
 
-        if not matches:
+        if last < 0:
             # No session yet — just append
             if content and not content.endswith("\n"):
                 content += "\n"
             content += bullet
         else:
-            last_match = matches[-1]
-            after_session = content[last_match.start():]
-
-            # Find the next heading after the last session
-            next_heading = re.search(r'\n(?=#{1,3} )', after_session[1:])
-            if next_heading:
-                insert_pos = last_match.start() + 1 + next_heading.start()
-                # Ensure there's a blank line before the next heading
-                before = content[:insert_pos]
-                after = content[insert_pos:]
+            # Find the next heading (#, ##, ###) after this session header
+            after = content.find("\n#", last + len(marker))
+            if after >= 0:
+                # Insert before the next heading, ensuring a separating newline
+                before = content[:after + 1]
+                tail   = content[after + 1:]
                 if not before.endswith("\n"):
                     before += "\n"
-                content = before + bullet + after
+                content = before + bullet + tail
             else:
-                # Append at end
                 if not content.endswith("\n"):
                     content += "\n"
                 content += bullet

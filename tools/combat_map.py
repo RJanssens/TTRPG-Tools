@@ -159,20 +159,25 @@ def _parse_dsl(dsl: str) -> dict:
     }
 
 
-def _portrait_url(key: str | None, name: str, side: str) -> str | None:
-    """Return a dashboard-relative portrait URL, or None."""
-    camp_dir = _c.campaign_dir()
+def _load_portrait_index(camp_dir: Path) -> list:
+    idx_path = camp_dir / "images" / "index.json"
+    if not idx_path.exists():
+        return []
+    try:
+        return json.loads(idx_path.read_text())
+    except Exception:
+        return []
 
-    if side == "party" and key:
-        idx_path = camp_dir / "images" / "index.json"
-        if idx_path.exists():
-            try:
-                idx = json.loads(idx_path.read_text())
-                matches = [e for e in idx if e.get("type") == "portrait" and e.get("slug") == key]
-                if matches:
-                    return f"/images/{matches[-1]['filename']}"
-            except Exception:
-                pass
+
+def _portrait_url(portrait_idx: list, key: str | None, name: str, side: str) -> str | None:
+    """Return a dashboard-relative portrait URL, or None.
+
+    portrait_idx: pre-loaded images/index.json contents (avoid re-reading per combatant).
+    """
+    if side == "party" and key and portrait_idx:
+        matches = [e for e in portrait_idx if e.get("type") == "portrait" and e.get("slug") == key]
+        if matches:
+            return f"/images/{matches[-1]['filename']}"
 
     # Monster portrait: global/monsters/<slug>.<ext>
     # Strip trailing " #N" counters ("Goblin #2" → "goblin") then normalise.
@@ -190,6 +195,7 @@ def save_combat_state(cfg: dict, session: dict) -> None:
     so that combat.py can clear it on end_combat without importing this whole module."""
     camp_dir = cfg["_dir"]
     idx      = min(session.get("current_idx", 0), max(len(session["combatants"]) - 1, 0))
+    portrait_idx = _load_portrait_index(camp_dir)
 
     combatants_out = []
     for i, c in enumerate(session["combatants"]):
@@ -204,7 +210,8 @@ def save_combat_state(cfg: dict, session: dict) -> None:
             "init":         c.get("init"),
             "conditions":   list(c["conditions"]),
             "current":      i == idx,
-            "portrait_url": _portrait_url(c.get("_key"), c["name"], c["side"]),
+            "portrait_url": _portrait_url(portrait_idx, c.get("_key"), c["name"], c["side"]),
+            "movement":     c.get("movement", 6),
         })
 
     out = {
@@ -214,8 +221,9 @@ def save_combat_state(cfg: dict, session: dict) -> None:
         "grid":       session.get("grid"),
         "combatants": combatants_out,
     }
-    (camp_dir / "combat_state.json").write_text(
-        json.dumps(out, ensure_ascii=False, indent=2)
+    _c.atomic_write_text(
+        camp_dir / "combat_state.json",
+        json.dumps(out, ensure_ascii=False, indent=2),
     )
 
 

@@ -17,11 +17,23 @@ def _norm_slug(slug: str) -> str:
 
 
 def _faction_state(state: dict, slug: str) -> dict:
+    """Get-or-create the dynamic state record for a faction. Mutates `state`;
+    callers that *write* should follow up with save_state. Read-only callers
+    should use _faction_state_view instead."""
     return state.setdefault("faction_state", {}).setdefault(slug, {
         "strength":   100,
         "reputation": 0,
         "discovered": False,
     })
+
+
+_DEFAULT_FACTION_STATE = {"strength": 100, "reputation": 0, "discovered": False}
+
+
+def _faction_state_view(state: dict, slug: str) -> dict:
+    """Read-only view of faction state — returns defaults without mutating
+    `state` or producing a needless save."""
+    return state.get("faction_state", {}).get(slug, _DEFAULT_FACTION_STATE)
 
 
 def register(mcp):
@@ -114,7 +126,7 @@ def register(mcp):
         for slug, f in factions.items():
             if known_only and not f.get("known_to_party"):
                 continue
-            fs = _faction_state(state, slug)
+            fs = _faction_state_view(state, slug)
             out.append({
                 "slug":           slug,
                 "name":           f.get("name", slug),
@@ -125,7 +137,6 @@ def register(mcp):
                 "strength":       fs.get("strength", 100),
                 "reputation":     fs.get("reputation", 0),
             })
-        _c.save_state(cfg, state)
         return {"factions": out}
 
     @mcp.tool()

@@ -66,7 +66,6 @@ def register(mcp):
         npc_slug  = ""
 
         if npc:
-            npcs = cfg.get("factions", {}) and cfg.get("npcs", {})
             slug_key = npc.lower().strip()
             npc_data = cfg.get("npcs", {}).get(slug_key)
             if not npc_data:
