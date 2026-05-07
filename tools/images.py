@@ -8,9 +8,10 @@ import _campaign as _c
 BASE_DIR = Path(__file__).parent.parent
 
 STYLE_BASE = (
-    "AD&D 2nd edition fantasy illustration, ink and watercolor style, muted earth tones. "
-    "Medieval fantasy setting. No text, no labels, no UI elements. "
-    "Strictly no anachronisms: no firearms, no guns, no modern technology."
+    "Tabletop RPG game art illustration, AD&D 2nd edition style, ink and watercolor, muted earth tones. "
+    "Medieval fantasy, non-violent character portrait, safe for work. "
+    "No text, no labels, no UI elements. "
+    "No firearms, no modern technology."
 )
 
 TONE_STYLES = {
@@ -48,7 +49,7 @@ def _update_index(images_dir: Path, entry: dict):
         except (json.JSONDecodeError, ValueError):
             records = []
     records.append(entry)
-    index_file.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    _c.atomic_write_text(index_file, json.dumps(records, indent=2))
 
 
 def _portrait_prompt_for(char: dict) -> str:
@@ -122,7 +123,7 @@ def _generate_image(replicate, full_prompt: str, images_dir: Path, filename: str
             "aspect_ratio":     "1:1",
             "output_format":    "png",
             "output_quality":   95,
-            "safety_tolerance": 5,
+            "safety_tolerance": 6,
         },
     )
     images_dir.mkdir(parents=True, exist_ok=True)

@@ -77,20 +77,39 @@ def _find_combatant(name: str) -> dict | None:
     return None
 
 
-def _spell_casting_time(spell_name: str) -> int | None:
-    """Return casting_time_init from 2e.db, or None if not found."""
+_spell_ct_cache: dict[str, tuple | None] = {}
+
+
+def _spell_casting_time(spell_name: str) -> tuple | None:
+    """Return (casting_time, casting_time_init) from 2e.db, or None if not found.
+    Cached: spell DB is read-only at runtime."""
+    key = spell_name.lower().strip()
+    if key in _spell_ct_cache:
+        return _spell_ct_cache[key]
     if not _2E_DB.exists():
+        _spell_ct_cache[key] = None
         return None
     try:
         conn = sqlite3.connect(str(_2E_DB))
         row = conn.execute(
-            "SELECT casting_time, casting_time_init FROM spells WHERE name LIKE ? COLLATE NOCASE LIMIT 1",
-            (f"%{spell_name}%",),
+            "SELECT casting_time, casting_time_init FROM spells "
+            "WHERE name = ? COLLATE NOCASE "
+            "ORDER BY CASE WHEN caster='wizard' THEN 0 ELSE 1 END LIMIT 1",
+            (spell_name.strip(),),
         ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT casting_time, casting_time_init FROM spells "
+                "WHERE name LIKE ? COLLATE NOCASE "
+                "ORDER BY CASE WHEN caster='wizard' THEN 0 ELSE 1 END, length(name) LIMIT 1",
+                (f"%{spell_name}%",),
+            ).fetchone()
         conn.close()
-        return (row[0], row[1]) if row else None
+        result = (row[0], row[1]) if row else None
     except Exception:
-        return None
+        result = None
+    _spell_ct_cache[key] = result
+    return result
 
 
 def register(mcp):

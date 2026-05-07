@@ -35,29 +35,6 @@ _XP_THRESHOLDS = {
 }
 
 
-def _level_hint(char: dict, xp_total: int) -> str:
-    cls_str = char.get("cls", "").lower()
-    for kw, thresholds in _XP_THRESHOLDS.items():
-        if kw in cls_str:
-            for threshold, level in thresholds:
-                if xp_total >= threshold:
-                    # Find current effective level
-                    pass
-            # Return hint for next uncrossed threshold
-            for threshold, level in thresholds:
-                if xp_total >= threshold:
-                    continue
-                return ""
-            # Check if any threshold is newly met
-            for threshold, level in thresholds:
-                if xp_total >= threshold:
-                    hint_level = level
-                    # Check previous total wasn't already there
-                    # (we don't have prev total here, just signal if >=)
-                    return f"Eligible for level {hint_level} ({kw.capitalize()}, {threshold} XP threshold reached)."
-    return ""
-
-
 def _level_up_hint(char: dict, xp_before: int, xp_after: int) -> str:
     cls_str = char.get("cls", "").lower()
     for kw, thresholds in _XP_THRESHOLDS.items():
@@ -316,7 +293,7 @@ def register(mcp):
 
         # Decrement slot
         slot_cfg = char.get("spell_slots") or {}
-        slot_state = cstate.setdefault("spell_slots", {k: v for k, v in slot_cfg.items()})
+        slot_state = cstate.setdefault("spell_slots", dict(slot_cfg))
         if spell_level:
             lvl_key = str(spell_level)
             remaining = slot_state.get(lvl_key, 0)
@@ -383,7 +360,7 @@ def register(mcp):
         if max_slots == 0:
             return {"error": f"{char.get('label', key)} has no level {level} spell slots."}
 
-        slot_state = cstate.setdefault("spell_slots", {k: v for k, v in slot_cfg.items()})
+        slot_state = cstate.setdefault("spell_slots", dict(slot_cfg))
         current = slot_state.get(lvl_key, max_slots)
         if current <= 0:
             return {"error": f"No level {level} slots remaining for {char.get('label', key)}."}

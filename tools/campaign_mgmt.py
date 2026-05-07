@@ -74,8 +74,7 @@ def register(mcp):
         campaign_data["characters"] = {}
 
         camp_json = camp_dir / "campaign.json"
-        with camp_json.open("w", encoding="utf-8") as f:
-            json.dump(campaign_data, f, indent=2)
+        _c.atomic_write_text(camp_json, json.dumps(campaign_data, indent=2))
 
         # Create empty adventure_log.md
         log_path = camp_dir / "adventure_log.md"
@@ -360,7 +359,7 @@ def register(mcp):
         if memorized_spells:    char_data["memorized_spells"]  = memorized_spells
 
         # Build and store portrait prompt (explicit > auto-generated)
-        from images import _portrait_prompt_for
+        from tools.images import _portrait_prompt_for
         char_data["portrait_prompt"] = portrait_prompt.strip() or _portrait_prompt_for(char_data)
 
         cfg.setdefault("characters", {})[key] = char_data
@@ -381,7 +380,7 @@ def register(mcp):
 
         # Auto-generate portrait using the stored prompt — best-effort
         try:
-            from images import generate_portrait_for
+            from tools.images import generate_portrait_for
             generate_portrait_for(cfg, key, char_data["portrait_prompt"])
         except Exception:
             pass

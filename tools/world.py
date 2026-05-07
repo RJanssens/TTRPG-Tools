@@ -10,6 +10,30 @@ import names
 BASE_DIR = Path(__file__).parent.parent
 _2E_DB   = BASE_DIR / "global" / "2e.db"
 
+# (path, mtime) → first-heading. Avoids re-reading every NPC/location markdown
+# on every list_characters / list_locations call.
+_heading_cache: dict[str, tuple[float, str]] = {}
+
+
+def _first_heading(path: Path) -> str:
+    """Return the first markdown heading text, cached by file mtime."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return path.stem
+    cached = _heading_cache.get(key)
+    if cached and cached[0] == st.st_mtime:
+        return cached[1]
+    if not st.st_size:
+        name = path.stem
+    else:
+        with path.open(encoding="utf-8") as f:
+            first_line = f.readline()
+        name = first_line.lstrip("#").strip() or path.stem
+    _heading_cache[key] = (st.st_mtime, name)
+    return name
+
 
 def _roll_hd(notation: str) -> int:
     """Roll a hit-dice expression like '1d8', '3d10+1'."""
@@ -88,7 +112,7 @@ def register(mcp):
 
         # Auto-generate portrait — best-effort
         try:
-            from images import generate_portrait_for
+            from tools.images import generate_portrait_for
             portrait_prompt = f"Portrait of a {gender or 'person'} {race} {description}".strip()
             generate_portrait_for(cfg, slug, portrait_prompt)
         except Exception:
@@ -287,7 +311,7 @@ def register(mcp):
 
         # Best-effort portrait
         try:
-            from images import generate_portrait_for
+            from tools.images import generate_portrait_for
             portrait_prompt = f"{gender or 'person'} {race} {class_name.lower()} {description}".strip()
             generate_portrait_for(cfg, slug, portrait_prompt)
         except Exception:
@@ -413,10 +437,7 @@ def register(mcp):
 
         characters = []
         for md in sorted(chars_dir.glob("*.md")):
-            slug = md.stem
-            first_line = md.read_text(encoding="utf-8").splitlines()[0] if md.stat().st_size else ""
-            name = first_line.lstrip("#").strip() or slug
-            characters.append({"slug": slug, "name": name})
+            characters.append({"slug": md.stem, "name": _first_heading(md)})
 
         return {"characters": characters}
 
@@ -535,19 +556,13 @@ def register(mcp):
             if not area_dir.exists():
                 return {"areas": [], "locations": []}
             for md in sorted(area_dir.glob("*.md")):
-                slug = md.stem
-                first_line = md.read_text(encoding="utf-8").splitlines()[0] if md.stat().st_size else ""
-                name = first_line.lstrip("#").strip() or slug
-                locations.append({"slug": slug, "area": area, "name": name})
+                locations.append({"slug": md.stem, "area": area, "name": _first_heading(md)})
         else:
             # Top-level: .md files (not in subdirs) + list subdirs as areas
             for item in sorted(locs_dir.iterdir()):
                 if item.is_dir():
                     areas.append(item.name)
                 elif item.is_file() and item.suffix == ".md":
-                    slug = item.stem
-                    first_line = item.read_text(encoding="utf-8").splitlines()[0] if item.stat().st_size else ""
-                    name = first_line.lstrip("#").strip() or slug
-                    locations.append({"slug": slug, "area": "", "name": name})
+                    locations.append({"slug": item.stem, "area": "", "name": _first_heading(item)})
 
         return {"areas": areas, "locations": locations}

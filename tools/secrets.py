@@ -30,8 +30,9 @@ def _load(cfg: dict) -> list:
 
 
 def _save(cfg: dict, records: list):
-    _secrets_path(cfg).write_text(
-        json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8"
+    _c.atomic_write_text(
+        _secrets_path(cfg),
+        json.dumps(records, indent=2, ensure_ascii=False),
     )
 
 

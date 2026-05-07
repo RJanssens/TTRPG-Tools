@@ -1,5 +1,7 @@
 """Campaign state management — imported by all tool modules."""
 import json
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -8,11 +10,45 @@ CAMPAIGNS_DIR = BASE_DIR / "campaigns"
 ACTIVE_FILE   = BASE_DIR / ".active"
 
 _cache: dict | None = None
+_cache_mtime: float = 0.0
+_state_cache: dict[str, tuple[float, dict]] = {}  # name -> (mtime, state)
 
 
 def _invalidate():
-    global _cache
+    global _cache, _cache_mtime
     _cache = None
+    _cache_mtime = 0.0
+    _state_cache.clear()
+
+
+def _mtime(p: Path) -> float:
+    try:
+        return p.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write text to path via tmp+rename so a crash mid-write can't truncate.
+
+    Why: state.json / events.json / campaign.json must never be partially
+    written — a Ctrl-C in the wrong second would corrupt the campaign.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_active_name() -> str:
@@ -39,41 +75,60 @@ def campaign_dir(name: str | None = None) -> Path:
 
 
 def load_campaign(name: str | None = None) -> dict:
-    global _cache
+    """Load campaign.json. mtime-gated: re-reads only if file changed since
+    last load. Pass `name` to force a fresh read (skips cache)."""
+    global _cache, _cache_mtime
     n = name or get_active_name()
-    if not name and _cache and _cache.get("_name") == n:
-        return _cache
     p = campaign_dir(n) / "campaign.json"
     if not p.exists():
         raise FileNotFoundError(f"Campaign '{n}' not found.")
+    m = _mtime(p)
+    if not name and _cache and _cache.get("_name") == n and m == _cache_mtime:
+        return _cache
     cfg = json.loads(p.read_text(encoding="utf-8"))
     cfg["_name"] = n
     cfg["_dir"]  = campaign_dir(n)
     cfg["_data_dir"] = (campaign_dir(n) / cfg.get("data_dir", ".")).resolve()
     if not name:
         _cache = cfg
+        _cache_mtime = m
     return cfg
 
 
 def save_campaign(cfg: dict):
     """Write campaign.json, stripping private _ keys."""
     clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
-    (cfg["_dir"] / "campaign.json").write_text(
-        json.dumps(clean, indent=2), encoding="utf-8"
-    )
+    atomic_write_text(cfg["_dir"] / "campaign.json", json.dumps(clean, indent=2))
 
 
 def load_state(cfg: dict) -> dict:
+    """Load state.json with mtime-gated cache. Returns the cached dict directly
+    (callers mutate it in place; save_state writes back and updates the cache).
+
+    Defense in depth: if the file is mid-write or hand-edited, JSONDecodeError
+    short-circuits to the last cached state rather than crashing the dashboard."""
+    name = cfg.get("_name", "")
     f = cfg["_dir"] / "state.json"
-    if f.exists():
-        return json.loads(f.read_text(encoding="utf-8"))
-    return _seed_state(cfg)
+    if not f.exists():
+        return _seed_state(cfg)
+    m = _mtime(f)
+    cached = _state_cache.get(name)
+    if cached and cached[0] == m:
+        return cached[1]
+    try:
+        state = json.loads(f.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        if cached:
+            return cached[1]
+        raise
+    _state_cache[name] = (m, state)
+    return state
 
 
 def save_state(cfg: dict, state: dict):
-    (cfg["_dir"] / "state.json").write_text(
-        json.dumps(state, indent=2), encoding="utf-8"
-    )
+    path = cfg["_dir"] / "state.json"
+    atomic_write_text(path, json.dumps(state, indent=2))
+    _state_cache[cfg.get("_name", "")] = (_mtime(path), state)
 
 
 def _seed_state(cfg: dict) -> dict:
@@ -100,20 +155,42 @@ def _seed_state(cfg: dict) -> dict:
 
 
 def load_events(cfg: dict) -> list:
-    f = cfg["_dir"] / "events.json"
-    return json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+    """Read all events. Prefers events.jsonl (append-only) but falls back to
+    legacy events.json (single JSON array) for older campaigns. If both exist,
+    legacy entries are returned first, then JSONL appends."""
+    out: list = []
+    legacy = cfg["_dir"] / "events.json"
+    if legacy.exists():
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                out.extend(data)
+        except json.JSONDecodeError:
+            pass
+    jsonl = cfg["_dir"] / "events.jsonl"
+    if jsonl.exists():
+        with jsonl.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return out
 
 
 def append_event(cfg: dict, event: dict):
+    """Append one event as a single JSONL line — O(1) per append, no rewrite."""
     state = load_state(cfg)
     event.setdefault("day",       state.get("current_day", 1))
     event.setdefault("session",   state.get("current_session", 1))
     event.setdefault("timestamp", datetime.now().isoformat(timespec="seconds"))
-    events = load_events(cfg)
-    events.append(event)
-    (cfg["_dir"] / "events.json").write_text(
-        json.dumps(events, indent=2), encoding="utf-8"
-    )
+    jsonl = cfg["_dir"] / "events.jsonl"
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with jsonl.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
 def char_key_for(cfg: dict, label: str) -> tuple[str | None, dict | None]:
