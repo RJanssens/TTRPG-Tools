@@ -1345,19 +1345,69 @@ def gallery():
 
     items = []
     for e in reversed(scenes):
-        fn = html.escape(e.get("filename", ""))
+        fn = e.get("filename", "")
+        fn_safe = html.escape(fn)
         scene = html.escape(e.get("scene", ""))
         desc = html.escape(e.get("description", ""))
         items.append(
-            f'<div class="grid-item">'
-            f'<img src="/images/{fn}" alt="{scene}" loading="lazy">'
+            f'<div class="grid-item" data-filename="{fn_safe}">'
+            f'<button class="gallery-delete" type="button" '
+            f'data-filename="{fn_safe}" '
+            f'title="Delete this picture" aria-label="Delete this picture">×</button>'
+            f'<img src="/images/{fn_safe}" alt="{scene}" loading="lazy">'
             f'<div class="caption"><strong>{scene}</strong>{desc}</div>'
             f'</div>'
         )
 
     body = (
+        "<style>"
+        ".grid-item { position: relative; }"
+        ".gallery-delete {"
+        "  position: absolute; top: 8px; right: 8px; z-index: 5;"
+        "  width: 30px; height: 30px; padding: 0;"
+        "  border-radius: 50%;"
+        "  background: rgba(10,8,5,0.78); border: 1px solid var(--accent-rust);"
+        "  color: #e8a090;"
+        "  font-family: var(--font-body); font-size: 1.15em; line-height: 1;"
+        "  cursor: pointer;"
+        "  display: flex; align-items: center; justify-content: center;"
+        "  opacity: 0; transition: opacity 180ms ease, transform 180ms ease, background 180ms ease, color 180ms ease;"
+        "}"
+        ".grid-item:hover .gallery-delete, "
+        ".gallery-delete:focus { opacity: 1; }"
+        ".gallery-delete:hover {"
+        "  background: rgba(70,20,15,0.92); color: #ffb09a;"
+        "  transform: scale(1.08);"
+        "}"
+        ".gallery-delete:disabled { opacity: 0.5; cursor: not-allowed; }"
+        "</style>"
         f"<h1>{html.escape(campaign_name)} — Gallery</h1>"
         f'<div class="grid">{"".join(items)}</div>'
+        "<script>(function(){"
+        "document.querySelectorAll('.gallery-delete').forEach(function(btn){"
+        "  btn.addEventListener('click', async function(e){"
+        "    e.stopPropagation();"  # don't bubble to lightbox handler
+        "    const fn = btn.dataset.filename;"
+        "    if (!fn) return;"
+        "    if (!confirm('Delete this picture?')) return;"
+        "    btn.disabled = true;"
+        "    try {"
+        "      const r = await fetch('/api/images/' + encodeURIComponent(fn), {method:'DELETE'});"
+        "      if (!r.ok) {"
+        "        const d = await r.json().catch(()=>({}));"
+        "        alert('Delete failed: ' + (d.error || ('HTTP '+r.status)));"
+        "        return;"
+        "      }"
+        "      const card = btn.closest('.grid-item');"
+        "      if (card) card.remove();"
+        "    } catch (err) {"
+        "      alert('Delete failed: ' + err);"
+        "    } finally {"
+        "      btn.disabled = false;"
+        "    }"
+        "  });"
+        "});"
+        "})();</script>"
     )
     return render(f"{campaign_name} — Gallery", body)
 
@@ -4559,6 +4609,42 @@ def location_detail(area: str, slug: str):
 def serve_image(filename: str):
     images_dir = cfg["_data_dir"] / "images"
     return send_from_directory(str(images_dir), filename)
+
+
+@app.route("/api/images/<filename>", methods=["DELETE"])
+def api_image_delete(filename: str):
+    """Delete a campaign image and prune its row from index.json.
+    Validates the filename is a basename and known to the index — refuses
+    paths that traverse out of the images dir."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    # Refuse anything that isn't a plain basename.
+    if "/" in filename or "\\" in filename or filename.startswith(".") or filename in ("", ".", ".."):
+        return jsonify({"error": "invalid filename"}), 400
+
+    images_dir = cfg["_data_dir"] / "images"
+    index_file = images_dir / "index.json"
+    if not index_file.exists():
+        return jsonify({"error": "no image index"}), 404
+
+    try:
+        records = json.loads(index_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return jsonify({"error": f"index unreadable: {exc}"}), 500
+
+    new_records = [r for r in records if r.get("filename") != filename]
+    if len(new_records) == len(records):
+        return jsonify({"error": "filename not in index"}), 404
+
+    target = images_dir / filename
+    if target.exists():
+        try:
+            target.unlink()
+        except OSError as exc:
+            return jsonify({"error": f"file delete failed: {exc}"}), 500
+
+    _c.atomic_write_text(index_file, json.dumps(new_records, indent=2))
+    return jsonify({"ok": True, "deleted": filename})
 
 
 @app.route("/favicon.ico")
