@@ -223,6 +223,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Cinzel:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=JetBrains+Mono:wght@400;500&family=Lora:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
@@ -4558,6 +4559,18 @@ def location_detail(area: str, slug: str):
 def serve_image(filename: str):
     images_dir = cfg["_data_dir"] / "images"
     return send_from_directory(str(images_dir), filename)
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """Serve the SVG favicon for legacy /favicon.ico requests so they don't
+    404 in logs. Browsers that honour the <link rel='icon'> in BASE_TEMPLATE
+    will already have loaded it from /static/favicon.svg."""
+    return send_from_directory(
+        Path(__file__).parent / "static",
+        "favicon.svg",
+        mimetype="image/svg+xml",
+    )
 
 
 # Monster routes are defined in dashboard_monsters.py and registered at the
