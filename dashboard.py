@@ -2034,20 +2034,91 @@ _PLAY_HTML = """
   .turn.dm li { margin: 1px 0; }
   .turn.dm code { color: var(--accent-gold-hi); }
   .turn.dm a { color: var(--accent-gold); }
-  .turn.tool {
+  /* Tool calls render as expandable <details>: summary shows the short
+     name + a key=val preview; expanded body shows the full input JSON and
+     the tool's result once it lands. */
+  details.turn.tool {
     font-family: var(--font-mono);
-    font-size: 0.78em;
+    font-size: 0.84em;
     color: var(--ink-muted);
     background: rgba(15,11,7,0.55);
-    border-left: 1px solid var(--rule);
-    padding: 5px 12px;
-    margin: 8px 0;
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--rule-hi);
     border-radius: 0 2px 2px 0;
+    margin: 6px 0;
+    padding: 0;
   }
-  .turn.tool::before {
-    content: '⚙ ';
+  details.turn.tool > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 5px 12px 5px 10px;
+    color: var(--ink-muted);
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    user-select: none;
+    line-height: 1.45;
+  }
+  details.turn.tool > summary::-webkit-details-marker { display: none; }
+  details.turn.tool > summary::before {
+    content: '▸';
     color: var(--accent-gold);
-    margin-right: 4px;
+    font-size: 0.8em;
+    transition: transform 200ms ease;
+    flex-shrink: 0;
+    width: 10px;
+  }
+  details.turn.tool[open] > summary::before { transform: rotate(90deg); }
+  details.turn.tool[open] > summary {
+    border-bottom: 1px solid var(--rule);
+    background: rgba(200,169,110,0.04);
+  }
+  details.turn.tool .tool-name {
+    color: var(--accent-gold);
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+  details.turn.tool .tool-args {
+    color: var(--ink-muted);
+    font-size: 0.94em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  details.turn.tool .tool-body { padding: 10px 14px 12px; }
+  details.turn.tool .tool-section + .tool-section { margin-top: 10px; }
+  details.turn.tool .tool-section-label {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.66em;
+    color: var(--ink-muted);
+    margin-bottom: 4px;
+  }
+  details.turn.tool .tool-input,
+  details.turn.tool .tool-result {
+    background: var(--bg-deep);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 8px 11px;
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+    color: var(--ink-body);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 380px;
+    overflow-y: auto;
+  }
+  details.turn.tool .tool-pending {
+    color: var(--ink-muted);
+    font-style: italic;
+  }
+  details.turn.tool .tool-error {
+    color: #e08070;
+    font-style: italic;
   }
   .turn.error {
     color: #e08070;
@@ -2495,6 +2566,9 @@ _PLAY_HTML = """
   let thinkingStart = 0;
   let thinkingTimer = null;
   let thinkingTools = 0;
+  // Map tool_use.id → DOM element so tool_result events can fill in the
+  // result section once it lands.
+  const toolElements = new Map();
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -2589,6 +2663,85 @@ _PLAY_HTML = """
     return out.join('\\n');
   }
 
+  function shortToolName(name) {
+    return (name || '?').replace(/^mcp__ttrpg__/, '');
+  }
+
+  function summarizeArgs(input) {
+    if (!input || typeof input !== 'object') return '';
+    const keys = Object.keys(input).slice(0, 4);
+    const parts = keys.map(k => {
+      const v = input[k];
+      if (typeof v === 'string') {
+        const s = v.length > 32 ? v.slice(0, 30) + '…' : v;
+        return k + '=' + JSON.stringify(s);
+      }
+      if (typeof v === 'number' || typeof v === 'boolean') return k + '=' + v;
+      if (Array.isArray(v)) return k + '=[' + v.length + ']';
+      if (v && typeof v === 'object') return k + '={…}';
+      if (v === null) return k + '=null';
+      return k + '=…';
+    });
+    return parts.join(', ');
+  }
+
+  function renderToolResult(blockContent) {
+    // tool_result.content can be a string or a list of {type:'text', text:'…'}
+    if (typeof blockContent === 'string') return blockContent;
+    if (Array.isArray(blockContent)) {
+      return blockContent.map(c => {
+        if (c && typeof c.text === 'string') return c.text;
+        if (c && typeof c === 'object') return JSON.stringify(c, null, 2);
+        return String(c);
+      }).join('\\n');
+    }
+    if (blockContent == null) return '';
+    return JSON.stringify(blockContent, null, 2);
+  }
+
+  function appendToolUse(block) {
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    const det = document.createElement('details');
+    det.className = 'turn tool';
+    const name = shortToolName(block.name);
+    const argsPreview = summarizeArgs(block.input);
+    const argSuffix = argsPreview ? '(' + argsPreview + ')' : '()';
+    const inputJson = JSON.stringify(block.input || {}, null, 2);
+    det.innerHTML =
+        '<summary>'
+      +   '<span class="tool-name">' + esc(name) + '</span>'
+      +   '<span class="tool-args">' + esc(argSuffix) + '</span>'
+      + '</summary>'
+      + '<div class="tool-body">'
+      +   '<div class="tool-section">'
+      +     '<div class="tool-section-label">Input</div>'
+      +     '<pre class="tool-input">' + esc(inputJson) + '</pre>'
+      +   '</div>'
+      +   '<div class="tool-section">'
+      +     '<div class="tool-section-label">Result</div>'
+      +     '<pre class="tool-result"><span class="tool-pending">awaiting…</span></pre>'
+      +   '</div>'
+      + '</div>';
+    if (thinkingEl && thinkingEl.parentElement === log) {
+      log.insertBefore(det, thinkingEl);
+    } else {
+      log.appendChild(det);
+    }
+    log.scrollTop = log.scrollHeight;
+    if (block.id) toolElements.set(block.id, det);
+    return det;
+  }
+
+  function fillToolResult(toolUseId, content, isError) {
+    const det = toolElements.get(toolUseId);
+    if (!det) return;
+    const resultEl = det.querySelector('.tool-result');
+    if (!resultEl) return;
+    const text = renderToolResult(content);
+    resultEl.textContent = text || '(empty)';
+    if (isError) resultEl.classList.add('tool-error');
+  }
+
   function startThinking() {
     stopThinking();
     if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
@@ -2657,8 +2810,15 @@ _PLAY_HTML = """
         } else if (block.type === 'tool_use') {
           thinkingTools++;
           updateThinkingTime();
-          const args = block.input ? Object.keys(block.input).slice(0, 3).join(', ') : '';
-          append('tool', (block.name || '?') + '(' + args + ')');
+          appendToolUse(block);
+        }
+      }
+    } else if (evt.type === 'user' && evt.message && Array.isArray(evt.message.content)) {
+      // Tool results: pair each tool_result block with the matching tool_use
+      // element by id and fill in its result section.
+      for (const block of evt.message.content) {
+        if (block && block.type === 'tool_result' && block.tool_use_id) {
+          fillToolResult(block.tool_use_id, block.content, !!block.is_error);
         }
       }
     } else if (evt.type === 'result') {
@@ -2733,13 +2893,15 @@ _PLAY_HTML = """
       const conds = (c.conditions || []).map(x =>
         '<span class="cond-chip">' + esc(x) + '</span>').join('');
       const cls = [c.cls, c.level].filter(Boolean).join(' ').trim();
+      const acStr = (c.ac !== undefined && c.ac !== null) ? 'AC ' + c.ac : '';
+      const sub = [cls, acStr].filter(Boolean).join('  \\u00b7  ');
       const sheetUrl = '/sheets/' + encodeURIComponent(c.key || '');
       return ''
         + '<article class="party-mini">'
         +   '<a class="portrait-frame ' + (ko ? 'kod ' : '') + (c.portrait ? '' : 'empty') + '" href="' + sheetUrl + '" title="Open ' + esc(c.label) + '\\u2019s sheet">' + portrait + '</a>'
         +   '<div class="party-mini-body">'
         +     '<a class="party-mini-name" href="' + sheetUrl + '">' + esc(c.label) + '</a>'
-        +     (cls ? '<div class="party-mini-class">' + esc(cls) + '</div>' : '')
+        +     (sub ? '<div class="party-mini-class">' + esc(sub) + '</div>' : '')
         +     '<div class="party-mini-hp">'
         +       '<span class="hp-meter"><i style="width:' + pct.toFixed(1) + '%"></i></span>'
         +       '<span class="party-mini-hp-text">' + esc(c.hp) + '/' + esc(c.hp_max) + '</span>'
