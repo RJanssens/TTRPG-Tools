@@ -2173,6 +2173,51 @@ _PLAY_HTML = """
     to { transform: rotate(360deg); }
   }
 
+  /* "DM is thinking" indicator: pulsing dots, live elapsed time, tool count.
+     Sits in the log between the player turn and the eventual DM reply, then
+     is removed once the first text block arrives. */
+  .turn.thinking {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 18px;
+    margin: 14px 0;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: linear-gradient(to bottom, rgba(200,169,110,0.04), transparent);
+    color: var(--ink-muted);
+    font-style: italic;
+    font-size: 0.92em;
+  }
+  .turn.thinking .thinking-glyph {
+    display: inline-flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .turn.thinking .thinking-glyph span {
+    width: 6px;
+    height: 6px;
+    background: var(--accent-gold);
+    border-radius: 50%;
+    box-shadow: 0 0 6px rgba(200,169,110,0.45);
+    animation: thinkingDot 1.25s ease-in-out infinite;
+  }
+  .turn.thinking .thinking-glyph span:nth-child(2) { animation-delay: 0.16s; }
+  .turn.thinking .thinking-glyph span:nth-child(3) { animation-delay: 0.32s; }
+  @keyframes thinkingDot {
+    0%, 70%, 100% { opacity: 0.2; transform: scale(0.7); }
+    35%           { opacity: 1;   transform: scale(1.15); }
+  }
+  .turn.thinking .thinking-text { flex: 1; }
+  .turn.thinking .thinking-time {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    font-style: normal;
+    color: var(--accent-gold);
+    letter-spacing: 0;
+    white-space: nowrap;
+  }
+
   /* ---- Sidebar ---- */
   .play-side {
     background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
@@ -2444,6 +2489,10 @@ _PLAY_HTML = """
   const makePicBtn = document.getElementById('play-make-pic');
   let firstAppend = true;
   let lastDmText = '';
+  let thinkingEl = null;
+  let thinkingStart = 0;
+  let thinkingTimer = null;
+  let thinkingTools = 0;
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -2538,6 +2587,39 @@ _PLAY_HTML = """
     return out.join('\\n');
   }
 
+  function startThinking() {
+    stopThinking();
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    thinkingTools = 0;
+    thinkingStart = performance.now();
+    thinkingEl = document.createElement('div');
+    thinkingEl.className = 'turn thinking';
+    thinkingEl.innerHTML =
+        '<span class="thinking-glyph" aria-hidden="true"><span></span><span></span><span></span></span>'
+      + '<span class="thinking-text">DM is thinking…</span>'
+      + '<span class="thinking-time">0.0s</span>';
+    log.appendChild(thinkingEl);
+    log.scrollTop = log.scrollHeight;
+    updateThinkingTime();
+    thinkingTimer = setInterval(updateThinkingTime, 200);
+  }
+
+  function updateThinkingTime() {
+    if (!thinkingEl) return;
+    const sec = ((performance.now() - thinkingStart) / 1000).toFixed(1);
+    const note = thinkingTools > 0
+      ? '  ·  ' + thinkingTools + ' tool call' + (thinkingTools === 1 ? '' : 's')
+      : '';
+    const t = thinkingEl.querySelector('.thinking-time');
+    if (t) t.textContent = sec + 's' + note;
+  }
+
+  function stopThinking() {
+    if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
+    if (thinkingEl && thinkingEl.parentElement) thinkingEl.remove();
+    thinkingEl = null;
+  }
+
   function append(role, text) {
     if (firstAppend) {
       log.innerHTML = '';
@@ -2550,7 +2632,14 @@ _PLAY_HTML = """
     } else {
       div.textContent = text;
     }
-    log.appendChild(div);
+    // Insert before the thinking indicator (if it's still up) so the new
+    // turn appears above the still-running spinner — keeps things in
+    // chronological order.
+    if (thinkingEl && thinkingEl.parentElement === log) {
+      log.insertBefore(div, thinkingEl);
+    } else {
+      log.appendChild(div);
+    }
     log.scrollTop = log.scrollHeight;
   }
 
@@ -2560,9 +2649,12 @@ _PLAY_HTML = """
     } else if (evt.type === 'assistant' && evt.message && Array.isArray(evt.message.content)) {
       for (const block of evt.message.content) {
         if (block.type === 'text' && block.text) {
+          stopThinking();          // first prose arrives — drop the indicator
           append('dm', block.text);
-          lastDmText = block.text;  // remember for "Make picture"
+          lastDmText = block.text;
         } else if (block.type === 'tool_use') {
+          thinkingTools++;
+          updateThinkingTime();
           const args = block.input ? Object.keys(block.input).slice(0, 3).join(', ') : '';
           append('tool', (block.name || '?') + '(' + args + ')');
         }
@@ -2580,8 +2672,8 @@ _PLAY_HTML = """
 
   async function submitTurn(text) {
     append('player', text);
+    startThinking();
     send.disabled = true;
-    statusEl.textContent = 'thinking…';
     try {
       const resp = await fetch('/play/turn', {
         method: 'POST',
@@ -2611,6 +2703,7 @@ _PLAY_HTML = """
     } catch (err) {
       append('error', String(err));
     } finally {
+      stopThinking();
       send.disabled = false;
       statusEl.textContent = '';
       input.focus();
