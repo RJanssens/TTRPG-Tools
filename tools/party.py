@@ -187,7 +187,10 @@ def register(mcp):
 
         _c.save_state(cfg, state)
 
-        # Sync with active combat session
+        # Sync with active combat session — and persist combat_state.json so
+        # the dashboard sidebar and statusline (which read live HP from that
+        # file) reflect the heal immediately. Without the persist call the
+        # in-memory tracker would be correct but the on-disk file stale.
         combat_synced = False
         try:
             from tools import combat as _combat
@@ -195,10 +198,11 @@ def register(mcp):
             if sess:
                 for c in sess["combatants"]:
                     if c.get("_key") == key:
-                        c_hp_before = c["hp"]
                         c["hp"] = min(c["hp"] + amount, hp_max)
                         combat_synced = True
                         break
+                if combat_synced:
+                    _combat._persist_session()
         except Exception:
             pass
 
