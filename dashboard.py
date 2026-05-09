@@ -2313,6 +2313,10 @@ _PLAY_HTML = """
   .turn.dm li { margin: 1px 0; }
   .turn.dm code { color: var(--accent-gold-hi); }
   .turn.dm a { color: var(--accent-gold); }
+  /* Tables inside DM turns: tighter than full-page tables, otherwise
+     inherits the base styling. */
+  .turn.dm table { width: auto; max-width: 100%; font-size: 0.94em; margin: 10px 0; }
+  .turn.dm th, .turn.dm td { padding: 5px 10px; vertical-align: top; }
   /* Tool calls render as expandable <details>: summary shows the short
      name + a key=val preview; expanded body shows the full input JSON and
      the tool's result once it lands. */
@@ -3087,6 +3091,39 @@ _PLAY_HTML = """
         }
         out.push('<ol>' + items.map(it => '<li>' + renderInline(it) + '</li>').join('') + '</ol>');
         continue;
+      }
+
+      // Pipe table: header row | separator | data rows. The separator
+      // pattern is just dashes/colons/pipes/whitespace and must contain
+      // at least one dash, which distinguishes it from a single-row
+      // pipe-laden line.
+      if (t.startsWith('|') && t.endsWith('|') && t.length > 2) {
+        const next = (i + 1 < lines.length) ? lines[i + 1].trim() : '';
+        if (/^\\|[\\s\\-:|]+\\|$/.test(next) && next.indexOf('-') >= 0) {
+          flushPara();
+          const splitRow = (line) =>
+            line.slice(1, -1).split('|').map(c => c.trim());
+          const headerCells = splitRow(t);
+          i += 2;  // skip header + separator
+          const rows = [];
+          while (i < lines.length) {
+            const rl = lines[i].trim();
+            if (!(rl.startsWith('|') && rl.endsWith('|'))) break;
+            rows.push(splitRow(rl));
+            i++;
+          }
+          let html = '<table><thead><tr>';
+          for (const h of headerCells) html += '<th>' + renderInline(h) + '</th>';
+          html += '</tr></thead><tbody>';
+          for (const r of rows) {
+            html += '<tr>';
+            for (const c of r) html += '<td>' + renderInline(c) + '</td>';
+            html += '</tr>';
+          }
+          html += '</tbody></table>';
+          out.push(html);
+          continue;
+        }
       }
 
       para.push(t);
