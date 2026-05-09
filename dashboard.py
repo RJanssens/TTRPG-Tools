@@ -2547,6 +2547,43 @@ _PLAY_HTML = """
   }
   dialog.hint-dialog button#hint-submit { border-color: var(--accent-gold); }
 
+  /* "Load earlier turns" button at the top of the log. */
+  .load-more-btn {
+    display: block;
+    margin: 0 auto 14px;
+    padding: 5px 16px;
+    background: transparent;
+    border: 1px solid var(--rule-hi);
+    border-radius: 2px;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-size: 0.7em;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    transition: all 180ms ease;
+  }
+  .load-more-btn:hover { border-color: var(--accent-gold); color: var(--accent-gold-hi); }
+  .load-more-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* History tool summaries — non-interactive (no input/result available). */
+  .turn.tool.history-tool {
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    color: var(--ink-muted);
+    padding: 5px 12px;
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--rule-hi);
+    background: rgba(15,11,7,0.4);
+    margin: 6px 0;
+    border-radius: 0 2px 2px 0;
+  }
+  .turn.tool.history-tool::before {
+    content: '⚙ ';
+    color: var(--accent-gold);
+    margin-right: 2px;
+  }
+
   /* Generated scene image inline in the chat log. */
   .turn.scene {
     text-align: center;
@@ -2914,7 +2951,8 @@ _PLAY_HTML = """
       </form>
     </dialog>
     <div class="play-log" id="play-log">
-      <div class="empty-state">
+      <button id="load-more" class="load-more-btn" type="button" hidden>↑ Load earlier turns</button>
+      <div class="empty-state" id="empty-state">
         <img src="/static/play-hero.png" alt="" class="play-hero">
         <div class="empty-state-text">Begin when ready. Describe an action below to address the DM.</div>
       </div>
@@ -3170,11 +3208,30 @@ _PLAY_HTML = """
     thinkingEl = null;
   }
 
-  function append(role, text) {
+  function clearEmptyState() {
     if (firstAppend) {
-      log.innerHTML = '';
+      const placeholder = document.getElementById('empty-state');
+      if (placeholder) placeholder.remove();
       firstAppend = false;
     }
+  }
+
+  function buildHistoryTurn(t) {
+    const div = document.createElement('div');
+    div.className = 'turn ' + t.role;
+    if (t.role === 'dm') {
+      div.innerHTML = renderMarkdown(t.text);
+    } else if (t.role === 'tool') {
+      div.classList.add('history-tool');
+      div.textContent = t.text;
+    } else {
+      div.textContent = t.text;
+    }
+    return div;
+  }
+
+  function append(role, text) {
+    clearEmptyState();
     const div = document.createElement('div');
     div.className = 'turn ' + role;
     if (role === 'dm') {
@@ -3513,13 +3570,69 @@ _PLAY_HTML = """
     sidEl.textContent = d.session_id ? d.session_id.slice(0, 8) : '(new)';
   });
 
-  // Replay the most recent DM reply from the resumed session, if any.
-  fetch('/api/last_narrative').then(r => r.json()).then(d => {
-    if (d && d.text) {
-      append('dm', d.text);
-      lastDmText = d.text;
+  // ------------------------------------------------------------------
+  // Initial replay + Load-earlier pagination.
+  // On load we fetch the last few turns from the resumed session so the
+  // page has context. The "↑ Load earlier turns" button at the top of
+  // the chat log walks further back in pages of 20.
+  // ------------------------------------------------------------------
+  const loadMoreBtn = document.getElementById('load-more');
+  let oldestLoadedIdx = null;
+
+  async function initialReplay() {
+    try {
+      const r = await fetch('/api/history?limit=10');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.turns || !d.turns.length) return;
+      clearEmptyState();
+      const frag = document.createDocumentFragment();
+      for (const t of d.turns) frag.appendChild(buildHistoryTurn(t));
+      // Insert AFTER the load-more button so the button stays at the top.
+      loadMoreBtn.after(frag);
+      oldestLoadedIdx = d.oldest_idx;
+      loadMoreBtn.hidden = !d.has_more;
+      // Seed lastDmText with the most recent DM turn for "Make picture".
+      for (let i = d.turns.length - 1; i >= 0; i--) {
+        if (d.turns[i].role === 'dm') { lastDmText = d.turns[i].text; break; }
+      }
+      log.scrollTop = log.scrollHeight;
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadEarlier() {
+    if (oldestLoadedIdx == null) return;
+    loadMoreBtn.disabled = true;
+    const orig = loadMoreBtn.textContent;
+    loadMoreBtn.textContent = 'loading…';
+    try {
+      const r = await fetch('/api/history?before=' + oldestLoadedIdx + '&limit=20');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.turns || !d.turns.length) {
+        loadMoreBtn.hidden = true;
+        return;
+      }
+      // Preserve scroll: prepending raises content above the viewport;
+      // we want the existing first-visible turn to stay where it is.
+      const heightBefore = log.scrollHeight;
+      const scrollBefore = log.scrollTop;
+
+      const frag = document.createDocumentFragment();
+      for (const t of d.turns) frag.appendChild(buildHistoryTurn(t));
+      loadMoreBtn.after(frag);
+
+      log.scrollTop = scrollBefore + (log.scrollHeight - heightBefore);
+
+      oldestLoadedIdx = d.oldest_idx;
+      if (!d.has_more) loadMoreBtn.hidden = true;
+    } catch (e) { /* ignore */ } finally {
+      loadMoreBtn.disabled = false;
+      loadMoreBtn.textContent = orig;
     }
-  }).catch(() => {});
+  }
+  loadMoreBtn.addEventListener('click', loadEarlier);
+  initialReplay();
 
   // ------------------------------------------------------------------
   // Server-side turn-state watcher — surfaces a "DM still thinking from
@@ -3631,6 +3744,48 @@ def api_last_narrative():
     so the /play surface can replay it on reload. Returns {"text": null} when
     there's no session, no transcript, or no recorded DM prose yet."""
     return jsonify({"text": _dm.last_dm_text()})
+
+
+@app.route("/api/history")
+def api_history():
+    """Return a slice of the resumed session's parsed transcript so /play
+    can render context on load and walk the conversation backward in pages.
+
+    Query params:
+        before: int — return turns whose chronological index is < this.
+                Defaults to the total turn count (i.e. "all turns").
+        limit:  int — max turns to return (clamped to 1..100, default 20).
+
+    Each returned turn carries its absolute ``idx`` in the session so the
+    client can pass the oldest idx as the next ``before`` cursor."""
+    sid = _dm.session_id()
+    empty = {"turns": [], "total": 0, "has_more": False, "oldest_idx": 0}
+    if not sid:
+        return jsonify(empty)
+    p = _dm._project_jsonl_dir() / f"{sid}.jsonl"
+    if not p.exists():
+        return jsonify(empty)
+
+    all_turns = _export.parse_session(p)
+    total = len(all_turns)
+
+    before = request.args.get("before", type=int, default=total)
+    limit = max(1, min(request.args.get("limit", type=int, default=20), 100))
+
+    end = max(0, min(before, total))
+    start = max(0, end - limit)
+    chunk = all_turns[start:end]
+
+    return jsonify({
+        "turns": [
+            {"role": t.role, "text": t.text, "idx": start + i,
+             "timestamp": t.timestamp}
+            for i, t in enumerate(chunk)
+        ],
+        "total": total,
+        "has_more": start > 0,
+        "oldest_idx": start,
+    })
 
 
 @app.route("/api/turn_state")
