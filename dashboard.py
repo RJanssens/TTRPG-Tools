@@ -2224,6 +2224,74 @@ _PLAY_HTML = """
   .play-form button:hover:not(:disabled) svg { transform: translateX(2px); }
   .play-form button:disabled { opacity: 0.4; cursor: not-allowed; }
 
+  /* Hint dialog (Make picture with a hint). Native <dialog> + theming. */
+  dialog.hint-dialog {
+    background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--accent-gold);
+    border-radius: 4px;
+    padding: 22px 24px;
+    box-shadow: var(--shadow-deep);
+    color: var(--ink-body);
+    font-family: var(--font-body);
+    max-width: 520px;
+    width: calc(100vw - 60px);
+  }
+  dialog.hint-dialog::backdrop {
+    background: rgba(10,8,5,0.72);
+    backdrop-filter: blur(3px);
+  }
+  dialog.hint-dialog h3 {
+    margin: 0 0 4px;
+    font-family: var(--font-display);
+    color: var(--accent-gold);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 1em;
+  }
+  dialog.hint-dialog p.muted { margin-bottom: 14px; font-size: 0.92em; }
+  dialog.hint-dialog textarea {
+    width: 100%;
+    background: var(--bg-rec);
+    color: var(--ink-body);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 10px 12px;
+    font-family: var(--font-body);
+    font-size: 1em;
+    resize: vertical;
+    min-height: 70px;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
+  }
+  dialog.hint-dialog textarea:focus {
+    outline: none;
+    border-color: var(--accent-gold);
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3), 0 0 0 1px rgba(200,169,110,0.25);
+  }
+  dialog.hint-dialog .hint-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 14px;
+  }
+  dialog.hint-dialog button {
+    background: linear-gradient(to bottom, #4a3625, #2e2014);
+    color: var(--ink-display);
+    border: 1px solid var(--rule-hi);
+    border-radius: 3px;
+    padding: 7px 18px;
+    font-family: var(--font-display);
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    transition: all 180ms ease;
+  }
+  dialog.hint-dialog button:hover {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold-hi);
+  }
+  dialog.hint-dialog button#hint-submit { border-color: var(--accent-gold); }
+
   /* Generated scene image inline in the chat log. */
   .turn.scene {
     text-align: center;
@@ -2246,6 +2314,40 @@ _PLAY_HTML = """
     letter-spacing: 0.2em;
     margin-top: 8px;
     font-style: normal;
+  }
+  /* Expandable prompt-detail under generated scenes. */
+  .turn.scene details.scene-prompt {
+    margin: 8px auto 0;
+    max-width: 80%;
+    text-align: left;
+    font-size: 0.84em;
+  }
+  .turn.scene details.scene-prompt > summary {
+    list-style: none;
+    cursor: pointer;
+    color: var(--ink-muted);
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.78em;
+    text-align: center;
+  }
+  .turn.scene details.scene-prompt > summary::-webkit-details-marker { display: none; }
+  .turn.scene details.scene-prompt > summary::before {
+    content: '▸ ';
+    color: var(--accent-gold);
+  }
+  .turn.scene details.scene-prompt[open] > summary::before { content: '▾ '; }
+  .turn.scene details.scene-prompt p {
+    margin: 8px 0 0;
+    color: var(--ink-muted);
+    font-style: italic;
+    font-family: var(--font-body);
+    font-size: 1em;
+    text-transform: none;
+    letter-spacing: 0;
+    text-align: left;
+    line-height: 1.5;
   }
   .turn.generating {
     text-align: center;
@@ -2542,8 +2644,20 @@ _PLAY_HTML = """
       <span class="spacer"></span>
       <span id="play-status"></span>
       <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
+      <button id="play-make-pic-hint" type="button" class="icon-btn" title="Make picture with a hint" aria-label="Make picture with a hint">…</button>
       <button id="play-reset" type="button">New session</button>
     </div>
+    <dialog id="hint-dialog" class="hint-dialog">
+      <form id="hint-form">
+        <h3>Make picture with a hint</h3>
+        <p class="muted">Optional extra direction for the illustrator. Combined with the last DM reply.</p>
+        <textarea id="hint-text" placeholder="e.g. focus on the treasure pile · show Korrhast in the foreground · stormy mood" rows="3"></textarea>
+        <div class="hint-actions">
+          <button type="button" id="hint-cancel">Cancel</button>
+          <button type="submit" id="hint-submit">Generate</button>
+        </div>
+      </form>
+    </dialog>
     <div class="play-log" id="play-log">
       <div class="empty-state">
         <img src="/static/play-hero.png" alt="" class="play-hero">
@@ -2992,7 +3106,7 @@ _PLAY_HTML = """
     append('meta', 'new session started');
   });
 
-  makePicBtn.addEventListener('click', async () => {
+  async function runMakePicture(hint) {
     if (!lastDmText) {
       statusEl.textContent = 'no DM text yet';
       setTimeout(() => { statusEl.textContent = ''; }, 2000);
@@ -3001,15 +3115,20 @@ _PLAY_HTML = """
     if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
     const placeholder = document.createElement('div');
     placeholder.className = 'turn generating';
-    placeholder.textContent = 'illustrating the scene…';
+    placeholder.textContent = hint
+      ? 'illustrating the scene with hint: "' + hint + '"…'
+      : 'composing prompt and illustrating the scene…';
     log.appendChild(placeholder);
     log.scrollTop = log.scrollHeight;
     makePicBtn.disabled = true;
+    hintBtn.disabled = true;
     try {
+      const body = {prompt: lastDmText.slice(0, 4000)};
+      if (hint) body.hint = hint;
       const r = await fetch('/play/generate_scene', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({prompt: lastDmText.slice(0, 1500)}),
+        body: JSON.stringify(body),
       });
       const d = await r.json();
       if (!r.ok || d.error) {
@@ -3018,14 +3137,55 @@ _PLAY_HTML = """
         return;
       }
       placeholder.className = 'turn scene';
-      placeholder.innerHTML = '<img src="' + esc(d.url) + '" alt="generated scene"><span class="caption">scene</span>';
+      const captionLabel = d.prepass ? 'scene · Claude-composed' : 'scene';
+      const promptDetails = d.prompt
+        ? '<details class="scene-prompt"><summary>prompt</summary><p>' + esc(d.prompt) + '</p></details>'
+        : '';
+      placeholder.innerHTML =
+          '<img src="' + esc(d.url) + '" alt="generated scene">'
+        + '<span class="caption">' + esc(captionLabel) + '</span>'
+        + promptDetails;
       log.scrollTop = log.scrollHeight;
     } catch (err) {
       placeholder.className = 'turn error';
       placeholder.textContent = 'image generation failed: ' + String(err);
     } finally {
       makePicBtn.disabled = false;
+      hintBtn.disabled = false;
     }
+  }
+
+  const hintBtn = document.getElementById('play-make-pic-hint');
+  const hintDialog = document.getElementById('hint-dialog');
+  const hintForm = document.getElementById('hint-form');
+  const hintText = document.getElementById('hint-text');
+  const hintCancel = document.getElementById('hint-cancel');
+
+  makePicBtn.addEventListener('click', () => runMakePicture(''));
+
+  hintBtn.addEventListener('click', () => {
+    if (!lastDmText) {
+      statusEl.textContent = 'no DM text yet';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    hintText.value = '';
+    if (typeof hintDialog.showModal === 'function') {
+      hintDialog.showModal();
+    } else {
+      // Older browser fallback — shouldn't happen, but degrades to prompt().
+      const h = window.prompt('Hint for the illustrator:');
+      if (h !== null) runMakePicture(h.trim());
+      return;
+    }
+    setTimeout(() => hintText.focus(), 30);
+  });
+  hintCancel.addEventListener('click', () => hintDialog.close());
+  hintForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const h = hintText.value.trim();
+    hintDialog.close();
+    runMakePicture(h);
   });
 
   // Narrative font-family cycle: three options, from thematic to maximally
@@ -3106,6 +3266,79 @@ _PLAY_HTML = """
     }
   }).catch(() => {});
 
+  // ------------------------------------------------------------------
+  // Server-side turn-state watcher — surfaces a "DM still thinking from
+  // a previous turn" indicator after a reload / network drop, disables
+  // Send while the server lock is held, and replays the new narrative
+  // once the in-flight turn lands.
+  // ------------------------------------------------------------------
+  let recoveryEl = null;
+  let lockedBySrv = false;
+  function startRecovery() {
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    recoveryEl = document.createElement('div');
+    recoveryEl.className = 'turn thinking';
+    recoveryEl.innerHTML =
+        '<span class="thinking-glyph" aria-hidden="true"><span></span><span></span><span></span></span>'
+      + '<span class="thinking-text">DM still working on a previous turn…</span>'
+      + '<span class="thinking-time"></span>';
+    log.appendChild(recoveryEl);
+    log.scrollTop = log.scrollHeight;
+  }
+  function updateRecovery(state) {
+    if (!recoveryEl) return;
+    const t = recoveryEl.querySelector('.thinking-time');
+    if (!t) return;
+    const sec = state.started_at
+      ? (Date.now() / 1000 - state.started_at).toFixed(1)
+      : '?';
+    const tn = state.tools_used > 0
+      ? '  ·  ' + state.tools_used + ' tool call' + (state.tools_used === 1 ? '' : 's')
+      : '';
+    t.textContent = sec + 's' + tn;
+  }
+  function stopRecovery() {
+    if (recoveryEl && recoveryEl.parentElement) recoveryEl.remove();
+    recoveryEl = null;
+  }
+  async function refreshLastNarrative() {
+    try {
+      const r = await fetch('/api/last_narrative');
+      const d = await r.json();
+      if (d && d.text && d.text !== lastDmText) {
+        append('dm', d.text);
+        lastDmText = d.text;
+        refreshState();
+      }
+    } catch (e) { /* ignore */ }
+  }
+  async function pollTurnState() {
+    try {
+      const r = await fetch('/api/turn_state');
+      if (!r.ok) return;
+      const s = await r.json();
+      // Send-disable when the server lock is held — local UI already
+      // disables it during its own submit, but a recovery scenario also
+      // needs the lock surface.
+      if (s.in_flight !== lockedBySrv) {
+        lockedBySrv = s.in_flight;
+        // Don't fight the local submit's own disable.
+        if (!thinkingEl) send.disabled = lockedBySrv;
+      }
+      // Recovery indicator: show only when the server is busy AND we're
+      // not the ones running it (no local thinkingEl).
+      if (s.in_flight && !thinkingEl) {
+        if (!recoveryEl) startRecovery();
+        updateRecovery(s);
+      } else if (recoveryEl && !s.in_flight) {
+        stopRecovery();
+        refreshLastNarrative();
+      }
+    } catch (e) { /* ignore */ }
+  }
+  pollTurnState();
+  setInterval(pollTurnState, 3000);
+
   refreshState();
   // Background refresh — picks up MCP-tool mutations made outside the turn flow.
   setInterval(refreshState, 20000);
@@ -3145,6 +3378,15 @@ def api_last_narrative():
     return jsonify({"text": _dm.last_dm_text()})
 
 
+@app.route("/api/turn_state")
+def api_turn_state():
+    """Live state of the currently running turn (if any). Polled by /play
+    so a reload during streaming can pick up the still-cooking server-side
+    response, disable Send while the lock is held, and replay the DM reply
+    once it lands."""
+    return jsonify(_dm.turn_state())
+
+
 @app.route("/play/turn", methods=["POST"])
 def play_turn():
     data = request.get_json(silent=True) or {}
@@ -3165,18 +3407,31 @@ def play_turn():
 
 @app.route("/play/generate_scene", methods=["POST"])
 def play_generate_scene():
-    """Generate an illustration based on a free-form prompt (used by the
-    /play 'Make picture' button to render the previous DM reply as art).
-    Synchronous — returns once the image is downloaded. Slow (~10–30s)."""
+    """Generate an illustration based on the previous DM reply.
+
+    Two-phase pipeline:
+
+    1. Pre-pass: ``_dm.rewrite_for_image`` runs a stateless ``claude -p``
+       to extract a focused image-generation prompt from the raw narrative
+       (drops dialogue, mechanics, etc).
+    2. Replicate Flux generates the image from that refined prompt.
+
+    Synchronous — returns once the image is downloaded. Slow (~15-45s).
+    Falls back to the raw narrative if the pre-pass fails so the user
+    still gets *some* image."""
     if not cfg:
         return jsonify({"error": "no campaign loaded"}), 400
     data = request.get_json(silent=True) or {}
-    prompt = (data.get("prompt") or "").strip()
-    if not prompt:
+    raw = (data.get("prompt") or "").strip()
+    hint = (data.get("hint") or "").strip()
+    if not raw:
         return jsonify({"error": "empty prompt"}), 400
-    # Trim very long prompts — Replicate has its own limit and shorter often
-    # composes better.
-    prompt = prompt[:1500]
+
+    # Pre-pass: translate the narrative (plus an optional player hint) into a
+    # painter's brief. Falls back to truncated raw narrative on failure.
+    refined = _dm.rewrite_for_image(raw[:4000], hint=hint or None)
+    used_prepass = refined is not None
+    image_prompt = (refined or raw)[:1500]
 
     try:
         replicate = _img._load_replicate()
@@ -3185,7 +3440,7 @@ def play_generate_scene():
 
     tone = cfg.get("tone", "high fantasy")
     tone_clause = _img.TONE_STYLES.get(tone, tone)
-    full_prompt = f"{_img.STYLE_BASE} {tone_clause}. {prompt}"
+    full_prompt = f"{_img.STYLE_BASE} {tone_clause}. {image_prompt}"
 
     title = "Live play scene"
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -3200,11 +3455,16 @@ def play_generate_scene():
     _img._update_index(images_dir, {
         "filename":    filename,
         "scene":       title,
-        "description": prompt[:500],
+        "description": image_prompt[:500],
         "timestamp":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "type":        "scene",
     })
-    return jsonify({"url": f"/images/{filename}", "filename": filename})
+    return jsonify({
+        "url": f"/images/{filename}",
+        "filename": filename,
+        "prompt": image_prompt,
+        "prepass": used_prepass,
+    })
 
 
 

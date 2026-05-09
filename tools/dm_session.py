@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -44,6 +46,29 @@ _ALLOWED_TOOLS = "mcp__ttrpg__*,Read,Write,Edit,Bash"
 # dashboard is single-player; one turn at a time is correct.
 _turn_lock = threading.Lock()
 
+# Live-state introspection so a reloaded /play page can discover that a
+# turn is still cooking server-side (browser dropped the SSE stream but
+# the subprocess kept running). Updated by stream_turn around the
+# subprocess lifetime; read by the /api/turn_state endpoint.
+_turn_state: dict = {"in_flight": False, "started_at": None, "tools_used": 0}
+_turn_state_lock = threading.Lock()
+
+
+def turn_state() -> dict:
+    """Snapshot of the in-flight turn state for the dashboard to poll."""
+    with _turn_state_lock:
+        return dict(_turn_state)
+
+
+def _set_turn_state(**fields) -> None:
+    with _turn_state_lock:
+        _turn_state.update(fields)
+
+
+def _bump_tools_used() -> None:
+    with _turn_state_lock:
+        _turn_state["tools_used"] += 1
+
 
 def session_id() -> str | None:
     """Return the persisted session id, or ``None`` for a fresh start."""
@@ -62,6 +87,77 @@ def _project_jsonl_dir() -> Path:
     replaces ``/`` with ``-`` in the absolute project path."""
     encoded = str(_REPO_ROOT).replace("/", "-")
     return Path.home() / ".claude" / "projects" / encoded
+
+
+_IMAGE_PROMPT_SYSTEM = (
+    "You translate fantasy RPG narrative prose into a focused "
+    "image-generation prompt for a Flux model.\n\n"
+    "The user's input is either:\n"
+    "  - a NARRATIVE on its own, OR\n"
+    "  - a NARRATIVE section followed by a HINT line. The HINT is the "
+    "player's direction about what the picture should emphasise (subject, "
+    "framing, mood). When a HINT is present, use it as the primary anchor "
+    "for the prompt and pull supporting visual detail from the narrative.\n\n"
+    "Extract only the *visual* scene: subject(s), action, setting, lighting, "
+    "time of day, mood, palette. Drop dialogue, internal thoughts, dice "
+    "results, NPC stat blocks, exposition, and anything an image cannot "
+    "show.\n\n"
+    "Return one English paragraph of 60 to 120 words describing the scene "
+    "the way a painter's brief would. No preface, no bullets, no "
+    "explanation, no quotation marks around the output — just the prompt "
+    "itself."
+)
+
+
+def rewrite_for_image(
+    narrative: str,
+    hint: str | None = None,
+    timeout_seconds: int = 90,
+) -> str | None:
+    """One-shot Claude pre-pass: convert raw narrative prose to a focused
+    image-generation prompt. Stateless — runs ``claude -p`` from a temp
+    directory so the project's CLAUDE.md and MCP config don't bias the
+    rewrite, no session is resumed, and nothing is persisted.
+
+    If ``hint`` is provided, the player's optional extra direction (e.g.
+    "focus on the treasure", "show Korrhast in the foreground") is
+    forwarded alongside the narrative; the system prompt instructs the
+    rewriter to give the hint priority when shaping the visual.
+
+    Returns the rewritten prompt, or ``None`` on any failure (caller should
+    fall back to the raw narrative)."""
+    text = (narrative or "").strip()
+    if not text:
+        return None
+
+    hint_clean = (hint or "").strip()
+    if hint_clean:
+        user_msg = (
+            f"NARRATIVE:\n{text}\n\n"
+            f"HINT (player's direction for the illustrator — prioritise this "
+            f"when shaping the prompt): {hint_clean}"
+        )
+    else:
+        user_msg = text
+
+    args = [
+        _CLAUDE_BIN, "-p", user_msg,
+        "--append-system-prompt", _IMAGE_PROMPT_SYSTEM,
+    ]
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=tempfile.gettempdir(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (proc.stdout or "").strip()
+    return out or None
 
 
 def last_dm_text() -> str | None:
@@ -163,13 +259,23 @@ def stream_turn(message: str) -> Iterator[dict]:
             bufsize=1,
         )
         assert proc.stdout is not None
+        _set_turn_state(in_flight=True, started_at=time.time(), tools_used=0)
         try:
             for line in proc.stdout:
                 evt = _process_event_line(line)
-                if evt is not None:
-                    yield evt
+                if evt is None:
+                    continue
+                # Tally tool_use blocks for the live turn-state poll.
+                if evt.get("type") == "assistant":
+                    content = evt.get("message", {}).get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                _bump_tools_used()
+                yield evt
         finally:
             rc = proc.wait()
+            _set_turn_state(in_flight=False, started_at=None, tools_used=0)
             if rc != 0:
                 err = (proc.stderr.read() if proc.stderr else "").strip()
                 yield {"type": "error", "returncode": rc, "stderr": err[-2000:]}
