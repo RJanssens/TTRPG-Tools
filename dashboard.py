@@ -646,6 +646,261 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   }}
   img:not(#lb-img) {{ cursor: zoom-in; }}
 
+  /* ---- Character sheet (AD&D 2e style) ---- */
+  .sheet {{ max-width: 940px; margin: 0 auto; }}
+  .sheet-header {{
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 26px;
+    padding: 22px 26px;
+    background:
+      linear-gradient(135deg, rgba(255,220,180,0.030), transparent 55%),
+      linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    margin-bottom: 16px;
+    align-items: start;
+  }}
+  .sheet-header-main {{ min-width: 0; }}
+  .sheet-header h1 {{
+    border: none;
+    padding: 0;
+    margin: 0 0 6px;
+    font-size: 2.1em;
+    letter-spacing: 0.16em;
+    line-height: 1.05;
+    color: var(--ink-display);
+  }}
+  .sheet-id {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.82em;
+    color: var(--accent-gold);
+  }}
+  .sheet-id .sep {{ color: var(--ink-muted); margin: 0 8px; }}
+  .sheet-conditions {{ margin-top: 10px; }}
+  .sheet-portrait {{
+    width: 170px;
+    border-radius: 3px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: var(--shadow-card);
+    display: block;
+  }}
+  .sheet-portrait-wrap {{ text-align: center; }}
+  .sheet-portrait-wrap details.portrait-desc {{ margin-top: 6px; }}
+
+  .sheet-panel {{
+    background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    margin-bottom: 14px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    overflow: hidden;
+  }}
+  .sheet-panel-title {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.72em;
+    color: var(--accent-gold);
+    margin: 0;
+    padding: 9px 16px;
+    background: rgba(0,0,0,0.20);
+    border-bottom: 1px solid var(--rule);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }}
+  .sheet-panel-title::before {{
+    content: '\\25C6';   /* ◆ */
+    font-size: 0.55em;
+    color: var(--accent-gold);
+    opacity: 0.85;
+  }}
+  .sheet-panel-body {{ padding: 16px 18px; }}
+  .sheet-panel-body > *:first-child {{ margin-top: 0; }}
+  .sheet-panel-body > *:last-child {{ margin-bottom: 0; }}
+
+  /* Ability score grid */
+  .ab-grid {{
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 8px;
+  }}
+  .ab-box {{
+    background: var(--bg-deep);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 12px 6px 9px;
+    text-align: center;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.4);
+  }}
+  .ab-box .ab-num {{
+    font-family: var(--font-mono);
+    font-size: 1.95em;
+    color: var(--ink-display);
+    line-height: 1.0;
+  }}
+  .ab-box .ab-label {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.66em;
+    color: var(--ink-muted);
+    margin-top: 6px;
+  }}
+
+  /* Vitals row */
+  .vitals-row {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 30px;
+    align-items: center;
+  }}
+  .vital {{ display: flex; align-items: baseline; gap: 8px; }}
+  .vital-label {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.66em;
+    color: var(--ink-muted);
+  }}
+  .vital-value {{
+    font-family: var(--font-mono);
+    font-size: 1.16em;
+    color: var(--ink-display);
+  }}
+  .vital-value .xp-next {{ color: var(--ink-muted); font-size: 0.84em; margin-left: 2px; }}
+  .vital .hp-meter {{ width: 110px; height: 10px; }}
+
+  /* Saves grid */
+  .saves-grid {{
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+  }}
+  .save-box {{
+    background: var(--bg-deep);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 9px 4px 7px;
+    text-align: center;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.4);
+  }}
+  .save-box .save-num {{
+    font-family: var(--font-mono);
+    font-size: 1.45em;
+    color: var(--ink-display);
+    line-height: 1.0;
+  }}
+  .save-box .save-label {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 0.6em;
+    color: var(--ink-muted);
+    margin-top: 5px;
+  }}
+
+  /* Attacks table */
+  table.attacks-table {{ width: 100%; margin: 0; font-size: 0.94em; }}
+  table.attacks-table th {{
+    background: linear-gradient(to bottom, #2c2218, #221912);
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-size: 0.74em;
+    padding: 6px 9px;
+  }}
+  table.attacks-table td {{
+    font-family: var(--font-mono);
+    padding: 7px 9px;
+    border: 1px solid var(--rule);
+  }}
+  table.attacks-table td:first-child {{
+    font-family: var(--font-body);
+    color: var(--ink-body);
+  }}
+
+  /* Two-column inside a panel (e.g. profs / nwps) */
+  .sheet-two-col {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px 26px;
+  }}
+  .sheet-two-col h4 {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 0.72em;
+    color: var(--accent-gold);
+    margin: 0 0 6px;
+  }}
+
+  /* Lists with diamond bullets */
+  ul.sheet-list {{ list-style: none; padding: 0; margin: 0; }}
+  ul.sheet-list li {{
+    padding: 4px 0 4px 18px;
+    position: relative;
+    border-bottom: 1px dotted rgba(140,110,70,0.18);
+    line-height: 1.45;
+  }}
+  ul.sheet-list li:last-child {{ border-bottom: none; }}
+  ul.sheet-list li::before {{
+    content: '\\25C7';   /* ◇ */
+    position: absolute;
+    left: 0;
+    top: 0.45em;
+    color: var(--accent-gold);
+    font-size: 0.72em;
+    line-height: 1;
+  }}
+
+  /* Proficiency chips */
+  .prof-chips {{ display: flex; flex-wrap: wrap; gap: 5px; }}
+  .prof-chip {{
+    background: #322012;
+    border: 1px solid var(--rule-hi);
+    border-radius: 2px;
+    padding: 3px 10px;
+    font-family: var(--font-display);
+    font-size: 0.72em;
+    letter-spacing: 0.06em;
+    color: var(--accent-gold);
+  }}
+
+  /* Thief / nature skills percentage grid */
+  .skills-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 4px 18px;
+  }}
+  .skill-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    border-bottom: 1px dotted rgba(140,110,70,0.20);
+    padding: 4px 0;
+  }}
+  .skill-name {{ color: var(--ink-body); font-size: 0.92em; }}
+  .skill-val {{
+    font-family: var(--font-mono);
+    color: var(--accent-gold-hi);
+    font-size: 0.96em;
+  }}
+
+  @media (max-width: 720px) {{
+    .sheet-header {{ grid-template-columns: 1fr; }}
+    .sheet-portrait {{ max-width: 220px; }}
+    .ab-grid {{ grid-template-columns: repeat(3, 1fr); }}
+    .saves-grid {{ grid-template-columns: repeat(3, 1fr); }}
+    .sheet-two-col {{ grid-template-columns: 1fr; }}
+  }}
+
   /* ---- Spoiler accordion (rumors, DM notes, sheet descriptions) ---- */
   details.spoiler {{
     border: 1px solid var(--rule);
@@ -3586,51 +3841,346 @@ def _encumbrance_html(char: dict, state: dict, key: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Character sheet — AD&D 2e structured layout
+# ---------------------------------------------------------------------------
+
+# Saving-throw column labels (5-column AD&D 2e order).
+_SAVE_KEYS = (
+    "paralysis_poison_death",
+    "rod_staff_wand",
+    "petrify_polymorph",
+    "breath_weapon",
+    "spell",
+)
+_SAVE_SHORT = {
+    "paralysis_poison_death": "PP&D",
+    "rod_staff_wand":         "RSW",
+    "petrify_polymorph":      "PETR",
+    "breath_weapon":          "BREATH",
+    "spell":                  "SPELL",
+}
+
+
+def _sheet_panel(title: str, body_html: str) -> str:
+    if not body_html:
+        return ""
+    return (
+        f'<section class="sheet-panel">'
+        f'<h2 class="sheet-panel-title">{html.escape(title)}</h2>'
+        f'<div class="sheet-panel-body">{body_html}</div>'
+        f'</section>'
+    )
+
+
+def _ab_grid(scores: dict) -> str:
+    if not scores:
+        return ""
+    boxes = []
+    for k in ("str", "dex", "con", "int", "wis", "cha"):
+        v = scores.get(k)
+        if v is None:
+            continue
+        boxes.append(
+            f'<div class="ab-box">'
+            f'<div class="ab-num">{html.escape(str(v))}</div>'
+            f'<div class="ab-label">{k.upper()}</div>'
+            f'</div>'
+        )
+    return f'<div class="ab-grid">{"".join(boxes)}</div>' if boxes else ""
+
+
+def _saves_grid(saves: list) -> str:
+    if not saves:
+        return ""
+    by_type = {s.get("type"): s.get("value") for s in saves if isinstance(s, dict)}
+    boxes = []
+    for key in _SAVE_KEYS:
+        if key not in by_type:
+            continue
+        boxes.append(
+            f'<div class="save-box">'
+            f'<div class="save-num">{html.escape(str(by_type[key]))}</div>'
+            f'<div class="save-label">{_SAVE_SHORT[key]}</div>'
+            f'</div>'
+        )
+    return f'<div class="saves-grid">{"".join(boxes)}</div>' if boxes else ""
+
+
+def _attacks_table(attacks: list) -> str:
+    if not attacks:
+        return ""
+    rows = []
+    for a in attacks:
+        if not isinstance(a, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td>{html.escape(str(a.get("name", "?")))}</td>'
+            f'<td>{html.escape(str(a.get("speed", "—")))}</td>'
+            f'<td>{html.escape(str(a.get("attacks", 1)))}</td>'
+            f'<td>{html.escape(str(a.get("thac0", "—")))}</td>'
+            f'<td>{html.escape(str(a.get("damage_sm", "—")))}</td>'
+            f'<td>{html.escape(str(a.get("damage_l", "—")))}</td>'
+            "</tr>"
+        )
+    head = (
+        "<thead><tr>"
+        "<th>Weapon</th><th>Speed</th><th>#/rd</th><th>THAC0</th>"
+        "<th>Dmg S/M</th><th>Dmg L</th>"
+        "</tr></thead>"
+    )
+    return f'<table class="attacks-table">{head}<tbody>{"".join(rows)}</tbody></table>'
+
+
+def _diamond_list(items: list) -> str:
+    if not items:
+        return ""
+    return (
+        '<ul class="sheet-list">'
+        + "".join(f"<li>{html.escape(str(i))}</li>" for i in items if i)
+        + "</ul>"
+    )
+
+
+def _nwps_list(nwps: list) -> str:
+    if not nwps:
+        return ""
+    rows = []
+    for n in nwps:
+        if not isinstance(n, dict):
+            continue
+        name = html.escape(str(n.get("name", "?")))
+        ab = n.get("ability") or ""
+        ab_html = f' <span class="muted">({html.escape(str(ab))})</span>' if ab else ""
+        rows.append(f"<li>{name}{ab_html}</li>")
+    return f'<ul class="sheet-list">{"".join(rows)}</ul>' if rows else ""
+
+
+def _prof_chips(profs: list) -> str:
+    if not profs:
+        return ""
+    chips = "".join(f'<span class="prof-chip">{html.escape(str(p))}</span>' for p in profs)
+    return f'<div class="prof-chips">{chips}</div>'
+
+
+def _skills_grid(skills: dict) -> str:
+    if not skills:
+        return ""
+    rows = []
+    for k, v in skills.items():
+        rows.append(
+            f'<div class="skill-row">'
+            f'<span class="skill-name">{html.escape(str(k))}</span>'
+            f'<span class="skill-val">{html.escape(str(v))}%</span>'
+            f"</div>"
+        )
+    return f'<div class="skills-grid">{"".join(rows)}</div>'
+
+
+def _hp_meter_html(cur: int, mx: int) -> str:
+    if mx <= 0:
+        return ""
+    pct = max(0.0, min(100.0, (cur / mx) * 100.0))
+    return (
+        f'<span class="hp-meter"><i style="width:{pct:.1f}%"></i></span> '
+        f'<span class="vital-value">{cur}/{mx}</span>'
+    )
+
+
+def _vitals_row(char: dict, cstate: dict) -> str:
+    items = []
+    hp_max = int(char.get("hp_max", 0) or 0)
+    hp_cur = int(cstate.get("hp", hp_max) or 0)
+    if hp_max:
+        items.append(
+            f'<div class="vital"><span class="vital-label">HP</span>{_hp_meter_html(hp_cur, hp_max)}</div>'
+        )
+    for label, key in (("AC", "ac"), ("THAC0", "thac0")):
+        v = char.get(key)
+        if v is not None and v != "":
+            items.append(
+                f'<div class="vital"><span class="vital-label">{label}</span>'
+                f'<span class="vital-value">{html.escape(str(v))}</span></div>'
+            )
+    level = int(char.get("level", 1) or 1)
+    items.append(
+        f'<div class="vital"><span class="vital-label">Level</span>'
+        f'<span class="vital-value">{level}</span></div>'
+    )
+    xp = int(cstate.get("xp", 0) or 0)
+    xp_table = _class_xp_table(char.get("cls", ""))
+    next_xp_html = ""
+    if xp_table and level < len(xp_table):
+        next_xp = xp_table[level]
+        next_xp_html = f' <span class="xp-next">/ {next_xp:,}</span>'
+    items.append(
+        f'<div class="vital"><span class="vital-label">XP</span>'
+        f'<span class="vital-value">{xp:,}{next_xp_html}</span></div>'
+    )
+    return f'<div class="vitals-row">{"".join(items)}</div>'
+
+
+def _extract_md_section(content: str, heading: str) -> str:
+    """Return the body of a `## <heading>` section, stripped, or "" if missing."""
+    pattern = re.compile(
+        r'^##\s+' + re.escape(heading) + r'\s*\n(.+?)(?=^##\s|\Z)',
+        re.M | re.S,
+    )
+    m = pattern.search(content)
+    return m.group(1).strip() if m else ""
+
+
+def _memorized_panel(memorized: list) -> str:
+    """Memorized spells grouped by level. Returns panel-body HTML (or "")."""
+    if not memorized:
+        return ""
+
+    # If level isn't set on each entry, fill from the spells DB.
+    unknown = {(s.get("name") or "").strip() for s in memorized
+               if isinstance(s, dict) and not int(s.get("level", 0) or 0)}
+    level_map = {}
+    if unknown:
+        placeholders = ",".join("?" * len(unknown))
+        rows = _db(_2E_DB).execute(
+            f"SELECT name, level FROM spells WHERE lower(name) IN ({placeholders})",
+            [n.lower() for n in unknown],
+        ).fetchall()
+        level_map = {r["name"].lower(): int(r["level"]) for r in rows}
+
+    by_level: dict[int, list[dict]] = {}
+    for s in memorized:
+        if not isinstance(s, dict):
+            continue
+        name = (s.get("name") or "").strip()
+        lvl = int(s.get("level", 0) or 0)
+        if lvl <= 0:
+            lvl = level_map.get(name.lower(), 0)
+        by_level.setdefault(lvl, []).append({"name": name, "cast": bool(s.get("cast"))})
+
+    blocks = []
+    for lvl in sorted(by_level):
+        spells = by_level[lvl]
+        ready = sum(1 for s in spells if not s["cast"])
+        total = len(spells)
+        head_label = f"Level {lvl}" if lvl > 0 else "Unleveled"
+        items = "".join(
+            f'<li class="spell-cast"><s>{html.escape(s["name"])}</s></li>'
+            if s["cast"] else
+            f'<li class="spell-ready">{html.escape(s["name"])}</li>'
+            for s in spells
+        )
+        blocks.append(
+            f'<div class="spell-level">'
+            f'<div class="spell-level-head">{head_label} '
+            f'<span class="muted">({ready}/{total} ready)</span></div>'
+            f'<ul class="spell-list">{items}</ul></div>'
+        )
+    return "".join(blocks)
+
+
+def _profs_two_col(weapon_profs: list, nwps: list) -> str:
+    left = _prof_chips(weapon_profs)
+    right = _nwps_list(nwps)
+    if not left and not right:
+        return ""
+    parts = []
+    if left:
+        parts.append(f'<div><h4>Weapons</h4>{left}</div>')
+    if right:
+        parts.append(f'<div><h4>Non-weapon</h4>{right}</div>')
+    return f'<div class="sheet-two-col">{"".join(parts)}</div>'
+
+
 @app.route("/sheets/<slug>")
 def character_sheet(slug: str):
     campaign_name = cfg.get("name", "Campaign")
     chars_dir = cfg["_data_dir"] / "characters"
     path = chars_dir / f"{slug}.md"
-
     if not path.exists():
         abort(404)
 
-    content = path.read_text(encoding="utf-8")
-    content_html = _markdown_to_html(content)
+    md_content = path.read_text(encoding="utf-8")
     name = _read_first_heading(path)
+    char = cfg.get("characters", {}).get(slug) or cfg.get("npcs", {}).get(slug) or {}
+    state = _c.load_state(cfg) if char else {}
+    cstate = state.get("characters", {}).get(slug, {}) if state else {}
 
-    index = _load_image_index()
-    portrait = _find_portrait(name, index, slug)
+    # Header — portrait + identity strip + conditions
+    image_index = _load_image_index() if char else _load_image_index()
+    portrait = _find_portrait(name, image_index, slug)
     portrait_html = ""
     if portrait:
-        fn   = html.escape(portrait["filename"])
+        fn = html.escape(portrait["filename"])
         desc = html.escape(portrait.get("description", ""))
         desc_block = (
             f'<details class="portrait-desc"><summary>portrait notes</summary>'
             f'<p>{desc}</p></details>'
         ) if desc else ""
         portrait_html = (
-            f'<div style="float:right;margin:0 0 16px 20px;max-width:200px;text-align:center">'
-            f'<img src="/images/{fn}" alt="{html.escape(name)}" '
-            f'style="width:100%;border-radius:3px;border:1px solid var(--rule-hi);box-shadow:var(--shadow-card)">'
+            f'<div class="sheet-portrait-wrap">'
+            f'<img class="sheet-portrait" src="/images/{fn}" alt="{html.escape(name)}">'
             f'{desc_block}'
             f'</div>'
         )
 
-    # Encumbrance block — only for characters known to the campaign config
-    char = cfg.get("characters", {}).get(slug) or cfg.get("npcs", {}).get(slug)
-    enc_html = ""
-    if char:
-        state = _c.load_state(cfg)
-        enc_html = _encumbrance_html(char, state, slug)
+    # Identity strip: race · class lvl · gender
+    id_parts = []
+    race = char.get("race") or ""
+    cls = char.get("cls") or ""
+    level = char.get("level")
+    gender = char.get("gender") or ""
+    if cls:
+        id_parts.append(f"{html.escape(cls)} {html.escape(str(level))}" if level else html.escape(cls))
+    if race:
+        id_parts.append(html.escape(race.title()))
+    if gender:
+        id_parts.append(html.escape(gender.title()))
+    id_strip = '<span class="sep">·</span>'.join(id_parts)
 
-    body = (
-        f'<div class="card clearfix">'
-        f"{portrait_html}"
-        f"{content_html}"
-        f"</div>"
-        f"{enc_html}"
+    conditions = cstate.get("conditions") or []
+    cond_html = ""
+    if conditions:
+        chips = "".join(f'<span class="tag">{html.escape(c)}</span>' for c in conditions)
+        cond_html = f'<div class="sheet-conditions">{chips}</div>'
+
+    header = (
+        '<div class="sheet-header">'
+        '<div class="sheet-header-main">'
+        f'<h1>{html.escape(name)}</h1>'
+        f'<div class="sheet-id">{id_strip}</div>'
+        f'{cond_html}'
+        '</div>'
+        f'{portrait_html}'
+        '</div>'
     )
+
+    # Build all the structured panels (only emit non-empty ones).
+    panels = []
+    if char:
+        panels.append(_sheet_panel("Vitals", _vitals_row(char, cstate)))
+        panels.append(_sheet_panel("Ability Scores", _ab_grid(char.get("ability_scores") or {})))
+        panels.append(_sheet_panel("Saving Throws", _saves_grid(char.get("saves") or [])))
+        panels.append(_sheet_panel("Attacks", _attacks_table(char.get("attacks") or [])))
+        panels.append(_sheet_panel("Proficiencies",
+                                   _profs_two_col(char.get("weapon_profs") or [],
+                                                  char.get("nwps") or [])))
+        panels.append(_sheet_panel("Thief / Nature Skills", _skills_grid(char.get("skills") or {})))
+        panels.append(_sheet_panel("Natural Abilities", _diamond_list(char.get("natural_abilities") or [])))
+        panels.append(_sheet_panel("Memorized Spells", _memorized_panel(cstate.get("memorized_spells") or [])))
+        panels.append(_sheet_panel("Inventory", _diamond_list(char.get("inventory") or [])))
+        enc = _encumbrance_html(char, state, slug)
+        if enc:
+            panels.append(_sheet_panel("Encumbrance", enc))
+
+    # Background panel: prefer the prose-only `## Background` section when
+    # the markdown follows the standard template; otherwise fall back to the
+    # whole markdown body so older / hand-written sheets keep showing.
+    background_md = _extract_md_section(md_content, "Background")
+    bg_html = _markdown_to_html(background_md) if background_md else _markdown_to_html(md_content)
+    panels.append(_sheet_panel("Background", bg_html))
+
+    body = '<div class="sheet">' + header + "".join(p for p in panels if p) + '</div>'
     return render(f"{html.escape(name)} — {html.escape(campaign_name)}", body)
 
 
