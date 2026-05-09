@@ -54,6 +54,55 @@ def session_id() -> str | None:
     return sid or None
 
 
+def _project_jsonl_dir() -> Path:
+    """Path to Claude Code's per-project transcript directory.
+
+    Claude Code stores session JSONLs under
+    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`` where the encoding
+    replaces ``/`` with ``-`` in the absolute project path."""
+    encoded = str(_REPO_ROOT).replace("/", "-")
+    return Path.home() / ".claude" / "projects" / encoded
+
+
+def last_dm_text() -> str | None:
+    """Return the most recent assistant text block from the persisted
+    session's JSONL transcript, or ``None`` if there's no session yet, no
+    transcript file, or no DM prose recorded.
+
+    Used by the dashboard's /play surface to replay the last narrative line
+    when a player reloads the page mid-session."""
+    sid = session_id()
+    if not sid:
+        return None
+    p = _project_jsonl_dir() / f"{sid}.jsonl"
+    if not p.exists():
+        return None
+    last: str | None = None
+    try:
+        with p.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "assistant":
+                    continue
+                content = rec.get("message", {}).get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = (block.get("text") or "").strip()
+                        if text:
+                            last = text
+    except OSError:
+        return None
+    return last
+
+
 def reset_session() -> None:
     """Forget the current session — the next turn starts a new one."""
     _SESSION_FILE.unlink(missing_ok=True)

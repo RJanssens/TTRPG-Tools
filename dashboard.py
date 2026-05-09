@@ -1878,6 +1878,49 @@ _PLAY_HTML = """
     min-width: 80px;
   }
 
+  /* Filter strip — toggles which message types are visible. */
+  .play-filters {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 0 10px;
+  }
+  .play-filters .filter-label {
+    color: var(--ink-muted);
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.66em;
+    margin-right: 4px;
+  }
+  .turn-toggle {
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 3px 11px;
+    font-family: var(--font-display);
+    font-size: 0.68em;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    color: var(--ink-muted);
+    transition: all 180ms ease;
+  }
+  .turn-toggle::before { content: '○ '; opacity: 0.55; }
+  .turn-toggle.active {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold-hi);
+    background: rgba(200,169,110,0.08);
+  }
+  .turn-toggle.active::before { content: '● '; opacity: 1; color: var(--accent-gold); }
+  .turn-toggle:hover { border-color: var(--rule-hi); }
+  .turn-toggle.active:hover { border-color: var(--accent-gold-hi); }
+
+  /* Visibility filters applied to .play-log via JS (toggle pills + localStorage). */
+  .play-log.hide-tools .turn.tool { display: none; }
+  .play-log.hide-meta  .turn.meta { display: none; }
+  .play-log.hide-player .turn.player { display: none; }
+
   .play-log {
     flex: 1;
     overflow-y: auto;
@@ -2297,6 +2340,12 @@ _PLAY_HTML = """
       <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
       <button id="play-reset" type="button">New session</button>
     </div>
+    <div class="play-filters">
+      <span class="filter-label">Show:</span>
+      <button class="turn-toggle" data-filter="player" type="button">Player echoes</button>
+      <button class="turn-toggle" data-filter="tools" type="button">Tool calls</button>
+      <button class="turn-toggle" data-filter="meta" type="button">Meta</button>
+    </div>
     <div class="play-log" id="play-log">
       <div class="empty-state">
         <img src="/static/play-hero.png" alt="" class="play-hero">
@@ -2547,9 +2596,33 @@ _PLAY_HTML = """
     }
   });
 
+  // Filter pills: persist Show/Hide per turn-type in localStorage.
+  document.querySelectorAll('.turn-toggle').forEach(btn => {
+    const key = btn.dataset.filter;
+    const hidden = localStorage.getItem('play.hide.' + key) === '1';
+    btn.classList.toggle('active', !hidden);
+    log.classList.toggle('hide-' + key, hidden);
+    btn.addEventListener('click', () => {
+      const wasActive = btn.classList.contains('active');
+      const nowActive = !wasActive;
+      btn.classList.toggle('active', nowActive);
+      log.classList.toggle('hide-' + key, !nowActive);
+      localStorage.setItem('play.hide.' + key, nowActive ? '0' : '1');
+    });
+  });
+
   fetch('/play/session').then(r => r.json()).then(d => {
     sidEl.textContent = d.session_id ? d.session_id.slice(0, 8) : '(new)';
   });
+
+  // Replay the most recent DM reply from the resumed session, if any.
+  fetch('/api/last_narrative').then(r => r.json()).then(d => {
+    if (d && d.text) {
+      append('dm', d.text);
+      lastDmText = d.text;
+    }
+  }).catch(() => {});
+
   refreshState();
   // Background refresh — picks up MCP-tool mutations made outside the turn flow.
   setInterval(refreshState, 20000);
@@ -2579,6 +2652,14 @@ def play_reset():
 @app.route("/api/play_state.json")
 def api_play_state():
     return jsonify(_play_state())
+
+
+@app.route("/api/last_narrative")
+def api_last_narrative():
+    """Return the most recent DM text from the resumed Claude Code session,
+    so the /play surface can replay it on reload. Returns {"text": null} when
+    there's no session, no transcript, or no recorded DM prose yet."""
+    return jsonify({"text": _dm.last_dm_text()})
 
 
 @app.route("/play/turn", methods=["POST"])
