@@ -4512,6 +4512,42 @@ def _extract_md_section(content: str, heading: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+_ALIGNMENT_LABELS = (
+    "Lawful Good", "Lawful Neutral", "Lawful Evil",
+    "Neutral Good", "True Neutral", "Neutral Evil",
+    "Chaotic Good", "Chaotic Neutral", "Chaotic Evil",
+    "Neutral",  # last so longer matches win
+)
+_ALIGNMENT_RE = re.compile(
+    # Leading guard rejects "FooAlignment" but tolerates the literal "\n"
+    # escape sequences some character files carry (where a real \b fails
+    # because both surrounding chars are word chars).
+    r'(?<![A-Za-z])Alignment\s*[:\-—]\s*('
+    + "|".join(re.escape(a) for a in _ALIGNMENT_LABELS)
+    + r')\b',
+    re.I,
+)
+
+
+def _extract_alignment(content: str) -> str:
+    """Pull an alignment label out of a character markdown file. Looks for
+    'Alignment: <label>' (or em-dash/hyphen variants) anywhere in the prose
+    and matches against the canonical 2e set, returning the canonical-cased
+    label or '' if none found."""
+    # Some legacy character files contain literal "\n" escape sequences
+    # rather than real newlines; normalise so the leading-anchor lookbehind
+    # doesn't see "n" right before the keyword and reject the match.
+    text = (content or "").replace("\\n", "\n")
+    m = _ALIGNMENT_RE.search(text)
+    if not m:
+        return ""
+    found = m.group(1).strip().lower()
+    for label in _ALIGNMENT_LABELS:
+        if label.lower() == found:
+            return label
+    return ""
+
+
 def _memorized_panel(memorized: list) -> str:
     """Memorized spells grouped by level. Returns panel-body HTML (or "")."""
     if not memorized:
@@ -4605,18 +4641,23 @@ def character_sheet(slug: str):
             f'</div>'
         )
 
-    # Identity strip: race · class lvl · gender
+    # Identity strip: class lvl · race · gender · alignment
     id_parts = []
     race = char.get("race") or ""
     cls = char.get("cls") or ""
     level = char.get("level")
     gender = char.get("gender") or ""
+    # Alignment: prefer the structured field, fall back to scanning the
+    # character markdown for an "Alignment: <label>" line.
+    alignment = (char.get("alignment") or "").strip() or _extract_alignment(md_content)
     if cls:
         id_parts.append(f"{html.escape(cls)} {html.escape(str(level))}" if level else html.escape(cls))
     if race:
         id_parts.append(html.escape(race.title()))
     if gender:
         id_parts.append(html.escape(gender.title()))
+    if alignment:
+        id_parts.append(html.escape(alignment))
     id_strip = '<span class="sep">·</span>'.join(id_parts)
 
     conditions = cstate.get("conditions") or []
