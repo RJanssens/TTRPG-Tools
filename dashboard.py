@@ -17,6 +17,7 @@ import _campaign as _c
 from tools import export_session as _export
 from tools import item_weights as _iw
 from tools import homebrew_classes as _hb
+from tools import dm_session as _dm
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -480,6 +481,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <nav>
   <a href="/">Gallery</a>
+  <a href="/play">Play</a>
   <a href="/party">Party</a>
   <a href="/world">World</a>
   <a href="/quests">Quests</a>
@@ -1445,6 +1447,190 @@ def session_view(sid: str):
         f'<div class="card">{content_html}</div>'
     )
     return render(f"Session {sid[:8]}", body)
+
+
+# ---------------------------------------------------------------------------
+# Live play surface — drives `claude -p` via tools/dm_session.py
+# ---------------------------------------------------------------------------
+
+_PLAY_HTML = """
+<style>
+  .play-shell { display: flex; flex-direction: column; height: calc(100vh - 160px); }
+  .play-bar { display: flex; gap: 12px; align-items: center; font-size: 0.9em; color: #b0a080; margin-bottom: 8px; }
+  .play-bar code { background: #2a2018; padding: 2px 6px; border-radius: 3px; }
+  .play-bar button { background: transparent; color: #c8a96e; border: 1px solid #4a3828; border-radius: 3px; padding: 3px 10px; font-family: Georgia, serif; font-size: 0.85em; cursor: pointer; }
+  .play-bar button:hover { background: #2a2018; }
+  .play-log { flex: 1; overflow-y: auto; background: #2a2018; border: 1px solid #4a3828; border-radius: 6px; padding: 16px; }
+  .play-log .turn { margin-bottom: 14px; line-height: 1.6; }
+  .play-log .turn.player { border-left: 3px solid #c8a96e; padding-left: 12px; color: #b0a080; font-style: italic; white-space: pre-wrap; }
+  .play-log .turn.dm { color: #d4c5a9; white-space: pre-wrap; }
+  .play-log .turn.tool { font-family: Menlo, Consolas, monospace; font-size: 0.82em; color: #806848; }
+  .play-log .turn.error { color: #e08070; }
+  .play-log .turn.meta { color: #806848; font-size: 0.85em; font-style: italic; }
+  .play-input { margin-top: 12px; display: flex; gap: 8px; }
+  .play-input textarea { flex: 1; background: #1a1510; color: #d4c5a9; border: 1px solid #4a3828; border-radius: 4px; padding: 8px 10px; font-family: Georgia, serif; font-size: 1em; resize: vertical; min-height: 56px; }
+  .play-input button { background: #4a3828; color: #d4c5a9; border: 1px solid #6a5848; border-radius: 4px; padding: 0 18px; font-family: Georgia, serif; font-size: 1em; cursor: pointer; }
+  .play-input button:hover:not(:disabled) { background: #6a5848; }
+  .play-input button:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+
+<div class="play-shell">
+  <div class="play-bar">
+    <span>Session: <code id="play-sid">…</code></span>
+    <button id="play-reset" type="button">New session</button>
+    <span id="play-status" style="margin-left:auto"></span>
+  </div>
+  <div class="play-log" id="play-log"></div>
+  <form class="play-input" id="play-form">
+    <textarea id="play-input" placeholder="Describe your action… (Ctrl+Enter to send)" autocomplete="off"></textarea>
+    <button type="submit" id="play-send">Send</button>
+  </form>
+</div>
+
+<script>
+(function(){
+  const log = document.getElementById('play-log');
+  const input = document.getElementById('play-input');
+  const send = document.getElementById('play-send');
+  const form = document.getElementById('play-form');
+  const sidEl = document.getElementById('play-sid');
+  const statusEl = document.getElementById('play-status');
+  const resetBtn = document.getElementById('play-reset');
+
+  function append(role, text) {
+    const div = document.createElement('div');
+    div.className = 'turn ' + role;
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function handleEvent(evt) {
+    if (evt.type === 'system' && evt.session_id) {
+      sidEl.textContent = evt.session_id.slice(0, 8);
+    } else if (evt.type === 'assistant' && evt.message && Array.isArray(evt.message.content)) {
+      for (const block of evt.message.content) {
+        if (block.type === 'text' && block.text) {
+          append('dm', block.text);
+        } else if (block.type === 'tool_use') {
+          const args = block.input ? Object.keys(block.input).slice(0, 3).join(', ') : '';
+          append('tool', '⚙ ' + (block.name || '?') + '(' + args + ')');
+        }
+      }
+    } else if (evt.type === 'result') {
+      const parts = ['turn complete'];
+      if (typeof evt.duration_ms === 'number') parts.push((evt.duration_ms / 1000).toFixed(1) + 's');
+      if (typeof evt.total_cost_usd === 'number') parts.push('$' + evt.total_cost_usd.toFixed(4));
+      append('meta', '— ' + parts.join(' · '));
+    } else if (evt.type === 'error') {
+      append('error', 'Error (rc=' + evt.returncode + '): ' + (evt.stderr || '').slice(0, 500));
+    }
+    // user-role echoes, raw lines, and other event types are ignored.
+  }
+
+  async function submitTurn(text) {
+    append('player', text);
+    send.disabled = true;
+    statusEl.textContent = 'thinking…';
+    try {
+      const resp = await fetch('/play/turn', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({message: text}),
+      });
+      if (!resp.ok) {
+        append('error', 'HTTP ' + resp.status);
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, {stream: true});
+        let nl;
+        while ((nl = buf.indexOf('\\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          try { handleEvent(JSON.parse(line)); }
+          catch (e) { append('error', 'Bad JSON: ' + line.slice(0, 80)); }
+        }
+      }
+    } catch (err) {
+      append('error', String(err));
+    } finally {
+      send.disabled = false;
+      statusEl.textContent = '';
+      input.focus();
+    }
+  }
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    submitTurn(text);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      form.requestSubmit();
+    }
+  });
+
+  resetBtn.addEventListener('click', async () => {
+    if (!confirm('Start a new DM session? The current conversation will no longer be resumed.')) return;
+    await fetch('/play/reset', {method: 'POST'});
+    sidEl.textContent = '(new)';
+    append('meta', '— new session started');
+  });
+
+  fetch('/play/session').then(r => r.json()).then(d => {
+    sidEl.textContent = d.session_id ? d.session_id.slice(0, 8) : '(new)';
+  });
+
+  input.focus();
+})();
+</script>
+"""
+
+
+@app.route("/play")
+def play_page():
+    return render("Play", _PLAY_HTML)
+
+
+@app.route("/play/session")
+def play_session_id():
+    return jsonify({"session_id": _dm.session_id()})
+
+
+@app.route("/play/reset", methods=["POST"])
+def play_reset():
+    _dm.reset_session()
+    return jsonify({"ok": True})
+
+
+@app.route("/play/turn", methods=["POST"])
+def play_turn():
+    data = request.get_json(silent=True) or {}
+    msg = (data.get("message") or "").strip()
+    if not msg:
+        return jsonify({"error": "empty message"}), 400
+
+    def gen():
+        for evt in _dm.stream_turn(msg):
+            yield json.dumps(evt) + "\n"
+
+    resp = Response(gen(), mimetype="application/x-ndjson")
+    # Defeat any reverse-proxy buffering (nginx etc.); harmless on the dev server.
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
 
 
 def _encumbrance_html(char: dict, state: dict, key: str) -> str:
