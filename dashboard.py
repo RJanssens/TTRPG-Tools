@@ -2824,7 +2824,8 @@ _PLAY_HTML = """
     } else if (evt.type === 'result') {
       const parts = ['turn complete'];
       if (typeof evt.duration_ms === 'number') parts.push((evt.duration_ms / 1000).toFixed(1) + 's');
-      if (typeof evt.total_cost_usd === 'number') parts.push('$' + evt.total_cost_usd.toFixed(4));
+      // Cost intentionally hidden — claude -p reports API-equivalent dollars
+      // but the user is on Claude Code subscription, so the number is noise.
       append('meta', parts.join(' · '));
       refreshState();
     } else if (evt.type === 'error') {
