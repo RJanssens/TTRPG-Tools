@@ -1885,14 +1885,30 @@ _PLAY_HTML = """
     min-width: 80px;
   }
 
-  /* Toolbar filter group: three icon-only toggle pills for message-type
-     visibility. Active = type is shown (gold + opaque); inactive = hidden
-     (dim). Tooltip exposes the full label. */
-  .filter-group {
+  /* Toolbar view-controls: filter pills + font-size buttons clustered
+     together, with a small gap between the two groups. */
+  .view-controls { display: inline-flex; align-items: center; gap: 10px; }
+  .filter-group, .font-group { display: inline-flex; gap: 4px; }
+  .icon-btn {
+    width: 30px;
+    height: 26px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    color: var(--ink-muted);
+    font-family: var(--font-body);
+    font-size: 0.86em;
+    line-height: 1;
+    cursor: pointer;
+    transition: all 180ms ease;
     display: inline-flex;
-    gap: 4px;
-    margin-left: 4px;
+    align-items: center;
+    justify-content: center;
   }
+  .icon-btn:hover { color: var(--accent-gold); border-color: var(--rule-hi); }
+  .icon-btn:active { background: rgba(200,169,110,0.12); }
+  .icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
   .turn-toggle.icon {
     width: 30px;
     height: 26px;
@@ -2369,10 +2385,16 @@ _PLAY_HTML = """
     <div class="play-toolbar">
       <h1>Live Play</h1>
       <span class="sid">session<code id="play-sid">…</code></span>
-      <span class="filter-group" role="group" aria-label="Show message types">
-        <button class="turn-toggle icon" data-filter="player" type="button" title="Show player echoes" aria-label="Show player echoes">◇</button>
-        <button class="turn-toggle icon" data-filter="tools"  type="button" title="Show tool calls"     aria-label="Show tool calls">⚙</button>
-        <button class="turn-toggle icon" data-filter="meta"   type="button" title="Show meta lines"     aria-label="Show meta lines">✦</button>
+      <span class="view-controls">
+        <span class="filter-group" role="group" aria-label="Show message types">
+          <button class="turn-toggle icon" data-filter="player" type="button" title="Show player echoes" aria-label="Show player echoes">◇</button>
+          <button class="turn-toggle icon" data-filter="tools"  type="button" title="Show tool calls"     aria-label="Show tool calls">⚙</button>
+          <button class="turn-toggle icon" data-filter="meta"   type="button" title="Show meta lines"     aria-label="Show meta lines">✦</button>
+        </span>
+        <span class="font-group" role="group" aria-label="Narrative text size">
+          <button id="play-font-dec" class="icon-btn" type="button" title="Smaller text" aria-label="Decrease narrative text size">A−</button>
+          <button id="play-font-inc" class="icon-btn" type="button" title="Larger text"  aria-label="Increase narrative text size">A+</button>
+        </span>
       </span>
       <span class="spacer"></span>
       <span id="play-status"></span>
@@ -2720,6 +2742,30 @@ _PLAY_HTML = """
       makePicBtn.disabled = false;
     }
   });
+
+  // Narrative font-size controls: persist scale in localStorage, clamp to a
+   // sane range, refresh button-disabled state at the limits.
+  const FONT_KEY = 'play.font-size';
+  const FONT_MIN = 0.85, FONT_MAX = 1.55, FONT_STEP = 0.06, FONT_DEFAULT = 1.02;
+  const fontDec = document.getElementById('play-font-dec');
+  const fontInc = document.getElementById('play-font-inc');
+  function applyFont() {
+    const stored = parseFloat(localStorage.getItem(FONT_KEY));
+    const v = isNaN(stored) ? FONT_DEFAULT : Math.max(FONT_MIN, Math.min(FONT_MAX, stored));
+    log.style.fontSize = v.toFixed(2) + 'em';
+    fontDec.disabled = v <= FONT_MIN + 0.001;
+    fontInc.disabled = v >= FONT_MAX - 0.001;
+  }
+  function bumpFont(delta) {
+    const stored = parseFloat(localStorage.getItem(FONT_KEY));
+    const cur = isNaN(stored) ? FONT_DEFAULT : stored;
+    const next = Math.max(FONT_MIN, Math.min(FONT_MAX, cur + delta));
+    localStorage.setItem(FONT_KEY, next.toString());
+    applyFont();
+  }
+  fontDec.addEventListener('click', () => bumpFont(-FONT_STEP));
+  fontInc.addEventListener('click', () => bumpFont(+FONT_STEP));
+  applyFont();
 
   // Filter pills: persist Show/Hide per turn-type in localStorage.
   document.querySelectorAll('.turn-toggle').forEach(btn => {
