@@ -17,6 +17,20 @@ def get_session() -> dict | None:
     return _session
 
 
+def _persist_session() -> None:
+    """Write combat_state.json after a state mutation so the dashboard and
+    status line can show live HP/conditions during combat. Deferred import
+    avoids a circular dep with tools.combat_map."""
+    if _session is None:
+        return
+    try:
+        from tools.combat_map import save_combat_state
+        cfg = _c.load_campaign()
+        save_combat_state(cfg, _session)
+    except Exception:
+        pass  # never break a tool response on a dashboard write
+
+
 def _sum_modifier(combatant: dict, key: str) -> int:
     """Total a numeric effect modifier across all active effects on a combatant."""
     total = 0
@@ -155,6 +169,7 @@ def register(mcp):
             })
             party_loaded.append(char["label"])
 
+        _persist_session()
         return {
             "message":      f"Combat started. {len(party_loaded)} party member(s) loaded.",
             "party_loaded": party_loaded,
@@ -195,6 +210,7 @@ def register(mcp):
             "movement":     movement,
         })
 
+        _persist_session()
         return {"name": name, "hp": hp, "ac": ac, "thac0": thac0, "side": side}
 
     @mcp.tool()
@@ -223,6 +239,7 @@ def register(mcp):
         _session["combatants"].sort(key=lambda c: name_to_total.get(c["name"], 999))
         _session["current_idx"] = 0
 
+        _persist_session()
         return {"round": _session["round"], "order": order}
 
     @mcp.tool()
@@ -254,6 +271,7 @@ def register(mcp):
         if "casting" not in caster["conditions"]:
             caster["conditions"].append("casting")
 
+        _persist_session()
         return {
             "caster":           caster["name"],
             "spell":            spell_name,
@@ -368,6 +386,7 @@ def register(mcp):
             morale = _check_morale_trigger(tgt["side"])
             if morale:
                 result["morale_due"] = morale
+        _persist_session()
         return result
 
     @mcp.tool()
@@ -404,6 +423,7 @@ def register(mcp):
             morale = _check_morale_trigger(c["side"])
             if morale:
                 result["morale_due"] = morale
+        _persist_session()
         return result
 
     @mcp.tool()
@@ -428,6 +448,7 @@ def register(mcp):
         if hp_before <= 0 and c["hp"] > 0:
             notes.append(f"{c['name']} regains consciousness.")
 
+        _persist_session()
         return {
             "name":     c["name"],
             "healed":   healed,
@@ -450,6 +471,7 @@ def register(mcp):
         if condition not in c["conditions"]:
             c["conditions"].append(condition)
 
+        _persist_session()
         return {"name": c["name"], "conditions": list(c["conditions"])}
 
     @mcp.tool()
@@ -465,6 +487,7 @@ def register(mcp):
         if condition in c["conditions"]:
             c["conditions"].remove(condition)
 
+        _persist_session()
         return {"name": c["name"], "conditions": list(c["conditions"])}
 
     @mcp.tool()
@@ -507,6 +530,7 @@ def register(mcp):
         if source: eff["source"] = source
 
         c.setdefault("effects", []).append(eff)
+        _persist_session()
         return {"target": c["name"], "effect": eff, "active_count": len(c["effects"])}
 
     @mcp.tool()
@@ -525,6 +549,7 @@ def register(mcp):
         for i, eff in enumerate(effects):
             if eff.get("name", "").lower() == name.lower():
                 removed = effects.pop(i)
+                _persist_session()
                 return {"target": c["name"], "removed": removed, "remaining": len(effects)}
         return {"error": f"No active effect named '{name}' on {c['name']}."}
 
@@ -580,6 +605,7 @@ def register(mcp):
                 }
                 if bleeding_report:
                     result["bleeding"] = bleeding_report
+                _persist_session()
                 return result
 
         return {"error": "All combatants are down."}

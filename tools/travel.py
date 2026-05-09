@@ -113,6 +113,11 @@ def register(mcp):
         for leg_n in range(1, int(days) + 1):
             season = state.get("current_season", "spring")
             table = _weather._terrain_table(season, terrain)
+            if table is None:
+                return {
+                    "error": f"Unknown terrain '{terrain}'. Call list_terrains() for supported keys.",
+                    "supported": _weather._supported_terrains(season),
+                }
             w_label, w_effect = _weather._weighted_pick(table)
             descriptor = f"{w_label} ({terrain}, {season})"
             state["current_weather"] = descriptor

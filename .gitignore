@@ -1,6 +1,10 @@
 # Secrets
 .env
 
+# Machine-local Claude Code state
+.claude/settings.local.json
+.dm_session
+
 # Python
 __pycache__/
 *.pyc

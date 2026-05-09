@@ -9,9 +9,16 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from datetime import datetime, timezone
+
 from flask import Flask, Response, abort, jsonify, render_template_string, request, send_from_directory
 
 import _campaign as _c
+from tools import export_session as _export
+from tools import item_weights as _iw
+from tools import homebrew_classes as _hb
+from tools import dm_session as _dm
+from tools import images as _img
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -67,6 +74,142 @@ def _reload_cfg() -> None:
     _cfg_mtime = m
 
 
+def _combat_hp_overrides() -> dict:
+    """If a combat session is active, return a dict mapping party-character
+    keys to live HP from combat_state.json so /party (and the status line)
+    show current HP during combat instead of stale state.json values."""
+    if not cfg:
+        return {}
+    cs_path = cfg["_dir"] / "combat_state.json"
+    if not cs_path.exists():
+        return {}
+    try:
+        cs = json.loads(cs_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not cs.get("active"):
+        return {}
+    out: dict = {}
+    for c in cs.get("combatants", []):
+        if c.get("side") != "party":
+            continue
+        key = c.get("key")
+        if key:
+            out[key] = c.get("hp")
+    return out
+
+
+def _combat_effects_overrides() -> dict:
+    """Return {character_key: [effect_dict, ...]} for party members in an
+    active combat session. Empty dict if no combat is active."""
+    if not cfg:
+        return {}
+    cs_path = cfg["_dir"] / "combat_state.json"
+    if not cs_path.exists():
+        return {}
+    try:
+        cs = json.loads(cs_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not cs.get("active"):
+        return {}
+    out: dict = {}
+    for c in cs.get("combatants", []):
+        if c.get("side") != "party":
+            continue
+        key = c.get("key")
+        effects = c.get("effects") or []
+        if key and effects:
+            out[key] = effects
+    return out
+
+
+_class_xp_cache: dict[str, list[int]] = {}
+
+# 2e kits and common synonyms map onto their PHB base class for XP-table
+# lookup. The kits use the base class's progression in the published rules.
+_CLASS_ALIASES: dict[str, str] = {
+    "barbarian":   "Fighter",   # Complete Barbarian's Handbook (Fighter kit)
+    "berserker":   "Fighter",
+    "cavalier":    "Fighter",
+    "gladiator":   "Fighter",
+    "samurai":     "Fighter",
+    "wizard":      "Mage",
+    "necromancer": "Specialist Mage",
+    "abjurer":     "Specialist Mage",
+    "conjurer":    "Specialist Mage",
+    "diviner":     "Specialist Mage",
+    "enchanter":   "Specialist Mage",
+    "illusionist": "Specialist Mage",
+    "invoker":     "Specialist Mage",
+    "transmuter":  "Specialist Mage",
+    "monk":        "Cleric",    # Scarlet Brotherhood / OA-style monk uses Priest table
+    "assassin":    "Thief",     # 2e: Assassin kit of Thief
+    "swashbuckler":"Thief",
+}
+
+
+def _class_xp_table(cls: str) -> list[int]:
+    """Return [xp_required at level 1, level 2, ...] for a class.
+
+    Resolution order:
+      1. Homebrew classes (global/homebrew/classes/*.json) — preferred so
+         home-brewed entries win over aliases.
+      2. PHB classes (global/2e.db).
+      3. Kit→base alias fallback (legacy; will be empty for classes whose
+         homebrew JSON has been authored).
+    Empty list if nothing matches. Process-cached."""
+    key = (cls or "").strip().lower()
+    if not key:
+        return []
+    if key in _class_xp_cache:
+        return _class_xp_cache[key]
+
+    table: list[int] = _hb.homebrew_xp_table(key)
+    if not table:
+        candidates = [key]
+        if key in _CLASS_ALIASES:
+            candidates.append(_CLASS_ALIASES[key].lower())
+        try:
+            conn = _db(_2E_DB)
+            for candidate in candidates:
+                row = conn.execute(
+                    "SELECT id FROM classes WHERE lower(name) = ? LIMIT 1", (candidate,),
+                ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        "SELECT id FROM classes WHERE lower(name) LIKE ? LIMIT 1",
+                        (candidate + "%",),
+                    ).fetchone()
+                if row is not None:
+                    for r in conn.execute(
+                        "SELECT xp_required FROM class_levels WHERE class_id=? ORDER BY level",
+                        (row["id"],),
+                    ).fetchall():
+                        table.append(int(r["xp_required"]))
+                    break
+        except sqlite3.Error:
+            table = []
+
+    _class_xp_cache[key] = table
+    return table
+
+
+# Encumbrance bands (PHB Table 47) and computation live in tools/item_weights.py.
+# These thin wrappers inject the dashboard's cached sqlite connection.
+def _item_weight_resolve(name: str) -> dict:
+    return _iw.resolve_weight(name, conn=_db(_2E_DB))
+
+
+def _item_weight_lookup(name: str) -> float:
+    return _item_weight_resolve(name)["lb"]
+
+
+def _encumbrance_band(char: dict, state: dict, key: str) -> dict:
+    """Compute encumbrance for a character. See item_weights.compute_encumbrance."""
+    return _iw.compute_encumbrance(char, state, key, conn=_db(_2E_DB))
+
+
 @app.before_request
 def _refresh_before_request() -> None:
     _reload_cfg()
@@ -80,175 +223,789 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Cinzel:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=JetBrains+Mono:wght@400;500&family=Lora:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
 <style>
+  :root {{
+    --bg-base:        #14100b;
+    --bg-deep:        #0a0805;
+    --bg-card:        #221a12;
+    --bg-card-hi:     #2a2018;
+    --bg-rec:         #0f0b07;
+    --bg-nav:         rgba(13, 10, 7, 0.92);
+    --ink-body:       #e8d8b8;
+    --ink-display:    #f0d9a4;
+    --ink-muted:      #8e7e5e;
+    --accent-gold:    #c8a96e;
+    --accent-gold-hi: #f0d196;
+    --accent-rust:    #b56a3a;
+    --accent-blood:   #c83a2a;
+    --accent-cool:    #6a9ec0;
+    --rule:           #3d2c1e;
+    --rule-hi:        #5a4030;
+    --hp-good:        #7ab46e;
+    --hp-warn:        #d4a14a;
+    --hp-bad:         #c8503a;
+    --shadow-deep:    0 10px 30px rgba(0,0,0,.55);
+    --shadow-card:    0 2px 10px rgba(0,0,0,.30);
+    --inset-warm:     inset 0 1px 0 rgba(220,180,120,0.05);
+    --font-display:   'Cinzel', 'Trajan Pro', Georgia, serif;
+    --font-body:      'EB Garamond', Georgia, 'Times New Roman', serif;
+    --font-mono:      'JetBrains Mono', Menlo, Consolas, monospace;
+  }}
+
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  html {{ scrollbar-color: var(--rule-hi) var(--bg-deep); }}
+  ::selection {{ background: rgba(200,169,110,0.35); color: var(--ink-display); }}
+
   body {{
-    background: #1a1510;
-    color: #d4c5a9;
-    font-family: Georgia, 'Times New Roman', serif;
-    font-size: 16px;
-    line-height: 1.6;
+    background: var(--bg-base);
+    background-image:
+      radial-gradient(ellipse at 18% -10%, rgba(120,80,40,0.16), transparent 55%),
+      radial-gradient(ellipse at 85% 105%, rgba(80,50,25,0.14), transparent 50%),
+      linear-gradient(180deg, #15110c 0%, #100c08 100%);
+    background-attachment: fixed;
+    color: var(--ink-body);
+    font-family: var(--font-body);
+    font-size: 18px;
+    line-height: 1.62;
+    font-feature-settings: "liga", "kern", "onum";
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
   }}
+
+  /* Subtle parchment grain over the entire viewport. */
+  body::before {{
+    content: '';
+    position: fixed; inset: 0;
+    pointer-events: none;
+    z-index: 1;
+    opacity: 0.045;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' seed='4'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0.6 0.6 0.6 0 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  }}
+
   .container {{
-    max-width: 900px;
+    max-width: 980px;
     margin: 0 auto;
-    padding: 20px;
+    padding: 28px 24px 60px;
+    position: relative;
+    z-index: 2;
   }}
+
+  /* ---- Navigation ---- */
   nav {{
-    background: #110e0a;
-    border-bottom: 1px solid #4a3828;
-    padding: 10px 20px;
-    margin-bottom: 24px;
+    background: var(--bg-nav);
+    border-bottom: 1px solid var(--rule);
+    box-shadow: 0 1px 0 rgba(200,169,110,0.04), 0 4px 16px rgba(0,0,0,0.4);
+    padding: 14px 28px;
+    position: sticky; top: 0;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    z-index: 50;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
   }}
   nav a {{
-    color: #c8a96e;
+    color: var(--accent-gold);
     text-decoration: none;
-    margin-right: 18px;
-    font-size: 0.95em;
-    letter-spacing: 0.03em;
+    font-family: var(--font-display);
+    font-size: 0.72em;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    padding: 4px 16px;
+    position: relative;
+    transition: color 180ms ease;
   }}
-  nav a:hover {{ color: #e8c98e; text-decoration: underline; }}
-  h1, h2, h3, h4 {{ color: #c8a96e; margin: 16px 0 8px; }}
-  h1 {{ font-size: 1.8em; border-bottom: 1px solid #4a3828; padding-bottom: 8px; }}
-  h2 {{ font-size: 1.3em; }}
-  h3 {{ font-size: 1.1em; }}
+  nav a:not(:last-child)::after {{
+    content: '';
+    position: absolute;
+    right: 0; top: 28%; bottom: 28%;
+    width: 1px;
+    background: linear-gradient(to bottom, transparent, rgba(200,169,110,0.24), transparent);
+  }}
+  nav a:hover {{ color: var(--accent-gold-hi); }}
+  nav a.is-active {{ color: var(--ink-display); }}
+  nav a.is-active::before {{
+    content: '';
+    position: absolute;
+    left: 14px; right: 14px; bottom: -16px;
+    height: 2px;
+    background: var(--accent-gold);
+  }}
+
+  /* ---- Typography ---- */
+  h1, h2, h3, h4 {{
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    margin: 22px 0 10px;
+  }}
+  h1 {{
+    font-size: 2.05em;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 12px;
+    margin-bottom: 18px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--ink-display);
+  }}
+  h2 {{ font-size: 1.32em; letter-spacing: 0.06em; }}
+  h3 {{ font-size: 1.10em; letter-spacing: 0.05em; color: var(--accent-gold); }}
+  h4 {{ font-size: 0.98em; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-gold); }}
   p {{ margin: 8px 0; }}
   ul, ol {{ margin: 8px 0 8px 24px; }}
-  a {{ color: #c8a96e; }}
-  a:hover {{ color: #e8c98e; }}
+  a {{ color: var(--accent-gold); transition: color 160ms ease; }}
+  a:hover {{ color: var(--accent-gold-hi); }}
+
+  /* ---- Cards & layout ---- */
   .card {{
-    background: #2a2018;
-    border: 1px solid #4a3828;
-    border-radius: 6px;
-    padding: 16px;
-    margin: 8px 0;
+    background:
+      linear-gradient(135deg, rgba(255,220,180,0.020), transparent 45%),
+      linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 18px 22px;
+    margin: 12px 0;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    position: relative;
   }}
   .card h2 {{ margin-top: 0; }}
   .grid {{
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 16px;
+    gap: 18px;
     margin-top: 16px;
   }}
   .grid-item {{
-    background: #2a2018;
-    border: 1px solid #4a3828;
-    border-radius: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
     overflow: hidden;
+    transition: border-color 200ms ease, transform 200ms ease;
   }}
-  .grid-item img {{
-    width: 100%;
-    display: block;
-    border-radius: 4px 4px 0 0;
-  }}
-  .grid-item .caption {{
-    padding: 10px 12px;
-    font-size: 0.9em;
-    color: #b0a080;
-  }}
-  .grid-item .caption strong {{
-    display: block;
-    color: #d4c5a9;
-    margin-bottom: 4px;
-  }}
+  .grid-item:hover {{ border-color: var(--rule-hi); transform: translateY(-2px); }}
+  .grid-item img {{ width: 100%; display: block; border-radius: 3px 3px 0 0; }}
+  .grid-item .caption {{ padding: 12px 14px; font-size: 0.92em; color: var(--ink-muted); }}
+  .grid-item .caption strong {{ display: block; color: var(--ink-body); margin-bottom: 4px; font-family: var(--font-display); font-size: 0.95em; letter-spacing: 0.04em; }}
+
+  /* ---- HP bar (legacy text-block form, kept for back-compat) ---- */
   .hp-bar {{
     display: inline-block;
-    font-family: monospace;
+    font-family: var(--font-mono);
     letter-spacing: 1px;
-    font-size: 0.9em;
+    font-size: 0.88em;
   }}
-  .hp-bar .filled {{ color: #6db86d; }}
-  .hp-bar .empty  {{ color: #5a3a3a; }}
+  .hp-bar .filled {{ color: var(--hp-good); }}
+  .hp-bar .empty  {{ color: #4a2a2a; }}
+
+  /* ---- HP meter (graphical, used by /play sidebar and elsewhere) ---- */
+  .hp-meter {{
+    display: block;
+    height: 8px;
+    background: var(--bg-rec);
+    border: 1px solid var(--rule);
+    border-radius: 1px;
+    overflow: hidden;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
+    position: relative;
+  }}
+  .hp-meter > i {{
+    display: block;
+    height: 100%;
+    background: linear-gradient(to right, var(--hp-bad) 0%, var(--hp-warn) 45%, var(--hp-good) 75%);
+    transition: width 380ms ease;
+  }}
+
+  /* ---- Info bar (e.g. /party header strip) ---- */
   .info-bar {{
-    background: #221a12;
-    border: 1px solid #4a3828;
-    border-radius: 6px;
-    padding: 10px 14px;
-    margin: 0 0 16px 0;
+    background: linear-gradient(to bottom, #1d160f, #16110b);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 12px 16px;
+    margin: 0 0 18px 0;
     display: flex;
     flex-wrap: wrap;
-    gap: 14px 24px;
-    font-size: 0.95em;
+    gap: 14px 26px;
+    font-size: 0.96em;
+    box-shadow: var(--inset-warm);
   }}
-  .info-bar .item strong {{ color: #c8a96e; margin-right: 4px; }}
+  .info-bar .item strong {{ color: var(--accent-gold); margin-right: 6px; font-family: var(--font-display); font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.1em; }}
+
+  /* ---- Clocks (faction timers) ---- */
   .clock {{
     display: inline-block;
-    padding: 4px 10px;
-    border-radius: 3px;
-    border: 1px solid #4a3828;
-    background: #2a2018;
+    padding: 4px 11px;
+    border-radius: 2px;
+    border: 1px solid var(--rule);
+    background: var(--bg-card);
     font-size: 0.9em;
     margin: 2px 4px 2px 0;
+    font-family: var(--font-display);
+    letter-spacing: 0.05em;
   }}
-  .clock.urgent {{ border-color: #b56a3a; color: #e8b487; background: #3a2418; }}
-  .clock.expired {{ border-color: #6a2818; color: #ff7a5a; background: #3a1812; }}
-  .truth-true        {{ color: #6db86d; font-size: 0.8em; }}
-  .truth-partly_true {{ color: #c8a96e; font-size: 0.8em; }}
+  .clock.urgent  {{ border-color: var(--accent-rust); color: #e8b487; background: #2e1d12; }}
+  .clock.expired {{ border-color: #6a2818; color: #ff7a5a; background: #2e1410; }}
+
+  /* ---- Truth/secret indicators (DM views) ---- */
+  .truth-true        {{ color: var(--hp-good); font-size: 0.8em; }}
+  .truth-partly_true {{ color: var(--accent-gold); font-size: 0.8em; }}
   .truth-false       {{ color: #c87a7a; font-size: 0.8em; }}
-  .truth-fabrication {{ color: #ff5a4a; font-size: 0.8em; font-weight: bold; }}
+  .truth-fabrication {{ color: #ff5a4a; font-size: 0.8em; font-weight: 600; }}
   .secret-card {{
-    background: #2a1818;
+    background: linear-gradient(to bottom, #2a1818, #221212);
     border: 1px solid #6a3828;
-    border-left: 4px solid #c8503a;
-    padding: 12px 16px;
-    margin: 8px 0;
-    border-radius: 4px;
+    border-left: 4px solid var(--accent-blood);
+    padding: 14px 18px;
+    margin: 10px 0;
+    border-radius: 3px;
+    box-shadow: var(--shadow-card);
   }}
   .scope-warning {{ color: #e8b487; font-size: 0.85em; }}
+
+  /* ---- Tags / chips ---- */
   .tag {{
     display: inline-block;
-    background: #3a2818;
-    border: 1px solid #5a4030;
-    border-radius: 3px;
-    padding: 1px 7px;
-    font-size: 0.8em;
+    background: #322012;
+    border: 1px solid var(--rule-hi);
+    border-radius: 2px;
+    padding: 1px 8px;
+    font-size: 0.78em;
     margin: 2px;
-    color: #c8a96e;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    letter-spacing: 0.06em;
   }}
-  .two-col {{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-  }}
+
+  /* ---- Layout helpers ---- */
+  .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}
   @media (max-width: 600px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
+
+  /* ---- Portrait (inline within prose) ---- */
   .portrait {{
     float: right;
-    margin: 0 0 12px 16px;
+    margin: 0 0 14px 18px;
     max-width: 180px;
-    border-radius: 4px;
-    border: 1px solid #4a3828;
+    border-radius: 3px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: var(--shadow-card);
   }}
+
+  /* ---- Party card (used on /party page) ---- */
+  .party-card {{ display: flex; gap: 18px; align-items: flex-start; }}
+  .party-portrait {{
+    width: 116px; height: 116px;
+    object-fit: cover;
+    border-radius: 3px;
+    border: 1px solid var(--rule-hi);
+    flex-shrink: 0;
+    box-shadow: var(--shadow-card), inset 0 0 0 1px rgba(0,0,0,0.4);
+  }}
+  .party-body {{ flex: 1; min-width: 0; }}
+  .party-body h2 {{ margin-top: 0; }}
+
+  /* ---- Spells ---- */
+  .spell-ready {{ color: var(--ink-body); }}
+  .spell-cast  {{ color: #6a5a48; text-decoration: line-through; text-decoration-color: rgba(106,90,72,0.5); }}
+  .memorized {{ margin: 8px 0; }}
+  .spell-level {{ margin: 6px 0; }}
+  .spell-level-head {{
+    font-size: 0.82em;
+    color: var(--accent-gold);
+    margin: 4px 0 4px;
+    border-bottom: 1px dotted var(--rule);
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    padding-bottom: 3px;
+  }}
+  .spell-list {{ list-style: disc; margin: 2px 0 4px 22px; padding: 0; }}
+  .spell-list li {{ margin: 1px 0; line-height: 1.42; }}
+
+  /* ---- Effect / light chips ---- */
+  .effect-chip {{
+    display: inline-block;
+    background: #182734;
+    border: 1px solid #3a5a7a;
+    border-radius: 2px;
+    padding: 2px 8px;
+    margin: 2px 2px 2px 0;
+    font-size: 0.85em;
+    color: #a0c0e0;
+    font-family: var(--font-display);
+    letter-spacing: 0.04em;
+  }}
+  .light-chip {{
+    display: inline-block;
+    background: #322014;
+    border: 1px solid #6a4828;
+    border-radius: 2px;
+    padding: 2px 8px;
+    margin: 2px 2px 2px 0;
+    font-size: 0.85em;
+    color: #e8c080;
+    font-family: var(--font-display);
+    letter-spacing: 0.04em;
+  }}
+  .light-chip.guttering {{
+    background: #321810;
+    border-color: var(--accent-rust);
+    color: #ff8a6a;
+    animation: flicker 1.4s ease-in-out infinite;
+  }}
+  @keyframes flicker {{
+    0%, 100% {{ opacity: 1; }}
+    47% {{ opacity: 0.78; }}
+    52% {{ opacity: 1; }}
+    78% {{ opacity: 0.86; }}
+  }}
+
+  /* ---- Encumbrance widgets ---- */
+  .enc-card {{ margin-top: 16px; }}
+  .enc-bar {{
+    height: 10px;
+    background: var(--bg-rec);
+    border: 1px solid var(--rule);
+    border-radius: 1px;
+    overflow: hidden;
+    margin: 6px 0 10px;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
+  }}
+  .enc-fill {{ height: 100%; transition: width .35s ease; }}
+  .enc-bands {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }}
+  .enc-band {{
+    background: var(--bg-rec);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 7px 8px;
+    font-size: 0.85em;
+    text-align: center;
+  }}
+  .enc-band-name {{
+    display: block;
+    color: var(--ink-muted);
+    text-transform: uppercase;
+    font-size: 0.78em;
+    font-family: var(--font-display);
+    letter-spacing: 0.1em;
+  }}
+  .enc-band-cap {{ display: block; color: var(--ink-body); font-family: var(--font-mono); font-size: 0.92em; }}
+  .enc-band-active {{ border-color: var(--accent-gold); background: var(--bg-card); }}
+  .enc-band-active .enc-band-name {{ color: var(--accent-gold); }}
+  .enc-items {{ margin: 12px 0 4px; font-size: 0.92em; }}
+  .enc-items th {{ font-weight: 500; color: var(--accent-gold); font-family: var(--font-display); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.82em; }}
+  .enc-items td, .enc-items th {{ padding: 5px 9px; }}
+  .enc-items tfoot td {{ border-top: 1px solid var(--rule); background: var(--bg-rec); }}
+  @media (max-width: 480px) {{
+    .party-card {{ flex-direction: column; }}
+    .party-portrait {{ width: 100%; height: auto; max-width: 220px; }}
+  }}
+
+  /* ---- Misc primitives ---- */
   .clearfix::after {{ content: ''; display: table; clear: both; }}
-  .muted {{ color: #8a7a60; font-size: 0.9em; }}
-  pre {{ background: #110e0a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }}
-  code {{ font-family: monospace; }}
-  blockquote {{ border-left: 3px solid #4a3828; padding-left: 12px; color: #a09070; }}
-  hr {{ border: none; border-top: 1px solid #4a3828; margin: 20px 0; }}
-  table {{ width: 100%; border-collapse: collapse; margin: 12px 0; }}
-  th, td {{ border: 1px solid #4a3828; padding: 6px 10px; text-align: left; }}
-  th {{ background: #2a2018; color: #c8a96e; }}
+  .muted {{ color: var(--ink-muted); font-size: 0.92em; }}
+  pre {{
+    background: var(--bg-deep);
+    padding: 14px 16px;
+    border-radius: 3px;
+    border: 1px solid var(--rule);
+    overflow-x: auto;
+    font-size: 0.86em;
+    font-family: var(--font-mono);
+  }}
+  code {{ font-family: var(--font-mono); font-size: 0.92em; color: var(--accent-gold-hi); }}
+  pre code {{ color: var(--ink-body); }}
+  blockquote {{
+    border-left: 3px solid var(--accent-gold);
+    padding: 4px 0 4px 16px;
+    color: #b8a982;
+    font-style: italic;
+    margin: 12px 0;
+  }}
+  hr {{
+    border: none;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--rule-hi), transparent);
+    margin: 28px 0;
+  }}
+  table {{ width: 100%; border-collapse: collapse; margin: 14px 0; }}
+  th, td {{ border: 1px solid var(--rule); padding: 7px 11px; text-align: left; }}
+  th {{
+    background: linear-gradient(to bottom, #2c2218, #221912);
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.84em;
+  }}
   img:not(#lb-img) {{ cursor: zoom-in; }}
+
+  /* ---- Character sheet (AD&D 2e style) ---- */
+  .sheet {{ max-width: 940px; margin: 0 auto; }}
+  .sheet-header {{
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 26px;
+    padding: 22px 26px;
+    background:
+      linear-gradient(135deg, rgba(255,220,180,0.030), transparent 55%),
+      linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    margin-bottom: 16px;
+    align-items: start;
+  }}
+  .sheet-header-main {{ min-width: 0; }}
+  .sheet-header h1 {{
+    border: none;
+    padding: 0;
+    margin: 0 0 6px;
+    font-size: 2.1em;
+    letter-spacing: 0.16em;
+    line-height: 1.05;
+    color: var(--ink-display);
+  }}
+  .sheet-id {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.82em;
+    color: var(--accent-gold);
+  }}
+  .sheet-id .sep {{ color: var(--ink-muted); margin: 0 8px; }}
+  .sheet-conditions {{ margin-top: 10px; }}
+  .sheet-portrait {{
+    width: 170px;
+    border-radius: 3px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: var(--shadow-card);
+    display: block;
+  }}
+  .sheet-portrait-wrap {{ text-align: center; }}
+  .sheet-portrait-wrap details.portrait-desc {{ margin-top: 6px; }}
+
+  .sheet-panel {{
+    background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    margin-bottom: 14px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    overflow: hidden;
+  }}
+  .sheet-panel-title {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.72em;
+    color: var(--accent-gold);
+    margin: 0;
+    padding: 9px 16px;
+    background: rgba(0,0,0,0.20);
+    border-bottom: 1px solid var(--rule);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }}
+  .sheet-panel-title::before {{
+    content: '\\25C6';   /* ◆ */
+    font-size: 0.55em;
+    color: var(--accent-gold);
+    opacity: 0.85;
+  }}
+  .sheet-panel-body {{ padding: 16px 18px; }}
+  .sheet-panel-body > *:first-child {{ margin-top: 0; }}
+  .sheet-panel-body > *:last-child {{ margin-bottom: 0; }}
+
+  /* Ability score grid */
+  .ab-grid {{
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 8px;
+  }}
+  .ab-box {{
+    background: var(--bg-deep);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 12px 6px 9px;
+    text-align: center;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.4);
+  }}
+  .ab-box .ab-num {{
+    font-family: var(--font-mono);
+    font-size: 1.95em;
+    color: var(--ink-display);
+    line-height: 1.0;
+  }}
+  .ab-box .ab-label {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.66em;
+    color: var(--ink-muted);
+    margin-top: 6px;
+  }}
+
+  /* Vitals row */
+  .vitals-row {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 30px;
+    align-items: center;
+  }}
+  .vital {{ display: flex; align-items: baseline; gap: 8px; }}
+  .vital-label {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.66em;
+    color: var(--ink-muted);
+  }}
+  .vital-value {{
+    font-family: var(--font-mono);
+    font-size: 1.16em;
+    color: var(--ink-display);
+  }}
+  .vital-value .xp-next {{ color: var(--ink-muted); font-size: 0.84em; margin-left: 2px; }}
+  .vital .hp-meter {{ width: 110px; height: 10px; }}
+
+  /* Saves grid */
+  .saves-grid {{
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+  }}
+  .save-box {{
+    background: var(--bg-deep);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 9px 4px 7px;
+    text-align: center;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.4);
+  }}
+  .save-box .save-num {{
+    font-family: var(--font-mono);
+    font-size: 1.45em;
+    color: var(--ink-display);
+    line-height: 1.0;
+  }}
+  .save-box .save-label {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    font-size: 0.6em;
+    color: var(--ink-muted);
+    margin-top: 5px;
+  }}
+
+  /* Attacks table */
+  table.attacks-table {{ width: 100%; margin: 0; font-size: 0.94em; }}
+  table.attacks-table th {{
+    background: linear-gradient(to bottom, #2c2218, #221912);
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-size: 0.74em;
+    padding: 6px 9px;
+  }}
+  table.attacks-table td {{
+    font-family: var(--font-mono);
+    padding: 7px 9px;
+    border: 1px solid var(--rule);
+  }}
+  table.attacks-table td:first-child {{
+    font-family: var(--font-body);
+    color: var(--ink-body);
+  }}
+
+  /* Two-column inside a panel (e.g. profs / nwps) */
+  .sheet-two-col {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 18px 26px;
+  }}
+  .sheet-two-col h4 {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 0.72em;
+    color: var(--accent-gold);
+    margin: 0 0 6px;
+  }}
+
+  /* Lists with diamond bullets */
+  ul.sheet-list {{ list-style: none; padding: 0; margin: 0; }}
+  ul.sheet-list li {{
+    padding: 4px 0 4px 18px;
+    position: relative;
+    border-bottom: 1px dotted rgba(140,110,70,0.18);
+    line-height: 1.45;
+  }}
+  ul.sheet-list li:last-child {{ border-bottom: none; }}
+  ul.sheet-list li::before {{
+    content: '\\25C7';   /* ◇ */
+    position: absolute;
+    left: 0;
+    top: 0.45em;
+    color: var(--accent-gold);
+    font-size: 0.72em;
+    line-height: 1;
+  }}
+
+  /* Proficiency chips */
+  .prof-chips {{ display: flex; flex-wrap: wrap; gap: 5px; }}
+  .prof-chip {{
+    background: #322012;
+    border: 1px solid var(--rule-hi);
+    border-radius: 2px;
+    padding: 3px 10px;
+    font-family: var(--font-display);
+    font-size: 0.72em;
+    letter-spacing: 0.06em;
+    color: var(--accent-gold);
+  }}
+
+  /* Thief / nature skills percentage grid */
+  .skills-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 4px 18px;
+  }}
+  .skill-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    border-bottom: 1px dotted rgba(140,110,70,0.20);
+    padding: 4px 0;
+  }}
+  .skill-name {{ color: var(--ink-body); font-size: 0.92em; }}
+  .skill-val {{
+    font-family: var(--font-mono);
+    color: var(--accent-gold-hi);
+    font-size: 0.96em;
+  }}
+
+  @media (max-width: 720px) {{
+    .sheet-header {{ grid-template-columns: 1fr; }}
+    .sheet-portrait {{ max-width: 220px; }}
+    .ab-grid {{ grid-template-columns: repeat(3, 1fr); }}
+    .saves-grid {{ grid-template-columns: repeat(3, 1fr); }}
+    .sheet-two-col {{ grid-template-columns: 1fr; }}
+  }}
+
+  /* ---- Spoiler accordion (rumors, DM notes, sheet descriptions) ---- */
+  details.spoiler {{
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent-rust);
+    background: linear-gradient(to bottom, #1d1410, #16100b);
+    border-radius: 3px;
+    margin: 12px 0;
+    box-shadow: var(--inset-warm);
+  }}
+  details.spoiler[open] {{ border-left-color: var(--accent-gold); }}
+  details.spoiler > summary {{
+    cursor: pointer;
+    padding: 11px 16px;
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.78em;
+    color: var(--accent-rust);
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    transition: color 180ms ease;
+  }}
+  details.spoiler > summary::-webkit-details-marker {{ display: none; }}
+  details.spoiler > summary::before {{
+    content: '▶';
+    font-size: 0.7em;
+    transition: transform 200ms ease;
+    color: inherit;
+  }}
+  details.spoiler[open] > summary {{
+    color: var(--accent-gold);
+    border-bottom: 1px solid var(--rule);
+  }}
+  details.spoiler[open] > summary::before {{ transform: rotate(90deg); }}
+  details.spoiler > summary .spoiler-warn {{
+    color: var(--ink-muted);
+    font-style: italic;
+    font-family: var(--font-body);
+    text-transform: none;
+    letter-spacing: 0.01em;
+    font-size: 0.86em;
+    margin-left: auto;
+    font-weight: normal;
+  }}
+  details.spoiler > .spoiler-body {{
+    padding: 14px 18px;
+  }}
+  details.spoiler > .spoiler-body > *:first-child {{ margin-top: 0; }}
+  details.spoiler > .spoiler-body > *:last-child {{ margin-bottom: 0; }}
+
+  /* Compact details (e.g. portrait description on character sheets) — quieter than .spoiler. */
+  details.portrait-desc {{ margin-top: 8px; text-align: left; }}
+  details.portrait-desc > summary {{
+    cursor: pointer;
+    font-size: 0.78em;
+    color: var(--ink-muted);
+    font-style: italic;
+    list-style: none;
+    user-select: none;
+    padding: 2px 0;
+  }}
+  details.portrait-desc > summary::-webkit-details-marker {{ display: none; }}
+  details.portrait-desc > summary::before {{
+    content: '▸ ';
+    color: var(--accent-gold);
+    font-style: normal;
+  }}
+  details.portrait-desc[open] > summary::before {{ content: '▾ '; }}
+  details.portrait-desc > p {{
+    margin-top: 6px;
+    color: var(--ink-muted);
+    font-size: 0.84em;
+    line-height: 1.5;
+    text-align: left;
+  }}
+
+  /* ---- Lightbox ---- */
   #lb {{
     display: none; position: fixed; inset: 0;
-    background: rgba(0,0,0,.88); z-index: 9999;
+    background: rgba(0,0,0,.92); z-index: 9999;
     align-items: center; justify-content: center;
     padding: 20px; cursor: zoom-out;
+    backdrop-filter: blur(4px);
   }}
   #lb.open {{ display: flex; }}
   #lb img {{
     max-width: 90vw; max-height: 90vh; object-fit: contain;
-    border-radius: 6px; border: 2px solid #5a4030;
-    box-shadow: 0 8px 40px rgba(0,0,0,.9); cursor: zoom-out;
+    border-radius: 3px; border: 1px solid var(--accent-gold);
+    box-shadow: 0 12px 60px rgba(0,0,0,.95); cursor: zoom-out;
   }}
 </style>
 </head>
 <body>
 <nav>
   <a href="/">Gallery</a>
+  <a href="/play">Play</a>
   <a href="/party">Party</a>
   <a href="/world">World</a>
   <a href="/quests">Quests</a>
   <a href="/log">Chronicle</a>
+  <a href="/sessions">Sessions</a>
   <a href="/characters">Characters</a>
   <a href="/locations">Locations</a>
   <a href="/monsters">Monsters</a>
@@ -256,6 +1013,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/classes">Classes</a>
   <a href="/items">Items</a>
   <a href="/combat">Combat</a>
+  <a href="/maps">Maps</a>
 </nav>
 <div class="container">
 {body}
@@ -271,6 +1029,12 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     if(t.tagName==='IMG'&&t.id!=='lb-img'){{li.src=t.src;li.alt=t.alt;lb.classList.add('open');}}
   }});
   document.addEventListener('keydown',function(e){{if(e.key==='Escape')lb.classList.remove('open');}});
+  // Highlight the active nav link based on the current path.
+  var p = location.pathname;
+  document.querySelectorAll('nav a').forEach(function(a){{
+    var href = a.getAttribute('href');
+    if (href === '/' ? p === '/' : p.indexOf(href) === 0) a.classList.add('is-active');
+  }});
 }})();
 </script>
 </body>
@@ -581,19 +1345,69 @@ def gallery():
 
     items = []
     for e in reversed(scenes):
-        fn = html.escape(e.get("filename", ""))
+        fn = e.get("filename", "")
+        fn_safe = html.escape(fn)
         scene = html.escape(e.get("scene", ""))
         desc = html.escape(e.get("description", ""))
         items.append(
-            f'<div class="grid-item">'
-            f'<img src="/images/{fn}" alt="{scene}" loading="lazy">'
+            f'<div class="grid-item" data-filename="{fn_safe}">'
+            f'<button class="gallery-delete" type="button" '
+            f'data-filename="{fn_safe}" '
+            f'title="Delete this picture" aria-label="Delete this picture">×</button>'
+            f'<img src="/images/{fn_safe}" alt="{scene}" loading="lazy">'
             f'<div class="caption"><strong>{scene}</strong>{desc}</div>'
             f'</div>'
         )
 
     body = (
+        "<style>"
+        ".grid-item { position: relative; }"
+        ".gallery-delete {"
+        "  position: absolute; top: 8px; right: 8px; z-index: 5;"
+        "  width: 30px; height: 30px; padding: 0;"
+        "  border-radius: 50%;"
+        "  background: rgba(10,8,5,0.78); border: 1px solid var(--accent-rust);"
+        "  color: #e8a090;"
+        "  font-family: var(--font-body); font-size: 1.15em; line-height: 1;"
+        "  cursor: pointer;"
+        "  display: flex; align-items: center; justify-content: center;"
+        "  opacity: 0; transition: opacity 180ms ease, transform 180ms ease, background 180ms ease, color 180ms ease;"
+        "}"
+        ".grid-item:hover .gallery-delete, "
+        ".gallery-delete:focus { opacity: 1; }"
+        ".gallery-delete:hover {"
+        "  background: rgba(70,20,15,0.92); color: #ffb09a;"
+        "  transform: scale(1.08);"
+        "}"
+        ".gallery-delete:disabled { opacity: 0.5; cursor: not-allowed; }"
+        "</style>"
         f"<h1>{html.escape(campaign_name)} — Gallery</h1>"
         f'<div class="grid">{"".join(items)}</div>'
+        "<script>(function(){"
+        "document.querySelectorAll('.gallery-delete').forEach(function(btn){"
+        "  btn.addEventListener('click', async function(e){"
+        "    e.stopPropagation();"  # don't bubble to lightbox handler
+        "    const fn = btn.dataset.filename;"
+        "    if (!fn) return;"
+        "    if (!confirm('Delete this picture?')) return;"
+        "    btn.disabled = true;"
+        "    try {"
+        "      const r = await fetch('/api/images/' + encodeURIComponent(fn), {method:'DELETE'});"
+        "      if (!r.ok) {"
+        "        const d = await r.json().catch(()=>({}));"
+        "        alert('Delete failed: ' + (d.error || ('HTTP '+r.status)));"
+        "        return;"
+        "      }"
+        "      const card = btn.closest('.grid-item');"
+        "      if (card) card.remove();"
+        "    } catch (err) {"
+        "      alert('Delete failed: ' + err);"
+        "    } finally {"
+        "      btn.disabled = false;"
+        "    }"
+        "  });"
+        "});"
+        "})();</script>"
     )
     return render(f"{campaign_name} — Gallery", body)
 
@@ -603,6 +1417,10 @@ def party():
     state = _c.load_state(cfg)
     campaign_name = cfg.get("name", "Campaign")
     characters = cfg.get("characters", {})
+    combat_hp = _combat_hp_overrides()
+    combat_effects = _combat_effects_overrides()
+    image_index = _load_image_index()
+    light_sources = state.get("light_sources", []) or []
 
     coin = state.get("coin", {})
     coin_parts = []
@@ -619,14 +1437,102 @@ def party():
     for key, char in characters.items():
         cstate = state.get("characters", {}).get(key, {})
         hp_max = char.get("hp_max", 0)
-        hp_cur = cstate.get("hp", hp_max)
+        hp_cur = combat_hp.get(key, cstate.get("hp", hp_max))
         label = char.get("label", key)
         cls = char.get("cls", "")
+        level = int(char.get("level", 1) or 1)
+        ac = char.get("ac")
+        thac0 = char.get("thac0")
         xp = cstate.get("xp", 0)
         conditions = cstate.get("conditions", [])
 
         bar = _hp_bar(hp_cur, hp_max)
         cond_tags = "".join(f'<span class="tag">{html.escape(c)}</span>' for c in conditions)
+
+        # Portrait
+        portrait = _find_portrait(label, image_index, key)
+        portrait_html = ""
+        if portrait:
+            fn = html.escape(portrait["filename"])
+            portrait_html = (
+                f'<img src="/images/{fn}" alt="{html.escape(label)}" '
+                f'class="party-portrait">'
+            )
+
+        # Class line: "Cleric 3"
+        cls_line = html.escape(cls)
+        if cls and level:
+            cls_line = f"{html.escape(cls)} {level}"
+
+        # Combat stats line
+        stats_parts = []
+        if ac is not None:
+            stats_parts.append(f"<strong>AC:</strong> {html.escape(str(ac))}")
+        if thac0 is not None:
+            stats_parts.append(f"<strong>THAC0:</strong> {html.escape(str(thac0))}")
+        stats_html = ""
+        if stats_parts:
+            stats_html = "<p>" + " &nbsp;·&nbsp; ".join(stats_parts) + "</p>"
+
+        # XP / next-level threshold
+        xp_table = _class_xp_table(cls)
+        next_xp_str = ""
+        if xp_table and level < len(xp_table):
+            next_xp = xp_table[level]   # xp_required for (level+1) — table is 0-indexed by level
+            if next_xp > xp:
+                next_xp_str = f' <span class="muted">/ {next_xp:,}</span>'
+            else:
+                next_xp_str = ' <span class="tag" style="background:#1a3a18;color:#6db86d">level up</span>'
+
+        # Active effects (combat-only)
+        effects = combat_effects.get(key, [])
+        effects_html = ""
+        if effects:
+            chips = []
+            for eff in effects:
+                name = html.escape(eff.get("name", "?"))
+                dur = eff.get("duration", 0)
+                mods = []
+                for k, sym in (("to_hit", "hit"), ("ac", "AC"), ("dmg", "dmg"), ("save", "save")):
+                    v = eff.get(k)
+                    if v:
+                        mods.append(f"{sym}{int(v):+d}")
+                mod_str = f" <span class='muted'>({', '.join(mods)})</span>" if mods else ""
+                chips.append(
+                    f'<span class="effect-chip">{name} '
+                    f'<span class="muted">{dur}r</span>{mod_str}</span>'
+                )
+            effects_html = "<p><strong>Effects:</strong> " + " ".join(chips) + "</p>"
+
+        # Encumbrance — only show when not "light" (the common case)
+        enc = _encumbrance_band(char, state, key)
+        enc_html = ""
+        if enc["band"] != "light":
+            color = {
+                "moderate":   "#c8a96e",
+                "heavy":      "#e0a060",
+                "severe":     "#e08060",
+                "overloaded": "#ff6a4a",
+            }.get(enc["band"], "#c8a96e")
+            penalty_str = f" ({enc['penalty']:+d} move)" if enc["penalty"] else ""
+            enc_html = (
+                f'<p><strong>Load:</strong> '
+                f'<span style="color:{color}">{html.escape(enc["band"])}</span> '
+                f'<span class="muted">— {enc["weight"]} lb{penalty_str}</span></p>'
+            )
+
+        # Light source carried by this character
+        carried_lit = [s for s in light_sources
+                       if s.get("lit") and s.get("holder") == key]
+        light_chip_html = ""
+        if carried_lit:
+            chips = []
+            for s in carried_lit:
+                mins = s.get("minutes_remaining", 0)
+                cls_chip = "light-chip guttering" if mins <= 5 else "light-chip"
+                stype = html.escape(s.get("type", "?"))
+                chips.append(f'<span class="{cls_chip}">{stype} · {mins} min</span>')
+            light_chip_html = "<p><strong>Carrying:</strong> " + " ".join(chips) + "</p>"
 
         # Spell slots
         slot_cfg = char.get("spell_slots") or {}
@@ -637,16 +1543,92 @@ def party():
             slot_lines.append(f"L{lvl}: {remaining}/{max_count}")
         slots_html = ""
         if slot_lines:
-            slots_html = "<p><strong>Spells:</strong> " + " &nbsp; ".join(slot_lines) + "</p>"
+            slots_html = "<p><strong>Slots:</strong> " + " &nbsp; ".join(slot_lines) + "</p>"
+
+        # Memorized spells, itemized and grouped by spell level.
+        memorized = cstate.get("memorized_spells") or []
+        mem_html = ""
+        if memorized:
+            # Resolve missing levels from the spell DB (entries are often
+            # stored with level=0 by the MCP layer).
+            unknown_names = sorted({
+                (s.get("name") if isinstance(s, dict) else str(s)).strip()
+                for s in memorized
+                if not (isinstance(s, dict) and int(s.get("level", 0) or 0) > 0)
+            })
+            unknown_names = [n for n in unknown_names if n]
+            level_map: dict[str, int] = {}
+            if unknown_names:
+                placeholders = ",".join("?" * len(unknown_names))
+                rows = _db(_2E_DB).execute(
+                    f"SELECT name, level FROM spells WHERE lower(name) IN ({placeholders})",
+                    [n.lower() for n in unknown_names],
+                ).fetchall()
+                level_map = {r["name"].lower(): int(r["level"]) for r in rows}
+
+            by_level: dict[int, list[dict]] = {}
+            for s in memorized:
+                if isinstance(s, dict):
+                    name = (s.get("name") or "").strip()
+                    lvl = int(s.get("level", 0) or 0)
+                    cast = bool(s.get("cast"))
+                else:
+                    name, lvl, cast = str(s).strip(), 0, False
+                if lvl <= 0:
+                    lvl = level_map.get(name.lower(), 0)
+                by_level.setdefault(lvl, []).append({"name": name, "cast": cast})
+
+            def _render_spell_li(s: dict) -> str:
+                name_esc = html.escape(s["name"])
+                if s["cast"]:
+                    return (
+                        f'<li class="spell-cast" title="cast">'
+                        f'<s>{name_esc}</s></li>'
+                    )
+                return f'<li class="spell-ready">{name_esc}</li>'
+
+            blocks = []
+            for lvl in sorted(by_level):
+                spells_at_level = by_level[lvl]
+                ready_at_level = sum(1 for s in spells_at_level if not s["cast"])
+                total_at_level = len(spells_at_level)
+                label_lvl = f"Level {lvl}" if lvl > 0 else "Unleveled"
+                items = "".join(_render_spell_li(s) for s in spells_at_level)
+                blocks.append(
+                    f'<div class="spell-level">'
+                    f'<div class="spell-level-head">{label_lvl} '
+                    f'<span class="muted">({ready_at_level}/{total_at_level})</span></div>'
+                    f'<ul class="spell-list">{items}</ul>'
+                    f'</div>'
+                )
+
+            ready_count = sum(1 for s in memorized
+                              if not (isinstance(s, dict) and s.get("cast")))
+            total_count = len(memorized)
+            mem_html = (
+                f'<div class="memorized">'
+                f'<p style="margin-bottom:4px"><strong>Memorized</strong> '
+                f'<span class="muted">({ready_count}/{total_count} ready)</span></p>'
+                f'{"".join(blocks)}'
+                f'</div>'
+            )
 
         cards.append(
-            f'<div class="card">'
+            f'<div class="card party-card clearfix">'
+            f'{portrait_html}'
+            f'<div class="party-body">'
             f'<h2><a href="/sheets/{html.escape(key)}">{html.escape(label)}</a></h2>'
-            f"<p class='muted'>{html.escape(cls)}</p>"
+            f"<p class='muted'>{cls_line}</p>"
             f"<p><strong>HP:</strong> {html.escape(str(hp_cur))}/{html.escape(str(hp_max))} {bar}</p>"
-            f"<p><strong>XP:</strong> {xp:,}</p>"
+            f"{stats_html}"
+            f"<p><strong>XP:</strong> {xp:,}{next_xp_str}</p>"
+            f"{enc_html}"
+            f"{light_chip_html}"
+            f"{effects_html}"
             f"{slots_html}"
+            f"{mem_html}"
             f'<p>{cond_tags}</p>'
+            f'</div>'
             f"</div>"
         )
 
@@ -827,15 +1809,26 @@ def world_view():
         else '<p class="muted">No DM-only notes recorded.</p>'
     )
 
+    rumor_count = len(rumors)
+    secret_count = len(secret_rows)
+
     body = (
         f"<h1>{html.escape(campaign_name)} — World</h1>"
         + _world_info_bar(state)
         + "<h2>Factions</h2>" + factions_html
         + "<h2>World Clocks</h2>" + clocks_html
-        + "<h2>Rumors <span class='muted' style='font-size:0.6em'>(DM view — shows truth tier)</span></h2>"
-        + rumors_html
-        + "<h2>DM-Only Notes <span class='muted' style='font-size:0.6em'>(never narrate to player)</span></h2>"
-        + secrets_html
+        + '<details class="spoiler">'
+        + f'<summary>Rumors <span class="muted">({rumor_count})</span>'
+        + '<span class="spoiler-warn">DM view — reveals truth tier · click to expand</span>'
+        + '</summary>'
+        + f'<div class="spoiler-body">{rumors_html}</div>'
+        + '</details>'
+        + '<details class="spoiler">'
+        + f'<summary>DM-Only Notes <span class="muted">({secret_count})</span>'
+        + '<span class="spoiler-warn">Never narrate to the player · click to expand</span>'
+        + '</summary>'
+        + f'<div class="spoiler-body">{secrets_html}</div>'
+        + '</details>'
     )
     return render(f"{campaign_name} — World", body)
 
@@ -931,38 +1924,2744 @@ def log():
     return render(f"{campaign_name} — Chronicle", body)
 
 
+def _sessions_dir() -> Path:
+    return _export.PROJECTS_DIR / _export.encode_cwd(Path(__file__).parent)
+
+
+def _session_teaser(path: Path, max_chars: int = 140) -> str:
+    """First non-empty player prompt in the session, trimmed."""
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "user":
+                    continue
+                content = rec.get("message", {}).get("content", "")
+                if not isinstance(content, str):
+                    continue
+                cleaned = _export.clean_user_text(content)
+                if cleaned:
+                    cleaned = cleaned.replace("\n", " ").strip()
+                    return cleaned[:max_chars] + ("…" if len(cleaned) > max_chars else "")
+    except OSError:
+        pass
+    return ""
+
+
+@app.route("/sessions")
+def sessions_index():
+    sdir = _sessions_dir()
+    if not sdir.is_dir():
+        body = "<h1>Sessions</h1><p class='muted'>No transcript directory found.</p>"
+        return render("Sessions", body)
+
+    files = _export.list_sessions(sdir)
+    rows = []
+    for p in files:
+        st = p.stat()
+        when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        size_kb = st.st_size / 1024
+        teaser = html.escape(_session_teaser(p))
+        sid = p.stem
+        rows.append(
+            f'<tr>'
+            f'<td><a href="/sessions/{html.escape(sid)}"><code>{html.escape(sid[:8])}</code></a></td>'
+            f'<td class="muted">{when}</td>'
+            f'<td class="muted" style="text-align:right">{size_kb:,.1f} KB</td>'
+            f'<td>{teaser or "<span class=muted>—</span>"}</td>'
+            f'</tr>'
+        )
+
+    if not rows:
+        body = "<h1>Sessions</h1><p class='muted'>No sessions yet.</p>"
+    else:
+        body = (
+            "<h1>Sessions</h1>"
+            f"<p class='muted'>{len(rows)} session(s). Newest first.</p>"
+            '<div class="card"><table style="width:100%;border-collapse:collapse">'
+            "<thead><tr>"
+            '<th style="text-align:left;padding:6px 8px">ID</th>'
+            '<th style="text-align:left;padding:6px 8px">When</th>'
+            '<th style="text-align:right;padding:6px 8px">Size</th>'
+            '<th style="text-align:left;padding:6px 8px">First prompt</th>'
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></div>"
+        )
+    return render("Sessions", body)
+
+
+@app.route("/sessions/<sid>")
+def session_view(sid: str):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+        abort(404)
+    sdir = _sessions_dir()
+    path = sdir / f"{sid}.jsonl"
+    if not path.is_file():
+        abort(404)
+
+    include_tools = request.args.get("tools", "0") not in ("0", "", "false")
+    dm_only = request.args.get("dm_only", "0") not in ("0", "", "false")
+
+    turns = _export.parse_session(path)
+    md = _export.render(
+        turns,
+        include_tools=include_tools,
+        dm_only=dm_only,
+        player_only=False,
+        show_timestamps=True,
+    )
+    content_html = _markdown_to_html(md)
+
+    when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    toggle = (
+        f'<a href="/sessions/{html.escape(sid)}?tools={"0" if include_tools else "1"}'
+        f'{"&dm_only=1" if dm_only else ""}">'
+        f'{"Hide" if include_tools else "Show"} tool calls</a> · '
+        f'<a href="/sessions/{html.escape(sid)}?dm_only={"0" if dm_only else "1"}'
+        f'{"&tools=1" if include_tools else ""}">'
+        f'{"Show all turns" if dm_only else "DM only"}</a>'
+    )
+
+    body = (
+        f"<h1>Session <code>{html.escape(sid[:8])}</code></h1>"
+        f"<p class='muted'>{when} · {toggle} · "
+        f'<a href="/sessions">← back to index</a></p>'
+        f'<div class="card">{content_html}</div>'
+    )
+    return render(f"Session {sid[:8]}", body)
+
+
+# ---------------------------------------------------------------------------
+# Live play surface — drives `claude -p` via tools/dm_session.py
+# ---------------------------------------------------------------------------
+
+def _latest_location_name() -> str:
+    """Most recent location_visited from events.json, or empty string."""
+    if not cfg:
+        return ""
+    p = cfg["_dir"] / "events.json"
+    if not p.exists():
+        return ""
+    try:
+        events = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    for ev in reversed(events):
+        if ev.get("type") == "location_visited":
+            return ev.get("name") or ev.get("slug") or ""
+    return ""
+
+
+def _play_state() -> dict:
+    """Assemble the live data the /play surface needs: party (with portraits
+    and HP), plus the equivalent of the statusline footer (location, time,
+    weather, day, session, combat, coin)."""
+    if not cfg:
+        return {"campaign": None, "characters": [], "session": 0, "day": 0,
+                "time": "", "weather": "", "location": "", "in_combat": False, "coin": ""}
+
+    _reload_cfg()
+    state = _c.load_state(cfg)
+    combat_hp = _combat_hp_overrides()
+    image_index = _load_image_index()
+
+    chars = []
+    for key, char in cfg.get("characters", {}).items():
+        cstate = state.get("characters", {}).get(key, {})
+        hp_max = char.get("hp_max", 0)
+        hp_cur = combat_hp.get(key, cstate.get("hp", hp_max))
+        portrait = _find_portrait(char.get("label", key), image_index, key)
+        chars.append({
+            "key": key,
+            "label": char.get("label", key),
+            "cls": char.get("cls", ""),
+            "level": int(char.get("level", 1) or 1),
+            "hp": hp_cur,
+            "hp_max": hp_max,
+            "ac": char.get("ac"),
+            "thac0": char.get("thac0"),
+            "conditions": cstate.get("conditions", []),
+            "portrait": f"/images/{portrait['filename']}" if portrait else None,
+        })
+
+    coin = state.get("coin", {}) or {}
+    # Show every non-zero denomination; if the party is genuinely broke,
+    # surface "0 gp" rather than blank — players want to see the zero.
+    coin_parts = [f"{coin[d]} {d}" for d in ("gp", "ep", "sp", "cp") if coin.get(d)]
+
+    hour = state.get("current_hour")
+    minute = state.get("current_minute")
+    time_str = f"{hour:02d}:{minute:02d}" if isinstance(hour, int) and isinstance(minute, int) else ""
+    weather_full = state.get("current_weather") or ""
+    weather_label = weather_full.split(" (", 1)[0] if weather_full else ""
+
+    return {
+        "campaign": {"name": cfg.get("name"), "slug": cfg.get("_name")},
+        "session": state.get("current_session", 0),
+        "day": state.get("current_day", 1),
+        "time": time_str,
+        "weather": weather_label,
+        "location": _latest_location_name(),
+        "in_combat": bool(state.get("combat")),
+        "coin": " · ".join(coin_parts) if coin_parts else "0 gp",
+        "characters": chars,
+    }
+
+
+_PLAY_HTML = """
+<style>
+  /* Take the entire viewport on /play — narrative window grows to fill all
+     remaining width to the left of the sidebar. The :has() check scopes this
+     to the play page so other routes keep the standard 980px container. */
+  .container:has(.play-shell) {
+    max-width: none;
+    width: 100%;
+    padding: 20px 28px;
+    height: calc(100vh - 50px);   /* viewport minus sticky nav */
+    display: flex;
+    flex-direction: column;
+  }
+  /* Suppress the page-level scrollbar on /play — the chat log owns its
+     own scroll. */
+  body:has(.play-shell) { overflow: hidden; }
+  .play-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    grid-template-rows: 100%;
+    gap: 18px;
+    flex: 1;
+    min-height: 0;               /* allow inner overflow:auto to actually scroll */
+  }
+  .play-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .play-side { min-width: 0; min-height: 0; overflow-y: auto; }
+
+  .play-toolbar {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+  .play-toolbar h1 {
+    font-size: 1.45em;
+    border-bottom: none;
+    padding: 0;
+    margin: 0;
+    flex: 0 0 auto;
+    color: var(--ink-display);
+    letter-spacing: 0.18em;
+  }
+  .play-toolbar .sid {
+    color: var(--ink-muted);
+    font-size: 0.82em;
+    font-family: var(--font-display);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+  .play-toolbar .sid code {
+    color: var(--accent-gold);
+    font-family: var(--font-mono);
+    text-transform: none;
+    letter-spacing: 0;
+    margin-left: 6px;
+  }
+  .play-toolbar .spacer { flex: 1; }
+  .play-toolbar button {
+    background: transparent;
+    color: var(--accent-gold);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 5px 12px;
+    font-family: var(--font-display);
+    font-size: 0.7em;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    transition: all 180ms ease;
+  }
+  .play-toolbar button:hover {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold-hi);
+  }
+  .play-toolbar #play-status {
+    color: var(--ink-muted);
+    font-size: 0.82em;
+    font-style: italic;
+    min-width: 80px;
+  }
+
+  /* Toolbar view-controls: filter pills + font-size buttons clustered
+     together, with a small gap between the two groups. */
+  .view-controls { display: inline-flex; align-items: center; gap: 10px; }
+  .filter-group, .font-group { display: inline-flex; gap: 4px; }
+  .icon-btn {
+    width: 30px;
+    height: 26px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    color: var(--ink-muted);
+    font-family: var(--font-body);
+    font-size: 0.86em;
+    line-height: 1;
+    cursor: pointer;
+    transition: all 180ms ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .icon-btn:hover { color: var(--accent-gold); border-color: var(--rule-hi); }
+  .icon-btn:active { background: rgba(200,169,110,0.12); }
+  .icon-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .turn-toggle.icon {
+    width: 30px;
+    height: 26px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    color: var(--ink-muted);
+    font-family: var(--font-body);
+    font-size: 1em;
+    line-height: 1;
+    letter-spacing: 0;
+    cursor: pointer;
+    opacity: 0.45;
+    transition: all 180ms ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .turn-toggle.icon:hover { opacity: 0.85; border-color: var(--rule-hi); }
+  .turn-toggle.icon.active {
+    opacity: 1;
+    color: var(--accent-gold);
+    border-color: var(--accent-gold);
+    background: rgba(200,169,110,0.08);
+  }
+
+  /* Visibility filters applied to .play-log via JS (toggle pills + localStorage). */
+  .play-log.hide-tools .turn.tool { display: none; }
+  .play-log.hide-meta  .turn.meta { display: none; }
+  .play-log.hide-player .turn.player { display: none; }
+
+  .play-log {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    background:
+      linear-gradient(135deg, rgba(255,220,180,0.022), transparent 50%),
+      linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px 30px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    line-height: 1.72;
+    font-size: 1.02em;
+  }
+  .play-log .empty-state {
+    text-align: center;
+    color: var(--ink-muted);
+    font-style: italic;
+    margin: 24px auto 0;
+    max-width: 520px;
+  }
+  .play-log .empty-state .play-hero {
+    display: block;
+    width: min(360px, 70%);
+    margin: 0 auto 20px;
+    border-radius: 4px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: 0 8px 28px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(0,0,0,0.4);
+    cursor: default;
+    opacity: 0.96;
+  }
+  .play-log .empty-state .empty-state-text {
+    font-size: 0.95em;
+    letter-spacing: 0.02em;
+    color: var(--ink-muted);
+  }
+  .play-log .empty-state .empty-state-text::before {
+    content: '✦';
+    color: var(--accent-gold);
+    font-style: normal;
+    margin-right: 8px;
+    font-size: 0.9em;
+  }
+  .turn { margin-bottom: 18px; }
+  .turn.player {
+    border-left: 2px solid var(--accent-gold);
+    padding: 2px 0 2px 16px;
+    color: #c8b48a;
+    font-style: italic;
+    white-space: pre-wrap;
+  }
+  .turn.player::before {
+    content: '◇';
+    color: var(--accent-gold);
+    margin-right: 8px;
+    font-style: normal;
+    font-size: 0.85em;
+  }
+  .turn.dm {
+    color: var(--ink-body);
+  }
+  /* Markdown rendered inside DM turns — scope headings/rules/etc so they
+     don't carry their full-page sizing into the chat log. */
+  .turn.dm > *:first-child { margin-top: 0; }
+  .turn.dm > *:last-child { margin-bottom: 0; }
+  .turn.dm p { margin: 6px 0; }
+  .turn.dm h1, .turn.dm h2, .turn.dm h3, .turn.dm h4 {
+    margin: 12px 0 4px;
+    border-bottom: none;
+    padding: 0;
+  }
+  .turn.dm h1 { font-size: 1.20em; letter-spacing: 0.08em; }
+  .turn.dm h2 { font-size: 1.08em; letter-spacing: 0.06em; }
+  .turn.dm h3 { font-size: 1.0em; letter-spacing: 0.05em; }
+  .turn.dm h4 { font-size: 0.95em; }
+  .turn.dm hr {
+    margin: 14px 0;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--rule-hi), transparent);
+    border: none;
+  }
+  /* Character speech: the DM convention is `> "..."` (occasionally
+     `> *"..."*`). Style the markdown blockquote so the speech reads as
+     distinct from narration — warmer gold-cream tone, subtle gold gradient,
+     italic, with a decorative opening curly-quote glyph. */
+  .turn.dm blockquote {
+    position: relative;
+    margin: 12px 0 12px 6px;
+    padding: 6px 16px 6px 22px;
+    border-left: 3px solid var(--accent-gold);
+    background: linear-gradient(to right, rgba(200,169,110,0.07), rgba(200,169,110,0.01) 60%, transparent);
+    color: #e6c98e;
+    font-style: italic;
+    border-radius: 0 2px 2px 0;
+  }
+  .turn.dm blockquote::before {
+    content: '\\201C';   /* left double quote */
+    position: absolute;
+    left: 6px;
+    top: -10px;
+    font-family: 'EB Garamond', Georgia, serif;
+    font-style: normal;
+    font-size: 2.4em;
+    line-height: 1;
+    color: var(--accent-gold);
+    opacity: 0.32;
+    pointer-events: none;
+  }
+  /* Inner <em> (e.g. when the DM writes `> *"..."*`) shouldn't double up
+     visually — strip the inner italic so the line stays italicised once. */
+  .turn.dm blockquote em { font-style: normal; }
+  .turn.dm ul, .turn.dm ol { margin: 6px 0 6px 22px; }
+  .turn.dm li { margin: 1px 0; }
+  .turn.dm code { color: var(--accent-gold-hi); }
+  .turn.dm a { color: var(--accent-gold); }
+  /* Tables inside DM turns: tighter than full-page tables, otherwise
+     inherits the base styling. */
+  .turn.dm table { width: auto; max-width: 100%; font-size: 0.94em; margin: 10px 0; }
+  .turn.dm th, .turn.dm td { padding: 5px 10px; vertical-align: top; }
+  /* Tool calls render as expandable <details>: summary shows the short
+     name + a key=val preview; expanded body shows the full input JSON and
+     the tool's result once it lands. */
+  details.turn.tool {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    color: var(--ink-muted);
+    background: rgba(15,11,7,0.55);
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--rule-hi);
+    border-radius: 0 2px 2px 0;
+    margin: 6px 0;
+    padding: 0;
+  }
+  details.turn.tool > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 5px 12px 5px 10px;
+    color: var(--ink-muted);
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    user-select: none;
+    line-height: 1.45;
+  }
+  details.turn.tool > summary::-webkit-details-marker { display: none; }
+  details.turn.tool > summary::before {
+    content: '▸';
+    color: var(--accent-gold);
+    font-size: 0.8em;
+    transition: transform 200ms ease;
+    flex-shrink: 0;
+    width: 10px;
+  }
+  details.turn.tool[open] > summary::before { transform: rotate(90deg); }
+  details.turn.tool[open] > summary {
+    border-bottom: 1px solid var(--rule);
+    background: rgba(200,169,110,0.04);
+  }
+  details.turn.tool .tool-name {
+    color: var(--accent-gold);
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+  details.turn.tool .tool-args {
+    color: var(--ink-muted);
+    font-size: 0.94em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+  /* Pretty-printed tool summary (custom formatter output). */
+  details.turn.tool .tool-glyph {
+    display: inline-block;
+    width: 14px;
+    margin-right: 6px;
+    text-align: center;
+    color: var(--accent-gold);
+    font-family: var(--font-body);
+    flex-shrink: 0;
+  }
+  details.turn.tool .tool-pretty {
+    flex: 1;
+    min-width: 0;
+    color: var(--ink-body);
+    font-family: var(--font-body);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  details.turn.tool .tool-pretty b {
+    color: var(--accent-gold-hi);
+    font-weight: 500;
+  }
+  details.turn.tool .tool-pretty .neg { color: #e08070; }
+  details.turn.tool .tool-pretty .pos { color: #7ab46e; }
+  details.turn.tool .tool-pretty .dim { color: var(--ink-muted); }
+  details.turn.tool .tool-body { padding: 10px 14px 12px; }
+  details.turn.tool .tool-section + .tool-section { margin-top: 10px; }
+  details.turn.tool .tool-section-label {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.66em;
+    color: var(--ink-muted);
+    margin-bottom: 4px;
+  }
+  details.turn.tool .tool-input,
+  details.turn.tool .tool-result {
+    background: var(--bg-deep);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 8px 11px;
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+    color: var(--ink-body);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 380px;
+    overflow-y: auto;
+  }
+  details.turn.tool .tool-pending {
+    color: var(--ink-muted);
+    font-style: italic;
+  }
+  details.turn.tool .tool-error {
+    color: #e08070;
+    font-style: italic;
+  }
+  .turn.error {
+    color: #e08070;
+    border-left: 2px solid var(--accent-blood);
+    padding: 6px 12px;
+    background: rgba(70,20,15,0.3);
+  }
+  .turn.meta {
+    color: var(--ink-muted);
+    font-size: 0.78em;
+    text-align: center;
+    margin: 18px 0 6px;
+    font-family: var(--font-display);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    position: relative;
+  }
+  .turn.meta::before, .turn.meta::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: 25%;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--rule-hi), transparent);
+  }
+  .turn.meta::before { left: 8%; }
+  .turn.meta::after { right: 8%; transform: scaleX(-1); }
+
+  .play-form {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+  }
+  .play-form textarea {
+    background: var(--bg-rec);
+    color: var(--ink-body);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 14px 16px;
+    font-family: var(--font-body);
+    font-size: 1.14em;
+    resize: vertical;
+    min-height: 68px;
+    line-height: 1.55;
+    transition: border-color 200ms ease, box-shadow 200ms ease;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
+  }
+  .play-form textarea:focus {
+    outline: none;
+    border-color: var(--accent-gold);
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3), 0 0 0 1px rgba(200,169,110,0.25);
+  }
+  .play-form textarea::placeholder { color: var(--ink-muted); font-style: italic; }
+  .play-form button {
+    background: linear-gradient(to bottom, #4a3625, #2e2014);
+    color: var(--ink-display);
+    border: 1px solid var(--rule-hi);
+    border-radius: 3px;
+    width: 64px;
+    padding: 0;
+    cursor: pointer;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    transition: all 180ms ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .play-form button svg {
+    width: 26px;
+    height: 26px;
+    transition: transform 180ms ease;
+  }
+  .play-form button:hover:not(:disabled) {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold-hi);
+    background: linear-gradient(to bottom, #5a4030, #3a2818);
+  }
+  .play-form button:hover:not(:disabled) svg { transform: translateX(2px); }
+  .play-form button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Hint dialog (Make picture with a hint). Native <dialog> + theming. */
+  dialog.hint-dialog {
+    background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--accent-gold);
+    border-radius: 4px;
+    padding: 22px 24px;
+    box-shadow: var(--shadow-deep);
+    color: var(--ink-body);
+    font-family: var(--font-body);
+    max-width: 520px;
+    width: calc(100vw - 60px);
+  }
+  dialog.hint-dialog::backdrop {
+    background: rgba(10,8,5,0.72);
+    backdrop-filter: blur(3px);
+  }
+  dialog.hint-dialog h3 {
+    margin: 0 0 4px;
+    font-family: var(--font-display);
+    color: var(--accent-gold);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 1em;
+  }
+  dialog.hint-dialog p.muted { margin-bottom: 14px; font-size: 0.92em; }
+  dialog.hint-dialog textarea {
+    width: 100%;
+    background: var(--bg-rec);
+    color: var(--ink-body);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 10px 12px;
+    font-family: var(--font-body);
+    font-size: 1em;
+    resize: vertical;
+    min-height: 70px;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
+  }
+  dialog.hint-dialog textarea:focus {
+    outline: none;
+    border-color: var(--accent-gold);
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3), 0 0 0 1px rgba(200,169,110,0.25);
+  }
+  dialog.hint-dialog .hint-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 14px;
+  }
+  dialog.hint-dialog button {
+    background: linear-gradient(to bottom, #4a3625, #2e2014);
+    color: var(--ink-display);
+    border: 1px solid var(--rule-hi);
+    border-radius: 3px;
+    padding: 7px 18px;
+    font-family: var(--font-display);
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    transition: all 180ms ease;
+  }
+  dialog.hint-dialog button:hover {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold-hi);
+  }
+  dialog.hint-dialog button#hint-submit { border-color: var(--accent-gold); }
+
+  /* "Load earlier turns" button at the top of the log. */
+  .load-more-btn {
+    display: block;
+    margin: 0 auto 14px;
+    padding: 5px 16px;
+    background: transparent;
+    border: 1px solid var(--rule-hi);
+    border-radius: 2px;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-size: 0.7em;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    transition: all 180ms ease;
+  }
+  .load-more-btn:hover { border-color: var(--accent-gold); color: var(--accent-gold-hi); }
+  .load-more-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* History tool summaries — non-interactive (no input/result available). */
+  .turn.tool.history-tool {
+    font-family: var(--font-mono);
+    font-size: 0.82em;
+    color: var(--ink-muted);
+    padding: 5px 12px;
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--rule-hi);
+    background: rgba(15,11,7,0.4);
+    margin: 6px 0;
+    border-radius: 0 2px 2px 0;
+  }
+  .turn.tool.history-tool::before {
+    content: '⚙ ';
+    color: var(--accent-gold);
+    margin-right: 2px;
+  }
+
+  /* Generated scene image inline in the chat log. */
+  .turn.scene {
+    text-align: center;
+    margin: 22px 0;
+  }
+  .turn.scene img {
+    max-width: 100%;
+    max-height: 460px;
+    border-radius: 4px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: var(--shadow-deep);
+    display: inline-block;
+  }
+  .turn.scene .caption {
+    display: block;
+    font-family: var(--font-display);
+    font-size: 0.7em;
+    color: var(--ink-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    margin-top: 8px;
+    font-style: normal;
+  }
+  /* Expandable prompt-detail under generated scenes. */
+  .turn.scene details.scene-prompt {
+    margin: 8px auto 0;
+    max-width: 80%;
+    text-align: left;
+    font-size: 0.84em;
+  }
+  .turn.scene details.scene-prompt > summary {
+    list-style: none;
+    cursor: pointer;
+    color: var(--ink-muted);
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.78em;
+    text-align: center;
+  }
+  .turn.scene details.scene-prompt > summary::-webkit-details-marker { display: none; }
+  .turn.scene details.scene-prompt > summary::before {
+    content: '▸ ';
+    color: var(--accent-gold);
+  }
+  .turn.scene details.scene-prompt[open] > summary::before { content: '▾ '; }
+  .turn.scene details.scene-prompt p {
+    margin: 8px 0 0;
+    color: var(--ink-muted);
+    font-style: italic;
+    font-family: var(--font-body);
+    font-size: 1em;
+    text-transform: none;
+    letter-spacing: 0;
+    text-align: left;
+    line-height: 1.5;
+  }
+  .turn.generating {
+    text-align: center;
+    color: var(--ink-muted);
+    font-style: italic;
+    font-size: 0.88em;
+    padding: 14px;
+    border: 1px dashed var(--rule);
+    border-radius: 3px;
+    margin: 18px 0;
+  }
+  .turn.generating::before {
+    content: '◌';
+    color: var(--accent-gold);
+    font-style: normal;
+    margin-right: 8px;
+    display: inline-block;
+    animation: spin 1.6s linear infinite;
+  }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  /* "DM is thinking" indicator: pulsing dots, live elapsed time, tool count.
+     Sits in the log between the player turn and the eventual DM reply, then
+     is removed once the first text block arrives. */
+  .turn.thinking {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 12px 18px;
+    margin: 14px 0;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: linear-gradient(to bottom, rgba(200,169,110,0.04), transparent);
+    color: var(--ink-muted);
+    font-style: italic;
+    font-size: 0.92em;
+  }
+  .turn.thinking .thinking-glyph {
+    display: inline-flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .turn.thinking .thinking-glyph span {
+    width: 6px;
+    height: 6px;
+    background: var(--accent-gold);
+    border-radius: 50%;
+    box-shadow: 0 0 6px rgba(200,169,110,0.45);
+    animation: thinkingDot 1.25s ease-in-out infinite;
+  }
+  .turn.thinking .thinking-glyph span:nth-child(2) { animation-delay: 0.16s; }
+  .turn.thinking .thinking-glyph span:nth-child(3) { animation-delay: 0.32s; }
+  @keyframes thinkingDot {
+    0%, 70%, 100% { opacity: 0.2; transform: scale(0.7); }
+    35%           { opacity: 1;   transform: scale(1.15); }
+  }
+  .turn.thinking .thinking-text { flex: 1; }
+  .turn.thinking .thinking-time {
+    font-family: var(--font-mono);
+    font-size: 0.84em;
+    font-style: normal;
+    color: var(--accent-gold);
+    letter-spacing: 0;
+    white-space: nowrap;
+  }
+
+  /* ---- Sidebar ---- */
+  .play-side {
+    background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 18px 16px 14px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+  }
+
+  /* Campaign banner at the very top of the sidebar. */
+  .side-camp {
+    font-family: var(--font-display);
+    color: var(--accent-gold-hi);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    text-align: center;
+    font-size: 0.82em;
+    font-weight: 500;
+    line-height: 1.35;
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .side-camp:empty { display: none; }
+
+  /* Stats rows: session/day/time, weather/gold, location, combat. */
+  .side-stats { display: flex; flex-direction: column; gap: 9px; margin-bottom: 12px; }
+  .side-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .side-row .pip { display: inline-flex; align-items: baseline; gap: 6px; line-height: 1; }
+  .side-row .pip .pip-label {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.62em;
+    color: var(--ink-muted);
+  }
+  .side-row .pip .pip-val {
+    font-family: var(--font-body);
+    color: var(--ink-body);
+    font-size: 0.96em;
+  }
+  .side-row.row-loc { padding-top: 4px; }
+  .side-row.row-loc .pip-val {
+    color: var(--accent-gold-hi);
+    font-style: italic;
+    font-size: 1.0em;
+  }
+  .side-row.row-combat {
+    padding: 4px 10px;
+    background: rgba(70,18,15,0.4);
+    border: 1px solid #6a2818;
+    border-radius: 2px;
+  }
+  .side-row.row-combat .pip-val {
+    color: var(--accent-blood);
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.8em;
+    font-weight: 500;
+    animation: combatPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes combatPulse {
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.55; }}
+  }
+  .pip.pip-gold .pip-val {
+    color: var(--accent-gold);
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    letter-spacing: 0;
+  }
+
+  .side-title {
+    font-family: var(--font-display);
+    color: var(--accent-gold);
+    text-transform: uppercase;
+    letter-spacing: 0.26em;
+    font-size: 0.74em;
+    text-align: center;
+    margin: 0 0 14px;
+    padding: 10px 0;
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+    position: relative;
+  }
+  .side-title::after {
+    content: '◆';
+    position: absolute;
+    left: 50%;
+    bottom: -7px;
+    transform: translateX(-50%);
+    background: var(--bg-card-hi);
+    color: var(--accent-gold);
+    padding: 0 6px;
+    font-size: 0.6em;
+    letter-spacing: 0;
+  }
+  .party-list { display: flex; flex-direction: column; gap: 16px; }
+  .party-mini { display: flex; gap: 12px; align-items: flex-start; }
+  .portrait-frame {
+    flex-shrink: 0;
+    width: 58px; height: 58px;
+    border-radius: 50%;
+    background: var(--bg-deep);
+    border: 1px solid var(--accent-gold);
+    box-shadow: 0 0 0 1px var(--bg-deep), 0 0 0 2px var(--rule), 0 2px 6px rgba(0,0,0,0.5);
+    overflow: hidden;
+    position: relative;
+    text-decoration: none;
+    color: inherit;
+    display: block;
+    transition: box-shadow 200ms ease, transform 200ms ease;
+  }
+  a.portrait-frame:hover {
+    box-shadow: 0 0 0 1px var(--bg-deep), 0 0 0 2px var(--accent-gold-hi), 0 4px 12px rgba(200,169,110,0.25);
+    transform: translateY(-1px);
+  }
+  .portrait-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .portrait-frame.empty {
+    background: linear-gradient(135deg, #1a130c, #0f0a07);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--rule-hi);
+    font-family: var(--font-display);
+    font-size: 1.4em;
+    letter-spacing: 0;
+  }
+  .portrait-frame.kod {
+    border-color: var(--hp-bad);
+    box-shadow: 0 0 0 1px var(--bg-deep), 0 0 0 2px #4a1a14, 0 0 12px rgba(200,80,58,0.4);
+    filter: grayscale(0.4);
+  }
+
+  .party-mini-body { flex: 1; min-width: 0; }
+  .party-mini-name {
+    font-family: var(--font-display);
+    color: var(--ink-display);
+    font-size: 0.94em;
+    letter-spacing: 0.06em;
+    line-height: 1.2;
+    display: block;
+    text-decoration: none;
+    transition: color 180ms ease;
+  }
+  a.party-mini-name:hover {
+    color: var(--accent-gold-hi);
+    text-decoration: underline;
+    text-decoration-color: var(--rule-hi);
+    text-underline-offset: 3px;
+  }
+  .party-mini-class {
+    font-family: var(--font-body);
+    font-style: italic;
+    color: var(--ink-muted);
+    font-size: 0.84em;
+    margin-top: 1px;
+  }
+  .party-mini-hp {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  .party-mini-hp .hp-meter { flex: 1; }
+  .party-mini-hp-text {
+    font-family: var(--font-mono);
+    font-size: 0.74em;
+    color: var(--ink-muted);
+    min-width: 42px;
+    text-align: right;
+    letter-spacing: 0;
+  }
+  .party-mini-conds {
+    margin-top: 5px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+  }
+  .cond-chip {
+    font-family: var(--font-display);
+    font-size: 0.62em;
+    padding: 1px 6px;
+    border: 1px solid var(--accent-rust);
+    background: #2e1d12;
+    color: #e8b487;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    border-radius: 1px;
+  }
+
+  @media (max-width: 900px) {
+    .play-shell {
+      grid-template-columns: 1fr;
+      height: auto;
+    }
+    .play-side { max-height: 480px; }
+  }
+</style>
+
+<div class="play-shell">
+  <section class="play-main">
+    <div class="play-toolbar">
+      <h1>Live Play</h1>
+      <span class="sid">session<code id="play-sid">…</code></span>
+      <span class="view-controls">
+        <span class="filter-group" role="group" aria-label="Show message types">
+          <button class="turn-toggle icon" data-filter="player" type="button" title="Show player echoes" aria-label="Show player echoes">◇</button>
+          <button class="turn-toggle icon" data-filter="tools"  type="button" title="Show tool calls"     aria-label="Show tool calls">⚙</button>
+          <button class="turn-toggle icon" data-filter="meta"   type="button" title="Show meta lines"     aria-label="Show meta lines">✦</button>
+        </span>
+        <span class="font-group" role="group" aria-label="Narrative font">
+          <button id="play-font-family" class="icon-btn" type="button" title="Cycle narrative font" aria-label="Cycle narrative font">Aa</button>
+          <button id="play-font-dec"    class="icon-btn" type="button" title="Smaller text" aria-label="Decrease narrative text size">A−</button>
+          <button id="play-font-inc"    class="icon-btn" type="button" title="Larger text"  aria-label="Increase narrative text size">A+</button>
+        </span>
+      </span>
+      <span class="spacer"></span>
+      <span id="play-status"></span>
+      <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
+      <button id="play-make-pic-hint" type="button" class="icon-btn" title="Make picture with a hint" aria-label="Make picture with a hint">…</button>
+      <button id="play-reset" type="button">New session</button>
+    </div>
+    <dialog id="hint-dialog" class="hint-dialog">
+      <form id="hint-form">
+        <h3>Make picture with a hint</h3>
+        <p class="muted">Optional extra direction for the illustrator. Combined with the last DM reply.</p>
+        <textarea id="hint-text" placeholder="e.g. focus on the treasure pile · show Korrhast in the foreground · stormy mood" rows="3"></textarea>
+        <div class="hint-actions">
+          <button type="button" id="hint-cancel">Cancel</button>
+          <button type="submit" id="hint-submit">Generate</button>
+        </div>
+      </form>
+    </dialog>
+    <div class="play-log" id="play-log">
+      <button id="load-more" class="load-more-btn" type="button" hidden>↑ Load earlier turns</button>
+      <div class="empty-state" id="empty-state">
+        <img src="/static/play-hero.png" alt="" class="play-hero">
+        <div class="empty-state-text">Begin when ready. Describe an action below to address the DM.</div>
+      </div>
+    </div>
+    <form class="play-form" id="play-form">
+      <textarea id="play-input" placeholder="Describe your action…  (Ctrl+Enter to send)" autocomplete="off"></textarea>
+      <button type="submit" id="play-send" title="Send (Ctrl+Enter)" aria-label="Send">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3.5 11.6 21 4l-7.5 17-2.2-7.4-7.8-2z"/>
+          <path d="m11.3 13.6 4.6-4.6" opacity="0.7"/>
+        </svg>
+      </button>
+    </form>
+  </section>
+
+  <aside class="play-side">
+    <div class="side-camp" id="side-camp"></div>
+    <div class="side-stats" id="side-stats"></div>
+    <div class="side-title">The Party</div>
+    <div class="party-list" id="party-list">
+      <div class="muted" style="text-align:center; font-size:0.84em; font-style:italic">…</div>
+    </div>
+  </aside>
+</div>
+
+<script>
+(function(){
+  const log = document.getElementById('play-log');
+  const input = document.getElementById('play-input');
+  const send = document.getElementById('play-send');
+  const form = document.getElementById('play-form');
+  const sidEl = document.getElementById('play-sid');
+  const statusEl = document.getElementById('play-status');
+  const resetBtn = document.getElementById('play-reset');
+  const partyList = document.getElementById('party-list');
+  const sideCamp = document.getElementById('side-camp');
+  const sideStats = document.getElementById('side-stats');
+  const makePicBtn = document.getElementById('play-make-pic');
+  let firstAppend = true;
+  let lastDmText = '';
+  let thinkingEl = null;
+  let thinkingStart = 0;
+  let thinkingTimer = null;
+  let thinkingTools = 0;
+  // Map tool_use.id → DOM element so tool_result events can fill in the
+  // result section once it lands.
+  const toolElements = new Map();
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+      {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function renderInline(s) {
+    // s is already HTML-escaped. Order matters: process triple-asterisk
+    // before double, double before single, code spans before italic so the
+    // backticks don't fight asterisk parsing.
+    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+    s = s.replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+    s = s.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
+    s = s.replace(/(^|[^\\w])_(.+?)_(?!\\w)/g, '$1<em>$2</em>');
+    s = s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
+    return s;
+  }
+
+  function renderMarkdown(text) {
+    if (!text) return '';
+    const escaped = esc(text);
+    const lines = escaped.split('\\n');
+    const out = [];
+    let para = [];
+
+    function flushPara() {
+      if (para.length) {
+        out.push('<p>' + renderInline(para.join(' ')) + '</p>');
+        para = [];
+      }
+    }
+
+    let i = 0;
+    while (i < lines.length) {
+      const raw = lines[i];
+      const t = raw.trim();
+
+      if (!t) { flushPara(); i++; continue; }
+
+      const h = /^(#{1,6})\\s+(.+)$/.exec(t);
+      if (h) {
+        flushPara();
+        const lvl = Math.min(h[1].length, 4);
+        out.push('<h' + lvl + '>' + renderInline(h[2]) + '</h' + lvl + '>');
+        i++; continue;
+      }
+
+      if (/^(-{3,}|\\*{3,}|_{3,})$/.test(t)) {
+        flushPara();
+        out.push('<hr>');
+        i++; continue;
+      }
+
+      // Note: block-level detection runs *after* esc(), so a markdown ">"
+      // arrives here as the entity "&gt;". Match that, not literal ">".
+      if (/^&gt;\\s?/.test(t)) {
+        flushPara();
+        const bq = [];
+        while (i < lines.length && /^&gt;\\s?/.test(lines[i].trim())) {
+          bq.push(lines[i].trim().replace(/^&gt;\\s?/, ''));
+          i++;
+        }
+        out.push('<blockquote>' + bq.map(renderInline).join('<br>') + '</blockquote>');
+        continue;
+      }
+
+      if (/^[-*+]\\s+/.test(t)) {
+        flushPara();
+        const items = [];
+        while (i < lines.length && /^[-*+]\\s+/.test(lines[i].trim())) {
+          items.push(lines[i].trim().replace(/^[-*+]\\s+/, ''));
+          i++;
+        }
+        out.push('<ul>' + items.map(it => '<li>' + renderInline(it) + '</li>').join('') + '</ul>');
+        continue;
+      }
+
+      if (/^\\d+\\.\\s+/.test(t)) {
+        flushPara();
+        const items = [];
+        while (i < lines.length && /^\\d+\\.\\s+/.test(lines[i].trim())) {
+          items.push(lines[i].trim().replace(/^\\d+\\.\\s+/, ''));
+          i++;
+        }
+        out.push('<ol>' + items.map(it => '<li>' + renderInline(it) + '</li>').join('') + '</ol>');
+        continue;
+      }
+
+      // Pipe table: header row | separator | data rows. The separator
+      // pattern is just dashes/colons/pipes/whitespace and must contain
+      // at least one dash, which distinguishes it from a single-row
+      // pipe-laden line.
+      if (t.startsWith('|') && t.endsWith('|') && t.length > 2) {
+        const next = (i + 1 < lines.length) ? lines[i + 1].trim() : '';
+        if (/^\\|[\\s\\-:|]+\\|$/.test(next) && next.indexOf('-') >= 0) {
+          flushPara();
+          const splitRow = (line) =>
+            line.slice(1, -1).split('|').map(c => c.trim());
+          const headerCells = splitRow(t);
+          i += 2;  // skip header + separator
+          const rows = [];
+          while (i < lines.length) {
+            const rl = lines[i].trim();
+            if (!(rl.startsWith('|') && rl.endsWith('|'))) break;
+            rows.push(splitRow(rl));
+            i++;
+          }
+          let html = '<table><thead><tr>';
+          for (const h of headerCells) html += '<th>' + renderInline(h) + '</th>';
+          html += '</tr></thead><tbody>';
+          for (const r of rows) {
+            html += '<tr>';
+            for (const c of r) html += '<td>' + renderInline(c) + '</td>';
+            html += '</tr>';
+          }
+          html += '</tbody></table>';
+          out.push(html);
+          continue;
+        }
+      }
+
+      para.push(t);
+      i++;
+    }
+    flushPara();
+    return out.join('\\n');
+  }
+
+  function shortToolName(name) {
+    return (name || '?').replace(/^mcp__ttrpg__/, '');
+  }
+
+  // Pretty-printed summary lines for the high-frequency MCP tools. Each
+  // formatter returns an HTML string that lands inside .tool-pretty.
+  // Parameters: (input, result) — result is null until the matching
+  // tool_result event arrives, then the summary re-renders.
+  const TOOL_PRETTY = {
+    'roll': {
+      glyph: '\\u2682',  // ⚂
+      summary: (i, r) => {
+        const f = i.formula || i.expression || i.dice || 'roll';
+        let s = '<b>' + esc(f) + '</b>';
+        if (i.purpose) s += ' <span class="dim">' + esc(i.purpose) + '</span>';
+        if (r && typeof r.total === 'number') s += ' &rarr; <b>' + r.total + '</b>';
+        else if (r && typeof r.roll === 'number') s += ' &rarr; <b>' + r.roll + '</b>';
+        return s;
+      },
+    },
+    'saving_throw': {
+      glyph: '\\u2756',  // ❖
+      summary: (i, r) => {
+        const who = i.character || '?';
+        const t = (i.type || 'save').replace(/_/g, ' ');
+        let s = esc(who) + ' <span class="dim">·</span> ' + esc(t);
+        if (r && r.success === true)  s += ' &rarr; <b class="pos">passed</b>';
+        if (r && r.success === false) s += ' &rarr; <b class="neg">failed</b>';
+        if (r && typeof r.roll === 'number') s += ' <span class="dim">(' + r.roll + ')</span>';
+        return s;
+      },
+    },
+    'skill_check': {
+      glyph: '\\u2756',
+      summary: (i, r) => {
+        const who = i.character || '?';
+        const sk = i.skill || '?';
+        let s = esc(who) + ' <span class="dim">·</span> ' + esc(sk);
+        if (r && r.success === true)  s += ' &rarr; <b class="pos">success</b>';
+        if (r && r.success === false) s += ' &rarr; <b class="neg">fail</b>';
+        if (r && typeof r.roll === 'number') s += ' <span class="dim">(' + r.roll + ')</span>';
+        return s;
+      },
+    },
+    'attack': {
+      glyph: '\\u2694',  // ⚔
+      summary: (i, r) => {
+        const a = i.attacker || '?';
+        const t = i.target || i.defender || '?';
+        let s = esc(a) + ' &rarr; ' + esc(t);
+        if (r) {
+          if (r.hits === true)  s += ' <b class="pos">hit</b>';
+          if (r.hits === false) s += ' <b class="neg">miss</b>';
+          if (typeof r.damage === 'number' && r.hits) s += ' <b>' + r.damage + '</b>';
+          if (typeof r.roll === 'number') s += ' <span class="dim">(' + r.roll + ')</span>';
+        }
+        return s;
+      },
+    },
+    'apply_damage': {
+      glyph: '\\u25BC',  // ▼
+      summary: (i, r) => {
+        const who = i.character || i.name || '?';
+        let s = '<b class="neg">&minus;' + (i.amount ?? '?') + ' HP</b> &rarr; ' + esc(who);
+        if (r && typeof r.hp_after === 'number') s += ' <span class="dim">(' + r.hp_after + ')</span>';
+        if (r && r.dead) s += ' <b class="neg">dead</b>';
+        else if (r && r.downed) s += ' <b class="neg">downed</b>';
+        return s;
+      },
+    },
+    'apply_combat_damage': null,    // alias (filled below)
+    'apply_heal': {
+      glyph: '\\u25B2',  // ▲
+      summary: (i, r) => {
+        const who = i.character || i.name || '?';
+        let s = '<b class="pos">+' + (i.amount ?? '?') + ' HP</b> &rarr; ' + esc(who);
+        if (r && typeof r.hp_after === 'number') s += ' <span class="dim">(' + r.hp_after + ')</span>';
+        return s;
+      },
+    },
+    'apply_combat_heal': null,
+    'apply_combat_damage_override': null, // placeholder names if any
+    'award_xp': {
+      glyph: '\\u2730',  // ✰
+      summary: (i, r) => {
+        let s = '<b class="pos">+' + (i.amount ?? '?') + ' XP</b> &rarr; ' + esc(i.character || '?');
+        if (r && typeof r.new_total === 'number') s += ' <span class="dim">(' + r.new_total.toLocaleString() + ')</span>';
+        return s;
+      },
+    },
+    'award_treasure': {
+      glyph: '\\u29C9',  // ⧉
+      summary: (i) => {
+        const parts = [];
+        for (const d of ['gp','ep','sp','cp']) if (i[d]) parts.push(i[d] + ' ' + d);
+        return parts.length ? parts.join(', ') : 'treasure';
+      },
+    },
+    'update_coin': {
+      glyph: '\\u29C9',
+      summary: (i) => {
+        const parts = [];
+        for (const d of ['gp','ep','sp','cp']) {
+          if (i[d] != null && i[d] !== 0) {
+            const sign = i[d] > 0 ? 'pos' : 'neg';
+            parts.push('<span class="' + sign + '">' + (i[d] > 0 ? '+' : '') + i[d] + ' ' + d + '</span>');
+          }
+        }
+        return parts.length ? parts.join(', ') : 'coin update';
+      },
+    },
+    'add_inventory': {
+      glyph: '\\u25C8',  // ◈
+      summary: (i) => {
+        const who = i.character || '?';
+        const item = i.item || '?';
+        const qty = i.qty || i.quantity || 1;
+        return esc(who) + ' &larr; ' + esc(item) + (qty > 1 ? ' <b>&times;' + qty + '</b>' : '');
+      },
+    },
+    'consume': {
+      glyph: '\\u25C8',
+      summary: (i) => {
+        const who = i.character || '?';
+        const item = i.item || '?';
+        const qty = i.qty || 1;
+        return esc(who) + ' uses <b>' + esc(item) + '</b>' + (qty > 1 ? ' &times;' + qty : '');
+      },
+    },
+    'advance_time': {
+      glyph: '\\u29D6',  // ⧖
+      summary: (i) => '<b>+' + (i.minutes ?? '?') + ' min</b>',
+    },
+    'advance_calendar': {
+      glyph: '\\u29D6',
+      summary: (i) => {
+        const d = i.days ?? '?';
+        return '<b>+' + d + ' day' + (d === 1 ? '' : 's') + '</b>';
+      },
+    },
+    'set_time': {
+      glyph: '\\u29D6',
+      summary: (i) => '<b>' + (i.hour != null ? String(i.hour).padStart(2,'0') + ':' + String(i.minute || 0).padStart(2,'0') : '?') + '</b>',
+    },
+    'introduce_npc': {
+      glyph: '\\u2766',  // ❦
+      summary: (i, r) => {
+        const desc = [i.race, i.gender].filter(Boolean).join(' ');
+        let s = 'NPC <span class="dim">' + esc(desc || '?') + '</span>';
+        if (r && r.name) s += ' &rarr; <b>' + esc(r.name) + '</b>';
+        return s;
+      },
+    },
+    'reaction': {
+      glyph: '\\u2766',
+      summary: (i, r) => {
+        let s = 'Reaction';
+        if (i.npc) s += ' <span class="dim">' + esc(i.npc) + '</span>';
+        if (r && (r.attitude || r.reaction)) s += ' &rarr; <b>' + esc(r.attitude || r.reaction) + '</b>';
+        return s;
+      },
+    },
+    'morale_check': {
+      glyph: '\\u2766',
+      summary: (i, r) => {
+        let s = 'Morale';
+        if (r) {
+          if (r.broke === true || r.broken === true || r.success === false) s += ' &rarr; <b class="neg">broke</b>';
+          else if (r.broke === false || r.success === true) s += ' &rarr; <b class="pos">held</b>';
+        }
+        return s;
+      },
+    },
+    'next_turn': {
+      glyph: '\\u29D6',
+      summary: (i, r) => {
+        if (r && r.round != null) return 'Round <b>' + r.round + '</b>' + (r.actor ? ' <span class="dim">' + esc(r.actor) + '</span>' : '');
+        return 'next turn';
+      },
+    },
+    'add_world_map_feature': {
+      glyph: '\\u2316',  // ⌖
+      summary: (i) => 'map feature: <b>' + esc((i.dsl_fragment || '').slice(0, 60)) + '</b>',
+    },
+  };
+  // Aliases: pairs that share the same renderer.
+  TOOL_PRETTY.apply_combat_damage = TOOL_PRETTY.apply_damage;
+  TOOL_PRETTY.apply_combat_heal   = TOOL_PRETTY.apply_heal;
+
+  function renderPrettySummary(name, input, result) {
+    const fmt = TOOL_PRETTY[name];
+    if (!fmt) return null;
+    return '<span class="tool-glyph">' + fmt.glyph + '</span>'
+         + '<span class="tool-pretty">' + fmt.summary(input || {}, result) + '</span>';
+  }
+
+  function summarizeArgs(input) {
+    if (!input || typeof input !== 'object') return '';
+    const keys = Object.keys(input).slice(0, 4);
+    const parts = keys.map(k => {
+      const v = input[k];
+      if (typeof v === 'string') {
+        const s = v.length > 32 ? v.slice(0, 30) + '…' : v;
+        return k + '=' + JSON.stringify(s);
+      }
+      if (typeof v === 'number' || typeof v === 'boolean') return k + '=' + v;
+      if (Array.isArray(v)) return k + '=[' + v.length + ']';
+      if (v && typeof v === 'object') return k + '={…}';
+      if (v === null) return k + '=null';
+      return k + '=…';
+    });
+    return parts.join(', ');
+  }
+
+  function renderToolResult(blockContent) {
+    // tool_result.content can be a string or a list of {type:'text', text:'…'}
+    if (typeof blockContent === 'string') return blockContent;
+    if (Array.isArray(blockContent)) {
+      return blockContent.map(c => {
+        if (c && typeof c.text === 'string') return c.text;
+        if (c && typeof c === 'object') return JSON.stringify(c, null, 2);
+        return String(c);
+      }).join('\\n');
+    }
+    if (blockContent == null) return '';
+    return JSON.stringify(blockContent, null, 2);
+  }
+
+  function appendToolUse(block) {
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    const det = document.createElement('details');
+    det.className = 'turn tool';
+    const name = shortToolName(block.name);
+    const inputJson = JSON.stringify(block.input || {}, null, 2);
+
+    // Prefer a custom pretty summary when one exists; otherwise fall back
+    // to the original name(arg-preview) layout.
+    const pretty = renderPrettySummary(name, block.input, null);
+    const summaryInner = pretty
+      ? pretty
+      : ('<span class="tool-name">' + esc(name) + '</span>'
+       + '<span class="tool-args">' + esc(summarizeArgs(block.input) ? '(' + summarizeArgs(block.input) + ')' : '()') + '</span>');
+
+    det.innerHTML =
+        '<summary>' + summaryInner + '</summary>'
+      + '<div class="tool-body">'
+      +   '<div class="tool-section">'
+      +     '<div class="tool-section-label">Input</div>'
+      +     '<pre class="tool-input">' + esc(inputJson) + '</pre>'
+      +   '</div>'
+      +   '<div class="tool-section">'
+      +     '<div class="tool-section-label">Result</div>'
+      +     '<pre class="tool-result"><span class="tool-pending">awaiting…</span></pre>'
+      +   '</div>'
+      + '</div>';
+    if (thinkingEl && thinkingEl.parentElement === log) {
+      log.insertBefore(det, thinkingEl);
+    } else {
+      log.appendChild(det);
+    }
+    log.scrollTop = log.scrollHeight;
+    if (block.id) toolElements.set(block.id, {el: det, name: name, input: block.input || {}});
+    return det;
+  }
+
+  function fillToolResult(toolUseId, content, isError) {
+    const entry = toolElements.get(toolUseId);
+    if (!entry) return;
+    const det = entry.el;
+
+    // Body: always show the raw result text in the expandable section.
+    const resultEl = det.querySelector('.tool-result');
+    const text = renderToolResult(content);
+    if (resultEl) {
+      resultEl.textContent = text || '(empty)';
+      if (isError) resultEl.classList.add('tool-error');
+    }
+
+    // Summary: re-render with the parsed result so e.g. a roll updates from
+    // "1d20" to "1d20 → 17". Skip if there's no formatter for this tool.
+    if (TOOL_PRETTY[entry.name]) {
+      let parsed = null;
+      try { parsed = text ? JSON.parse(text) : null; } catch (e) { /* leave null */ }
+      const summary = det.querySelector('summary');
+      if (summary) {
+        const re = renderPrettySummary(entry.name, entry.input, parsed);
+        if (re) summary.innerHTML = re;
+      }
+    }
+  }
+
+  function startThinking() {
+    stopThinking();
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    thinkingTools = 0;
+    thinkingStart = performance.now();
+    thinkingEl = document.createElement('div');
+    thinkingEl.className = 'turn thinking';
+    thinkingEl.innerHTML =
+        '<span class="thinking-glyph" aria-hidden="true"><span></span><span></span><span></span></span>'
+      + '<span class="thinking-text">DM is thinking…</span>'
+      + '<span class="thinking-time">0.0s</span>';
+    log.appendChild(thinkingEl);
+    log.scrollTop = log.scrollHeight;
+    updateThinkingTime();
+    thinkingTimer = setInterval(updateThinkingTime, 200);
+  }
+
+  function updateThinkingTime() {
+    if (!thinkingEl) return;
+    const sec = ((performance.now() - thinkingStart) / 1000).toFixed(1);
+    const note = thinkingTools > 0
+      ? '  ·  ' + thinkingTools + ' tool call' + (thinkingTools === 1 ? '' : 's')
+      : '';
+    const t = thinkingEl.querySelector('.thinking-time');
+    if (t) t.textContent = sec + 's' + note;
+  }
+
+  function stopThinking() {
+    if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
+    if (thinkingEl && thinkingEl.parentElement) thinkingEl.remove();
+    thinkingEl = null;
+  }
+
+  function clearEmptyState() {
+    if (firstAppend) {
+      const placeholder = document.getElementById('empty-state');
+      if (placeholder) placeholder.remove();
+      firstAppend = false;
+    }
+  }
+
+  function buildHistoryTurn(t) {
+    const div = document.createElement('div');
+    div.className = 'turn ' + t.role;
+    if (t.role === 'dm') {
+      div.innerHTML = renderMarkdown(t.text);
+    } else if (t.role === 'tool') {
+      div.classList.add('history-tool');
+      div.textContent = t.text;
+    } else {
+      div.textContent = t.text;
+    }
+    return div;
+  }
+
+  function append(role, text) {
+    clearEmptyState();
+    const div = document.createElement('div');
+    div.className = 'turn ' + role;
+    if (role === 'dm') {
+      div.innerHTML = renderMarkdown(text);
+    } else {
+      div.textContent = text;
+    }
+    // Insert before the thinking indicator (if it's still up) so the new
+    // turn appears above the still-running spinner — keeps things in
+    // chronological order.
+    if (thinkingEl && thinkingEl.parentElement === log) {
+      log.insertBefore(div, thinkingEl);
+    } else {
+      log.appendChild(div);
+    }
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function handleEvent(evt) {
+    if (evt.type === 'system' && evt.session_id) {
+      sidEl.textContent = evt.session_id.slice(0, 8);
+    } else if (evt.type === 'assistant' && evt.message && Array.isArray(evt.message.content)) {
+      for (const block of evt.message.content) {
+        if (block.type === 'text' && block.text) {
+          stopThinking();          // first prose arrives — drop the indicator
+          append('dm', block.text);
+          lastDmText = block.text;
+        } else if (block.type === 'tool_use') {
+          thinkingTools++;
+          updateThinkingTime();
+          appendToolUse(block);
+        }
+      }
+    } else if (evt.type === 'user' && evt.message && Array.isArray(evt.message.content)) {
+      // Tool results: pair each tool_result block with the matching tool_use
+      // element by id and fill in its result section.
+      for (const block of evt.message.content) {
+        if (block && block.type === 'tool_result' && block.tool_use_id) {
+          fillToolResult(block.tool_use_id, block.content, !!block.is_error);
+        }
+      }
+    } else if (evt.type === 'result') {
+      const parts = ['turn complete'];
+      if (typeof evt.duration_ms === 'number') parts.push((evt.duration_ms / 1000).toFixed(1) + 's');
+      // Cost intentionally hidden — claude -p reports API-equivalent dollars
+      // but the user is on Claude Code subscription, so the number is noise.
+      append('meta', parts.join(' · '));
+      refreshState();
+    } else if (evt.type === 'error') {
+      append('error', 'rc=' + evt.returncode + '  ' + (evt.stderr || '').slice(0, 500));
+    }
+  }
+
+  async function submitTurn(text) {
+    append('player', text);
+    startThinking();
+    send.disabled = true;
+    try {
+      const resp = await fetch('/play/turn', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({message: text}),
+      });
+      if (!resp.ok) {
+        append('error', 'HTTP ' + resp.status);
+        return;
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, {stream: true});
+        let nl;
+        while ((nl = buf.indexOf('\\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          try { handleEvent(JSON.parse(line)); }
+          catch (e) { append('error', 'bad json: ' + line.slice(0, 80)); }
+        }
+      }
+    } catch (err) {
+      append('error', String(err));
+    } finally {
+      stopThinking();
+      send.disabled = false;
+      statusEl.textContent = '';
+      input.focus();
+    }
+  }
+
+  function pip(label, value, klass) {
+    return '<span class="pip ' + (klass || '') + '">'
+      + (label ? '<span class="pip-label">' + esc(label) + '</span>' : '')
+      + '<span class="pip-val">' + esc(value) + '</span>'
+      + '</span>';
+  }
+
+  function renderParty(chars) {
+    if (!chars || !chars.length) {
+      partyList.innerHTML = '<div class="muted" style="text-align:center; font-size:0.82em; font-style:italic">No characters in roster.</div>';
+      return;
+    }
+    partyList.innerHTML = chars.map(c => {
+      const pct = c.hp_max > 0 ? Math.max(0, Math.min(100, (c.hp / c.hp_max) * 100)) : 0;
+      const ko = (c.hp || 0) <= 0;
+      const portrait = c.portrait
+        ? '<img src="' + esc(c.portrait) + '" alt="' + esc(c.label) + '">'
+        : '<span>' + esc((c.label || '?').slice(0, 1).toUpperCase()) + '</span>';
+      const conds = (c.conditions || []).map(x =>
+        '<span class="cond-chip">' + esc(x) + '</span>').join('');
+      const cls = [c.cls, c.level].filter(Boolean).join(' ').trim();
+      const acStr = (c.ac !== undefined && c.ac !== null) ? 'AC ' + c.ac : '';
+      const sub = [cls, acStr].filter(Boolean).join('  \\u00b7  ');
+      const sheetUrl = '/sheets/' + encodeURIComponent(c.key || '');
+      return ''
+        + '<article class="party-mini">'
+        +   '<a class="portrait-frame ' + (ko ? 'kod ' : '') + (c.portrait ? '' : 'empty') + '" href="' + sheetUrl + '" title="Open ' + esc(c.label) + '\\u2019s sheet">' + portrait + '</a>'
+        +   '<div class="party-mini-body">'
+        +     '<a class="party-mini-name" href="' + sheetUrl + '">' + esc(c.label) + '</a>'
+        +     (sub ? '<div class="party-mini-class">' + esc(sub) + '</div>' : '')
+        +     '<div class="party-mini-hp">'
+        +       '<span class="hp-meter"><i style="width:' + pct.toFixed(1) + '%"></i></span>'
+        +       '<span class="party-mini-hp-text">' + esc(c.hp) + '/' + esc(c.hp_max) + '</span>'
+        +     '</div>'
+        +     (conds ? '<div class="party-mini-conds">' + conds + '</div>' : '')
+        +   '</div>'
+        + '</article>';
+    }).join('');
+  }
+
+  function renderSidebarStats(s) {
+    sideCamp.innerHTML = (s.campaign && s.campaign.name) ? esc(s.campaign.name) : '';
+    const rows = [];
+    const r1 = [];
+    if (s.session) r1.push(pip('Sess', s.session));
+    if (s.day) r1.push(pip('Day', s.day));
+    if (s.time) r1.push(pip('Time', s.time));
+    if (r1.length) rows.push('<div class="side-row">' + r1.join('') + '</div>');
+    const r2 = [];
+    if (s.weather) r2.push(pip('Sky', s.weather));
+    if (s.coin) r2.push(pip('Gold', s.coin, 'pip-gold'));
+    if (r2.length) rows.push('<div class="side-row">' + r2.join('') + '</div>');
+    if (s.location) {
+      rows.push('<div class="side-row row-loc">' + pip('At', s.location) + '</div>');
+    }
+    if (s.in_combat) {
+      rows.push('<div class="side-row row-combat">' + pip('', '⚔ In Combat') + '</div>');
+    }
+    sideStats.innerHTML = rows.join('');
+  }
+
+  async function refreshState() {
+    try {
+      const r = await fetch('/api/play_state.json');
+      if (!r.ok) return;
+      const s = await r.json();
+      renderParty(s.characters);
+      renderSidebarStats(s);
+    } catch (e) {
+      // best-effort: leave existing render in place
+    }
+  }
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    submitTurn(text);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  resetBtn.addEventListener('click', async () => {
+    if (!confirm('Start a new DM session? The current conversation will no longer be resumed.')) return;
+    await fetch('/play/reset', {method: 'POST'});
+    sidEl.textContent = '(new)';
+    append('meta', 'new session started');
+  });
+
+  async function runMakePicture(hint) {
+    if (!lastDmText) {
+      statusEl.textContent = 'no DM text yet';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    const placeholder = document.createElement('div');
+    placeholder.className = 'turn generating';
+    placeholder.textContent = hint
+      ? 'illustrating the scene with hint: "' + hint + '"…'
+      : 'composing prompt and illustrating the scene…';
+    log.appendChild(placeholder);
+    log.scrollTop = log.scrollHeight;
+    makePicBtn.disabled = true;
+    hintBtn.disabled = true;
+    try {
+      const body = {prompt: lastDmText.slice(0, 4000)};
+      if (hint) body.hint = hint;
+      const r = await fetch('/play/generate_scene', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok || d.error) {
+        placeholder.className = 'turn error';
+        placeholder.textContent = 'image generation failed: ' + (d.error || ('HTTP ' + r.status));
+        return;
+      }
+      placeholder.className = 'turn scene';
+      const captionLabel = d.prepass ? 'scene · Claude-composed' : 'scene';
+      const promptDetails = d.prompt
+        ? '<details class="scene-prompt"><summary>prompt</summary><p>' + esc(d.prompt) + '</p></details>'
+        : '';
+      placeholder.innerHTML =
+          '<img src="' + esc(d.url) + '" alt="generated scene">'
+        + '<span class="caption">' + esc(captionLabel) + '</span>'
+        + promptDetails;
+      log.scrollTop = log.scrollHeight;
+    } catch (err) {
+      placeholder.className = 'turn error';
+      placeholder.textContent = 'image generation failed: ' + String(err);
+    } finally {
+      makePicBtn.disabled = false;
+      hintBtn.disabled = false;
+    }
+  }
+
+  const hintBtn = document.getElementById('play-make-pic-hint');
+  const hintDialog = document.getElementById('hint-dialog');
+  const hintForm = document.getElementById('hint-form');
+  const hintText = document.getElementById('hint-text');
+  const hintCancel = document.getElementById('hint-cancel');
+
+  makePicBtn.addEventListener('click', () => runMakePicture(''));
+
+  hintBtn.addEventListener('click', () => {
+    if (!lastDmText) {
+      statusEl.textContent = 'no DM text yet';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    hintText.value = '';
+    if (typeof hintDialog.showModal === 'function') {
+      hintDialog.showModal();
+    } else {
+      // Older browser fallback — shouldn't happen, but degrades to prompt().
+      const h = window.prompt('Hint for the illustrator:');
+      if (h !== null) runMakePicture(h.trim());
+      return;
+    }
+    setTimeout(() => hintText.focus(), 30);
+  });
+  hintCancel.addEventListener('click', () => hintDialog.close());
+  hintForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const h = hintText.value.trim();
+    hintDialog.close();
+    runMakePicture(h);
+  });
+
+  // Narrative font-family cycle: three options, from thematic to maximally
+  // readable. The button itself renders in the active font as a preview.
+  const FONTS = [
+    {key: 'garamond', label: 'Garamond',  stack: "'EB Garamond', Georgia, 'Times New Roman', serif"},
+    {key: 'lora',     label: 'Lora',      stack: "'Lora', Georgia, 'Times New Roman', serif"},
+    {key: 'atkinson', label: 'Atkinson Hyperlegible', stack: "'Atkinson Hyperlegible', system-ui, sans-serif"},
+  ];
+  const FONT_FAMILY_KEY = 'play.font-family';
+  const fontFamilyBtn = document.getElementById('play-font-family');
+  function fontIdx() {
+    const stored = localStorage.getItem(FONT_FAMILY_KEY);
+    const i = FONTS.findIndex(f => f.key === stored);
+    return i >= 0 ? i : 0;
+  }
+  function applyFontFamily() {
+    const f = FONTS[fontIdx()];
+    log.style.fontFamily = f.stack;
+    fontFamilyBtn.style.fontFamily = f.stack;
+    fontFamilyBtn.title = 'Font: ' + f.label + ' — click to cycle';
+  }
+  fontFamilyBtn.addEventListener('click', () => {
+    const next = (fontIdx() + 1) % FONTS.length;
+    localStorage.setItem(FONT_FAMILY_KEY, FONTS[next].key);
+    applyFontFamily();
+  });
+  applyFontFamily();
+
+  // Narrative font-size controls: persist scale in localStorage, clamp to a
+   // sane range, refresh button-disabled state at the limits.
+  const FONT_KEY = 'play.font-size';
+  const FONT_MIN = 0.85, FONT_MAX = 1.55, FONT_STEP = 0.06, FONT_DEFAULT = 1.02;
+  const fontDec = document.getElementById('play-font-dec');
+  const fontInc = document.getElementById('play-font-inc');
+  function applyFont() {
+    const stored = parseFloat(localStorage.getItem(FONT_KEY));
+    const v = isNaN(stored) ? FONT_DEFAULT : Math.max(FONT_MIN, Math.min(FONT_MAX, stored));
+    log.style.fontSize = v.toFixed(2) + 'em';
+    fontDec.disabled = v <= FONT_MIN + 0.001;
+    fontInc.disabled = v >= FONT_MAX - 0.001;
+  }
+  function bumpFont(delta) {
+    const stored = parseFloat(localStorage.getItem(FONT_KEY));
+    const cur = isNaN(stored) ? FONT_DEFAULT : stored;
+    const next = Math.max(FONT_MIN, Math.min(FONT_MAX, cur + delta));
+    localStorage.setItem(FONT_KEY, next.toString());
+    applyFont();
+  }
+  fontDec.addEventListener('click', () => bumpFont(-FONT_STEP));
+  fontInc.addEventListener('click', () => bumpFont(+FONT_STEP));
+  applyFont();
+
+  // Filter pills: persist Show/Hide per turn-type in localStorage.
+  document.querySelectorAll('.turn-toggle').forEach(btn => {
+    const key = btn.dataset.filter;
+    const hidden = localStorage.getItem('play.hide.' + key) === '1';
+    btn.classList.toggle('active', !hidden);
+    log.classList.toggle('hide-' + key, hidden);
+    btn.addEventListener('click', () => {
+      const wasActive = btn.classList.contains('active');
+      const nowActive = !wasActive;
+      btn.classList.toggle('active', nowActive);
+      log.classList.toggle('hide-' + key, !nowActive);
+      localStorage.setItem('play.hide.' + key, nowActive ? '0' : '1');
+    });
+  });
+
+  fetch('/play/session').then(r => r.json()).then(d => {
+    sidEl.textContent = d.session_id ? d.session_id.slice(0, 8) : '(new)';
+  });
+
+  // ------------------------------------------------------------------
+  // Initial replay + Load-earlier pagination.
+  // On load we fetch the last few turns from the resumed session so the
+  // page has context. The "↑ Load earlier turns" button at the top of
+  // the chat log walks further back in pages of 20.
+  // ------------------------------------------------------------------
+  const loadMoreBtn = document.getElementById('load-more');
+  let oldestLoadedIdx = null;
+
+  async function initialReplay() {
+    try {
+      const r = await fetch('/api/history?limit=10');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.turns || !d.turns.length) return;
+      clearEmptyState();
+      const frag = document.createDocumentFragment();
+      for (const t of d.turns) frag.appendChild(buildHistoryTurn(t));
+      // Insert AFTER the load-more button so the button stays at the top.
+      loadMoreBtn.after(frag);
+      oldestLoadedIdx = d.oldest_idx;
+      loadMoreBtn.hidden = !d.has_more;
+      // Seed lastDmText with the most recent DM turn for "Make picture".
+      for (let i = d.turns.length - 1; i >= 0; i--) {
+        if (d.turns[i].role === 'dm') { lastDmText = d.turns[i].text; break; }
+      }
+      log.scrollTop = log.scrollHeight;
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadEarlier() {
+    if (oldestLoadedIdx == null) return;
+    loadMoreBtn.disabled = true;
+    const orig = loadMoreBtn.textContent;
+    loadMoreBtn.textContent = 'loading…';
+    try {
+      const r = await fetch('/api/history?before=' + oldestLoadedIdx + '&limit=20');
+      if (!r.ok) return;
+      const d = await r.json();
+      if (!d.turns || !d.turns.length) {
+        loadMoreBtn.hidden = true;
+        return;
+      }
+      // Preserve scroll: prepending raises content above the viewport;
+      // we want the existing first-visible turn to stay where it is.
+      const heightBefore = log.scrollHeight;
+      const scrollBefore = log.scrollTop;
+
+      const frag = document.createDocumentFragment();
+      for (const t of d.turns) frag.appendChild(buildHistoryTurn(t));
+      loadMoreBtn.after(frag);
+
+      log.scrollTop = scrollBefore + (log.scrollHeight - heightBefore);
+
+      oldestLoadedIdx = d.oldest_idx;
+      if (!d.has_more) loadMoreBtn.hidden = true;
+    } catch (e) { /* ignore */ } finally {
+      loadMoreBtn.disabled = false;
+      loadMoreBtn.textContent = orig;
+    }
+  }
+  loadMoreBtn.addEventListener('click', loadEarlier);
+  initialReplay();
+
+  // ------------------------------------------------------------------
+  // Server-side turn-state watcher — surfaces a "DM still thinking from
+  // a previous turn" indicator after a reload / network drop, disables
+  // Send while the server lock is held, and replays the new narrative
+  // once the in-flight turn lands.
+  // ------------------------------------------------------------------
+  let recoveryEl = null;
+  let lockedBySrv = false;
+  function startRecovery() {
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    recoveryEl = document.createElement('div');
+    recoveryEl.className = 'turn thinking';
+    recoveryEl.innerHTML =
+        '<span class="thinking-glyph" aria-hidden="true"><span></span><span></span><span></span></span>'
+      + '<span class="thinking-text">DM still working on a previous turn…</span>'
+      + '<span class="thinking-time"></span>';
+    log.appendChild(recoveryEl);
+    log.scrollTop = log.scrollHeight;
+  }
+  function updateRecovery(state) {
+    if (!recoveryEl) return;
+    const t = recoveryEl.querySelector('.thinking-time');
+    if (!t) return;
+    const sec = state.started_at
+      ? (Date.now() / 1000 - state.started_at).toFixed(1)
+      : '?';
+    const tn = state.tools_used > 0
+      ? '  ·  ' + state.tools_used + ' tool call' + (state.tools_used === 1 ? '' : 's')
+      : '';
+    t.textContent = sec + 's' + tn;
+  }
+  function stopRecovery() {
+    if (recoveryEl && recoveryEl.parentElement) recoveryEl.remove();
+    recoveryEl = null;
+  }
+  async function refreshLastNarrative() {
+    try {
+      const r = await fetch('/api/last_narrative');
+      const d = await r.json();
+      if (d && d.text && d.text !== lastDmText) {
+        append('dm', d.text);
+        lastDmText = d.text;
+        refreshState();
+      }
+    } catch (e) { /* ignore */ }
+  }
+  async function pollTurnState() {
+    try {
+      const r = await fetch('/api/turn_state');
+      if (!r.ok) return;
+      const s = await r.json();
+      // Send-disable when the server lock is held — local UI already
+      // disables it during its own submit, but a recovery scenario also
+      // needs the lock surface.
+      if (s.in_flight !== lockedBySrv) {
+        lockedBySrv = s.in_flight;
+        // Don't fight the local submit's own disable.
+        if (!thinkingEl) send.disabled = lockedBySrv;
+      }
+      // Recovery indicator: show only when the server is busy AND we're
+      // not the ones running it (no local thinkingEl).
+      if (s.in_flight && !thinkingEl) {
+        if (!recoveryEl) startRecovery();
+        updateRecovery(s);
+      } else if (recoveryEl && !s.in_flight) {
+        stopRecovery();
+        refreshLastNarrative();
+      }
+    } catch (e) { /* ignore */ }
+  }
+  pollTurnState();
+  setInterval(pollTurnState, 3000);
+
+  refreshState();
+  // Background refresh — picks up MCP-tool mutations made outside the turn flow.
+  setInterval(refreshState, 20000);
+
+  input.focus();
+})();
+</script>
+"""
+
+
+@app.route("/play")
+def play_page():
+    return render("Play", _PLAY_HTML)
+
+
+@app.route("/play/session")
+def play_session_id():
+    return jsonify({"session_id": _dm.session_id()})
+
+
+@app.route("/play/reset", methods=["POST"])
+def play_reset():
+    _dm.reset_session()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/play_state.json")
+def api_play_state():
+    return jsonify(_play_state())
+
+
+@app.route("/api/last_narrative")
+def api_last_narrative():
+    """Return the most recent DM text from the resumed Claude Code session,
+    so the /play surface can replay it on reload. Returns {"text": null} when
+    there's no session, no transcript, or no recorded DM prose yet."""
+    return jsonify({"text": _dm.last_dm_text()})
+
+
+@app.route("/api/history")
+def api_history():
+    """Return a slice of the resumed session's parsed transcript so /play
+    can render context on load and walk the conversation backward in pages.
+
+    Query params:
+        before: int — return turns whose chronological index is < this.
+                Defaults to the total turn count (i.e. "all turns").
+        limit:  int — max turns to return (clamped to 1..100, default 20).
+
+    Each returned turn carries its absolute ``idx`` in the session so the
+    client can pass the oldest idx as the next ``before`` cursor."""
+    sid = _dm.session_id()
+    empty = {"turns": [], "total": 0, "has_more": False, "oldest_idx": 0}
+    if not sid:
+        return jsonify(empty)
+    p = _dm._project_jsonl_dir() / f"{sid}.jsonl"
+    if not p.exists():
+        return jsonify(empty)
+
+    all_turns = _export.parse_session(p)
+    total = len(all_turns)
+
+    before = request.args.get("before", type=int, default=total)
+    limit = max(1, min(request.args.get("limit", type=int, default=20), 100))
+
+    end = max(0, min(before, total))
+    start = max(0, end - limit)
+    chunk = all_turns[start:end]
+
+    return jsonify({
+        "turns": [
+            {"role": t.role, "text": t.text, "idx": start + i,
+             "timestamp": t.timestamp}
+            for i, t in enumerate(chunk)
+        ],
+        "total": total,
+        "has_more": start > 0,
+        "oldest_idx": start,
+    })
+
+
+@app.route("/api/turn_state")
+def api_turn_state():
+    """Live state of the currently running turn (if any). Polled by /play
+    so a reload during streaming can pick up the still-cooking server-side
+    response, disable Send while the lock is held, and replay the DM reply
+    once it lands."""
+    return jsonify(_dm.turn_state())
+
+
+@app.route("/play/turn", methods=["POST"])
+def play_turn():
+    data = request.get_json(silent=True) or {}
+    msg = (data.get("message") or "").strip()
+    if not msg:
+        return jsonify({"error": "empty message"}), 400
+
+    def gen():
+        for evt in _dm.stream_turn(msg):
+            yield json.dumps(evt) + "\n"
+
+    resp = Response(gen(), mimetype="application/x-ndjson")
+    # Defeat any reverse-proxy buffering (nginx etc.); harmless on the dev server.
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.route("/play/generate_scene", methods=["POST"])
+def play_generate_scene():
+    """Generate an illustration based on the previous DM reply.
+
+    Two-phase pipeline:
+
+    1. Pre-pass: ``_dm.rewrite_for_image`` runs a stateless ``claude -p``
+       to extract a focused image-generation prompt from the raw narrative
+       (drops dialogue, mechanics, etc).
+    2. Replicate Flux generates the image from that refined prompt.
+
+    Synchronous — returns once the image is downloaded. Slow (~15-45s).
+    Falls back to the raw narrative if the pre-pass fails so the user
+    still gets *some* image."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    data = request.get_json(silent=True) or {}
+    raw = (data.get("prompt") or "").strip()
+    hint = (data.get("hint") or "").strip()
+    if not raw:
+        return jsonify({"error": "empty prompt"}), 400
+
+    # Pre-pass: translate the narrative (plus an optional player hint) into a
+    # painter's brief. Falls back to truncated raw narrative on failure.
+    refined = _dm.rewrite_for_image(raw[:4000], hint=hint or None)
+    used_prepass = refined is not None
+    image_prompt = (refined or raw)[:1500]
+
+    try:
+        replicate = _img._load_replicate()
+    except (ImportError, EnvironmentError) as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    tone = cfg.get("tone", "high fantasy")
+    tone_clause = _img.TONE_STYLES.get(tone, tone)
+    full_prompt = f"{_img.STYLE_BASE} {tone_clause}. {image_prompt}"
+
+    title = "Live play scene"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"{ts}_{_img._safe_slug(title)}.png"
+    images_dir = cfg["_data_dir"] / "images"
+
+    try:
+        _img._generate_image(replicate, full_prompt, images_dir, filename)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    _img._update_index(images_dir, {
+        "filename":    filename,
+        "scene":       title,
+        "description": image_prompt[:500],
+        "timestamp":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "type":        "scene",
+    })
+    return jsonify({
+        "url": f"/images/{filename}",
+        "filename": filename,
+        "prompt": image_prompt,
+        "prepass": used_prepass,
+    })
+
+
+
+def _encumbrance_html(char: dict, state: dict, key: str) -> str:
+    """Render a 'Carrying' block: total weight, band, and STR-keyed thresholds.
+    Returns an empty string if the character has no usable ability scores."""
+    ab = char.get("ability_scores") or {}
+    if "str" not in ab:
+        return ""
+
+    enc = _encumbrance_band(char, state, key)
+    band = enc["band"]
+    weight = enc["weight"]
+    penalty = enc["penalty"]
+    th = enc["thresholds"]
+    strength = enc["strength"]
+
+    band_color = {
+        "light":      "#6db86d",
+        "moderate":   "#c8a96e",
+        "heavy":      "#e0a060",
+        "severe":     "#e08060",
+        "overloaded": "#ff6a4a",
+    }.get(band, "#c8a96e")
+    penalty_str = f" &nbsp;·&nbsp; {penalty:+d} move" if penalty else ""
+
+    # Bar — fraction of severe (overloaded cap). Cap at 1.0.
+    severe_cap = max(th["severe"], 1)
+    pct = min(100.0, weight / severe_cap * 100.0)
+    pct_color = band_color
+
+    rows = []
+    for tname in ("light", "moderate", "heavy", "severe"):
+        cap = th[tname]
+        active = " enc-band-active" if band == tname else ""
+        rows.append(
+            f'<div class="enc-band{active}">'
+            f'<span class="enc-band-name">{tname}</span>'
+            f'<span class="enc-band-cap">≤ {cap} lb</span>'
+            f'</div>'
+        )
+
+    # Per-item breakdown
+    item_rows = []
+    for it in enc["items"]:
+        name = html.escape(it["item"])
+        qty = it["qty"]
+        unit = it["unit_lb"]
+        sub = it["weight_lb"]
+        wsrc = it.get("source", "unknown")
+
+        if wsrc == "unknown":
+            unit_cell = '<span class="muted" title="not found in 2e item DB or PHB">— lb</span>'
+            sub_cell  = '<span class="muted">—</span>'
+        elif wsrc == "negligible":
+            unit_cell = '<span class="muted" title="PHB lists this as negligible (10/lb)">≈ 0</span>'
+            sub_cell  = '<span class="muted">—</span>'
+        else:
+            unit_cell = f'{unit:g} lb'
+            sub_cell  = f'<strong>{sub:g} lb</strong>'
+
+        src_chips = []
+        if it.get("origin") == "consumable":
+            src_chips.append('<span class="tag" style="font-size:.7em">consumable</span>')
+        if wsrc == "phb":
+            src_chips.append('<span class="tag" style="font-size:.7em;background:#1a2a3a;color:#a0c0e0;border-color:#3a5a7a" title="weight from PHB Chapter 6">PHB</span>')
+        elif wsrc == "alias":
+            src_chips.append('<span class="tag" style="font-size:.7em" title="resolved via alias to a canonical 2e item">alias</span>')
+        chips_html = " ".join(src_chips)
+
+        qty_cell = f'×{qty}' if qty > 1 else ''
+        item_rows.append(
+            f'<tr>'
+            f'<td>{name} {chips_html}</td>'
+            f'<td style="text-align:right">{qty_cell}</td>'
+            f'<td style="text-align:right">{unit_cell}</td>'
+            f'<td style="text-align:right">{sub_cell}</td>'
+            f'</tr>'
+        )
+    item_table = ""
+    if item_rows:
+        item_table = (
+            '<table class="enc-items">'
+            '<thead><tr>'
+            '<th>Item</th>'
+            '<th style="text-align:right">Qty</th>'
+            '<th style="text-align:right">Unit</th>'
+            '<th style="text-align:right">Weight</th>'
+            '</tr></thead>'
+            f'<tbody>{"".join(item_rows)}</tbody>'
+            '<tfoot><tr>'
+            '<td colspan="3" style="text-align:right"><strong>Total</strong></td>'
+            f'<td style="text-align:right"><strong>{weight} lb</strong></td>'
+            '</tr></tfoot>'
+            '</table>'
+        )
+    else:
+        item_table = ('<p class="muted" style="font-size:.85em">'
+                      'No items recorded.</p>')
+
+    return (
+        f'<div class="card enc-card">'
+        f'<h3 style="margin-top:0">Carrying</h3>'
+        f'<p><strong>Weight:</strong> {weight} lb '
+        f'&nbsp;·&nbsp; <span style="color:{band_color}"><strong>{band}</strong></span>'
+        f'{penalty_str} '
+        f'<span class="muted">(STR {strength})</span></p>'
+        f'<div class="enc-bar"><div class="enc-fill" '
+        f'style="width:{pct:.1f}%;background:{pct_color}"></div></div>'
+        f'<div class="enc-bands">{"".join(rows)}</div>'
+        f'{item_table}'
+        f'<p class="muted" style="font-size:.8em;margin-top:6px">'
+        f'Sources: 2e item DB · <span class="tag" style="font-size:.7em">alias</span> matched to canonical name · '
+        f'<span class="tag" style="font-size:.7em;background:#1a2a3a;color:#a0c0e0;border-color:#3a5a7a">PHB</span> '
+        f'sourced from PHB Chapter 6 · '
+        f'“≈ 0” means PHB lists the item as negligible (10 per pound) · '
+        f'“— lb” means no match — override with <code>item_update</code>.</p>'
+        f'</div>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Character sheet — AD&D 2e structured layout
+# ---------------------------------------------------------------------------
+
+# Saving-throw column labels (5-column AD&D 2e order).
+_SAVE_KEYS = (
+    "paralysis_poison_death",
+    "rod_staff_wand",
+    "petrify_polymorph",
+    "breath_weapon",
+    "spell",
+)
+_SAVE_SHORT = {
+    "paralysis_poison_death": "PP&D",
+    "rod_staff_wand":         "RSW",
+    "petrify_polymorph":      "PETR",
+    "breath_weapon":          "BREATH",
+    "spell":                  "SPELL",
+}
+
+
+def _sheet_panel(title: str, body_html: str) -> str:
+    if not body_html:
+        return ""
+    return (
+        f'<section class="sheet-panel">'
+        f'<h2 class="sheet-panel-title">{html.escape(title)}</h2>'
+        f'<div class="sheet-panel-body">{body_html}</div>'
+        f'</section>'
+    )
+
+
+def _ab_grid(scores: dict) -> str:
+    if not scores:
+        return ""
+    boxes = []
+    for k in ("str", "dex", "con", "int", "wis", "cha"):
+        v = scores.get(k)
+        if v is None:
+            continue
+        boxes.append(
+            f'<div class="ab-box">'
+            f'<div class="ab-num">{html.escape(str(v))}</div>'
+            f'<div class="ab-label">{k.upper()}</div>'
+            f'</div>'
+        )
+    return f'<div class="ab-grid">{"".join(boxes)}</div>' if boxes else ""
+
+
+def _saves_grid(saves: list) -> str:
+    if not saves:
+        return ""
+    by_type = {s.get("type"): s.get("value") for s in saves if isinstance(s, dict)}
+    boxes = []
+    for key in _SAVE_KEYS:
+        if key not in by_type:
+            continue
+        boxes.append(
+            f'<div class="save-box">'
+            f'<div class="save-num">{html.escape(str(by_type[key]))}</div>'
+            f'<div class="save-label">{_SAVE_SHORT[key]}</div>'
+            f'</div>'
+        )
+    return f'<div class="saves-grid">{"".join(boxes)}</div>' if boxes else ""
+
+
+def _attacks_table(attacks: list) -> str:
+    if not attacks:
+        return ""
+    rows = []
+    for a in attacks:
+        if not isinstance(a, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f'<td>{html.escape(str(a.get("name", "?")))}</td>'
+            f'<td>{html.escape(str(a.get("speed", "—")))}</td>'
+            f'<td>{html.escape(str(a.get("attacks", 1)))}</td>'
+            f'<td>{html.escape(str(a.get("thac0", "—")))}</td>'
+            f'<td>{html.escape(str(a.get("damage_sm", "—")))}</td>'
+            f'<td>{html.escape(str(a.get("damage_l", "—")))}</td>'
+            "</tr>"
+        )
+    head = (
+        "<thead><tr>"
+        "<th>Weapon</th><th>Speed</th><th>#/rd</th><th>THAC0</th>"
+        "<th>Dmg S/M</th><th>Dmg L</th>"
+        "</tr></thead>"
+    )
+    return f'<table class="attacks-table">{head}<tbody>{"".join(rows)}</tbody></table>'
+
+
+def _diamond_list(items: list) -> str:
+    if not items:
+        return ""
+    return (
+        '<ul class="sheet-list">'
+        + "".join(f"<li>{html.escape(str(i))}</li>" for i in items if i)
+        + "</ul>"
+    )
+
+
+def _nwps_list(nwps: list) -> str:
+    if not nwps:
+        return ""
+    rows = []
+    for n in nwps:
+        if not isinstance(n, dict):
+            continue
+        name = html.escape(str(n.get("name", "?")))
+        ab = n.get("ability") or ""
+        ab_html = f' <span class="muted">({html.escape(str(ab))})</span>' if ab else ""
+        rows.append(f"<li>{name}{ab_html}</li>")
+    return f'<ul class="sheet-list">{"".join(rows)}</ul>' if rows else ""
+
+
+def _prof_chips(profs: list) -> str:
+    if not profs:
+        return ""
+    chips = "".join(f'<span class="prof-chip">{html.escape(str(p))}</span>' for p in profs)
+    return f'<div class="prof-chips">{chips}</div>'
+
+
+def _skills_grid(skills: dict) -> str:
+    if not skills:
+        return ""
+    rows = []
+    for k, v in skills.items():
+        rows.append(
+            f'<div class="skill-row">'
+            f'<span class="skill-name">{html.escape(str(k))}</span>'
+            f'<span class="skill-val">{html.escape(str(v))}%</span>'
+            f"</div>"
+        )
+    return f'<div class="skills-grid">{"".join(rows)}</div>'
+
+
+def _hp_meter_html(cur: int, mx: int) -> str:
+    if mx <= 0:
+        return ""
+    pct = max(0.0, min(100.0, (cur / mx) * 100.0))
+    return (
+        f'<span class="hp-meter"><i style="width:{pct:.1f}%"></i></span> '
+        f'<span class="vital-value">{cur}/{mx}</span>'
+    )
+
+
+def _vitals_row(char: dict, cstate: dict) -> str:
+    items = []
+    hp_max = int(char.get("hp_max", 0) or 0)
+    hp_cur = int(cstate.get("hp", hp_max) or 0)
+    if hp_max:
+        items.append(
+            f'<div class="vital"><span class="vital-label">HP</span>{_hp_meter_html(hp_cur, hp_max)}</div>'
+        )
+    for label, key in (("AC", "ac"), ("THAC0", "thac0")):
+        v = char.get(key)
+        if v is not None and v != "":
+            items.append(
+                f'<div class="vital"><span class="vital-label">{label}</span>'
+                f'<span class="vital-value">{html.escape(str(v))}</span></div>'
+            )
+    level = int(char.get("level", 1) or 1)
+    items.append(
+        f'<div class="vital"><span class="vital-label">Level</span>'
+        f'<span class="vital-value">{level}</span></div>'
+    )
+    xp = int(cstate.get("xp", 0) or 0)
+    xp_table = _class_xp_table(char.get("cls", ""))
+    next_xp_html = ""
+    if xp_table and level < len(xp_table):
+        next_xp = xp_table[level]
+        next_xp_html = f' <span class="xp-next">/ {next_xp:,}</span>'
+    items.append(
+        f'<div class="vital"><span class="vital-label">XP</span>'
+        f'<span class="vital-value">{xp:,}{next_xp_html}</span></div>'
+    )
+    return f'<div class="vitals-row">{"".join(items)}</div>'
+
+
+def _extract_md_section(content: str, heading: str) -> str:
+    """Return the body of a `## <heading>` section, stripped, or "" if missing."""
+    pattern = re.compile(
+        r'^##\s+' + re.escape(heading) + r'\s*\n(.+?)(?=^##\s|\Z)',
+        re.M | re.S,
+    )
+    m = pattern.search(content)
+    return m.group(1).strip() if m else ""
+
+
+def _memorized_panel(memorized: list) -> str:
+    """Memorized spells grouped by level. Returns panel-body HTML (or "")."""
+    if not memorized:
+        return ""
+
+    # If level isn't set on each entry, fill from the spells DB.
+    unknown = {(s.get("name") or "").strip() for s in memorized
+               if isinstance(s, dict) and not int(s.get("level", 0) or 0)}
+    level_map = {}
+    if unknown:
+        placeholders = ",".join("?" * len(unknown))
+        rows = _db(_2E_DB).execute(
+            f"SELECT name, level FROM spells WHERE lower(name) IN ({placeholders})",
+            [n.lower() for n in unknown],
+        ).fetchall()
+        level_map = {r["name"].lower(): int(r["level"]) for r in rows}
+
+    by_level: dict[int, list[dict]] = {}
+    for s in memorized:
+        if not isinstance(s, dict):
+            continue
+        name = (s.get("name") or "").strip()
+        lvl = int(s.get("level", 0) or 0)
+        if lvl <= 0:
+            lvl = level_map.get(name.lower(), 0)
+        by_level.setdefault(lvl, []).append({"name": name, "cast": bool(s.get("cast"))})
+
+    blocks = []
+    for lvl in sorted(by_level):
+        spells = by_level[lvl]
+        ready = sum(1 for s in spells if not s["cast"])
+        total = len(spells)
+        head_label = f"Level {lvl}" if lvl > 0 else "Unleveled"
+        items = "".join(
+            f'<li class="spell-cast"><s>{html.escape(s["name"])}</s></li>'
+            if s["cast"] else
+            f'<li class="spell-ready">{html.escape(s["name"])}</li>'
+            for s in spells
+        )
+        blocks.append(
+            f'<div class="spell-level">'
+            f'<div class="spell-level-head">{head_label} '
+            f'<span class="muted">({ready}/{total} ready)</span></div>'
+            f'<ul class="spell-list">{items}</ul></div>'
+        )
+    return "".join(blocks)
+
+
+def _profs_two_col(weapon_profs: list, nwps: list) -> str:
+    left = _prof_chips(weapon_profs)
+    right = _nwps_list(nwps)
+    if not left and not right:
+        return ""
+    parts = []
+    if left:
+        parts.append(f'<div><h4>Weapons</h4>{left}</div>')
+    if right:
+        parts.append(f'<div><h4>Non-weapon</h4>{right}</div>')
+    return f'<div class="sheet-two-col">{"".join(parts)}</div>'
+
+
 @app.route("/sheets/<slug>")
 def character_sheet(slug: str):
     campaign_name = cfg.get("name", "Campaign")
     chars_dir = cfg["_data_dir"] / "characters"
     path = chars_dir / f"{slug}.md"
-
     if not path.exists():
         abort(404)
 
-    content = path.read_text(encoding="utf-8")
-    content_html = _markdown_to_html(content)
+    md_content = path.read_text(encoding="utf-8")
     name = _read_first_heading(path)
+    char = cfg.get("characters", {}).get(slug) or cfg.get("npcs", {}).get(slug) or {}
+    state = _c.load_state(cfg) if char else {}
+    cstate = state.get("characters", {}).get(slug, {}) if state else {}
 
-    index = _load_image_index()
-    portrait = _find_portrait(name, index, slug)
+    # Header — portrait + identity strip + conditions
+    image_index = _load_image_index() if char else _load_image_index()
+    portrait = _find_portrait(name, image_index, slug)
     portrait_html = ""
     if portrait:
-        fn   = html.escape(portrait["filename"])
+        fn = html.escape(portrait["filename"])
         desc = html.escape(portrait.get("description", ""))
+        desc_block = (
+            f'<details class="portrait-desc"><summary>portrait notes</summary>'
+            f'<p>{desc}</p></details>'
+        ) if desc else ""
         portrait_html = (
-            f'<div style="float:right;margin:0 0 16px 20px;max-width:200px;text-align:center">'
-            f'<img src="/images/{fn}" alt="{html.escape(name)}" style="width:100%;border-radius:4px;border:1px solid #4a3828">'
-            f'{"<p class=muted style=font-size:.85em;margin-top:6px>" + desc + "</p>" if desc else ""}'
+            f'<div class="sheet-portrait-wrap">'
+            f'<img class="sheet-portrait" src="/images/{fn}" alt="{html.escape(name)}">'
+            f'{desc_block}'
             f'</div>'
         )
 
-    body = (
-        f'<div class="card clearfix">'
-        f"{portrait_html}"
-        f"{content_html}"
-        f"</div>"
+    # Identity strip: race · class lvl · gender
+    id_parts = []
+    race = char.get("race") or ""
+    cls = char.get("cls") or ""
+    level = char.get("level")
+    gender = char.get("gender") or ""
+    if cls:
+        id_parts.append(f"{html.escape(cls)} {html.escape(str(level))}" if level else html.escape(cls))
+    if race:
+        id_parts.append(html.escape(race.title()))
+    if gender:
+        id_parts.append(html.escape(gender.title()))
+    id_strip = '<span class="sep">·</span>'.join(id_parts)
+
+    conditions = cstate.get("conditions") or []
+    cond_html = ""
+    if conditions:
+        chips = "".join(f'<span class="tag">{html.escape(c)}</span>' for c in conditions)
+        cond_html = f'<div class="sheet-conditions">{chips}</div>'
+
+    header = (
+        '<div class="sheet-header">'
+        '<div class="sheet-header-main">'
+        f'<h1>{html.escape(name)}</h1>'
+        f'<div class="sheet-id">{id_strip}</div>'
+        f'{cond_html}'
+        '</div>'
+        f'{portrait_html}'
+        '</div>'
     )
+
+    # Build all the structured panels (only emit non-empty ones).
+    panels = []
+    if char:
+        panels.append(_sheet_panel("Vitals", _vitals_row(char, cstate)))
+        panels.append(_sheet_panel("Ability Scores", _ab_grid(char.get("ability_scores") or {})))
+        panels.append(_sheet_panel("Saving Throws", _saves_grid(char.get("saves") or [])))
+        panels.append(_sheet_panel("Attacks", _attacks_table(char.get("attacks") or [])))
+        panels.append(_sheet_panel("Proficiencies",
+                                   _profs_two_col(char.get("weapon_profs") or [],
+                                                  char.get("nwps") or [])))
+        panels.append(_sheet_panel("Thief / Nature Skills", _skills_grid(char.get("skills") or {})))
+        panels.append(_sheet_panel("Natural Abilities", _diamond_list(char.get("natural_abilities") or [])))
+        panels.append(_sheet_panel("Memorized Spells", _memorized_panel(cstate.get("memorized_spells") or [])))
+        panels.append(_sheet_panel("Inventory", _diamond_list(char.get("inventory") or [])))
+        enc = _encumbrance_html(char, state, slug)
+        if enc:
+            panels.append(_sheet_panel("Encumbrance", enc))
+
+    # Background panel: prefer the prose-only `## Background` section when
+    # the markdown follows the standard template; otherwise fall back to the
+    # whole markdown body so older / hand-written sheets keep showing.
+    background_md = _extract_md_section(md_content, "Background")
+    bg_html = _markdown_to_html(background_md) if background_md else _markdown_to_html(md_content)
+    panels.append(_sheet_panel("Background", bg_html))
+
+    body = '<div class="sheet">' + header + "".join(p for p in panels if p) + '</div>'
     return render(f"{html.escape(name)} — {html.escape(campaign_name)}", body)
 
 
@@ -1148,6 +4847,54 @@ def location_detail(area: str, slug: str):
 def serve_image(filename: str):
     images_dir = cfg["_data_dir"] / "images"
     return send_from_directory(str(images_dir), filename)
+
+
+@app.route("/api/images/<filename>", methods=["DELETE"])
+def api_image_delete(filename: str):
+    """Delete a campaign image and prune its row from index.json.
+    Validates the filename is a basename and known to the index — refuses
+    paths that traverse out of the images dir."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    # Refuse anything that isn't a plain basename.
+    if "/" in filename or "\\" in filename or filename.startswith(".") or filename in ("", ".", ".."):
+        return jsonify({"error": "invalid filename"}), 400
+
+    images_dir = cfg["_data_dir"] / "images"
+    index_file = images_dir / "index.json"
+    if not index_file.exists():
+        return jsonify({"error": "no image index"}), 404
+
+    try:
+        records = json.loads(index_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return jsonify({"error": f"index unreadable: {exc}"}), 500
+
+    new_records = [r for r in records if r.get("filename") != filename]
+    if len(new_records) == len(records):
+        return jsonify({"error": "filename not in index"}), 404
+
+    target = images_dir / filename
+    if target.exists():
+        try:
+            target.unlink()
+        except OSError as exc:
+            return jsonify({"error": f"file delete failed: {exc}"}), 500
+
+    _c.atomic_write_text(index_file, json.dumps(new_records, indent=2))
+    return jsonify({"ok": True, "deleted": filename})
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """Serve the SVG favicon for legacy /favicon.ico requests so they don't
+    404 in logs. Browsers that honour the <link rel='icon'> in BASE_TEMPLATE
+    will already have loaded it from /static/favicon.svg."""
+    return send_from_directory(
+        Path(__file__).parent / "static",
+        "favicon.svg",
+        mimetype="image/svg+xml",
+    )
 
 
 # Monster routes are defined in dashboard_monsters.py and registered at the
@@ -1432,27 +5179,56 @@ def spell_detail(spell_id: int):
 
 @app.route("/classes")
 def classes():
-    if not _2E_DB.exists():
+    # Collect (name, slug, hit_die, pr_str, is_homebrew) entries from both sources.
+    entries: list[tuple[str, str, str, str, bool, str]] = []
+
+    if _2E_DB.exists():
+        conn = _db(_2E_DB)
+        for r in conn.execute(
+            "SELECT name, hit_die, prime_requisite FROM classes ORDER BY name"
+        ).fetchall():
+            slug = re.sub(r"[^a-z0-9]+", "-", r["name"].lower()).strip("-")
+            try:
+                pr = json.loads(r["prime_requisite"] or "[]")
+                pr_str = ", ".join(p.capitalize() for p in pr) if pr else "—"
+            except (json.JSONDecodeError, TypeError):
+                pr_str = str(r["prime_requisite"] or "—")
+            entries.append((r["name"], slug, r["hit_die"] or "—", pr_str, False, ""))
+
+    for hb in _hb.list_homebrew():
+        if hb.get("_error"):
+            entries.append((
+                hb.get("name", "?"), hb.get("slug", "?"),
+                "—", "—", True,
+                f'<span class="tag" style="background:#3a1818;color:#c87a7a">load error</span>',
+            ))
+            continue
+        try:
+            pr = json.loads(hb.get("prime_requisite") or "[]")
+            pr_str = ", ".join(p.capitalize() for p in pr) if pr else "—"
+        except (json.JSONDecodeError, TypeError):
+            pr_str = "—"
+        entries.append((
+            hb["name"], hb["slug"], hb.get("hit_die") or "—",
+            pr_str, True, "",
+        ))
+
+    if not entries:
         body = "<h1>Classes</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
         return render("Classes", body)
 
-    conn = _db(_2E_DB)
-    rows = conn.execute("SELECT id, name, hit_die, prime_requisite FROM classes ORDER BY name").fetchall()
+    entries.sort(key=lambda e: e[0].lower())
 
     cards = []
-    for r in rows:
-        slug = re.sub(r"[^a-z0-9]+", "-", r["name"].lower()).strip("-")
-        try:
-            pr = json.loads(r["prime_requisite"] or "[]")
-            pr_str = ", ".join(pr).capitalize() if pr else "—"
-        except (json.JSONDecodeError, TypeError):
-            pr_str = str(r["prime_requisite"] or "—")
+    for name, slug, hit_die, pr_str, is_homebrew, extra in entries:
+        tag = ('<span class="tag" style="background:#1a3a18;color:#6db86d;'
+               'border-color:#3a6a3a">homebrew</span>' if is_homebrew else "")
         cards.append(
             f'<div class="card" style="padding:10px 14px">'
             f'<h2 style="margin:0 0 2px">'
-            f'<a href="/classes/{html.escape(slug)}">{html.escape(r["name"])}</a></h2>'
+            f'<a href="/classes/{html.escape(slug)}">{html.escape(name)}</a> {tag}{extra}</h2>'
             f'<p class="muted" style="margin:0;font-size:.9em">'
-            f'Hit Die: {html.escape(r["hit_die"] or "—")} &nbsp;·&nbsp; '
+            f'Hit Die: {html.escape(hit_die)} &nbsp;·&nbsp; '
             f'Prime Requisite: {html.escape(pr_str)}'
             f'</p></div>'
         )
@@ -1463,41 +5239,63 @@ def classes():
 
 @app.route("/classes/<slug>")
 def class_detail(slug: str):
-    if not _2E_DB.exists():
-        abort(404)
+    # Try homebrew first; the JSON files are authoritative for any class they
+    # define, so a homebrew Barbarian wins over any same-named PHB entry.
+    cls_row: dict | None = None
+    level_rows: list = []
+    is_homebrew = False
+    homebrew_extras: dict = {}
 
-    name_pattern = slug.replace("-", " ")
-    conn = _db(_2E_DB)
-    cls_row = conn.execute(
-        "SELECT * FROM classes WHERE lower(replace(name,' ','-')) = ? "
-        "OR name LIKE ? COLLATE NOCASE LIMIT 1",
-        (slug, f"%{name_pattern}%"),
-    ).fetchone()
+    hb = _hb.get_homebrew(slug)
+    if hb is not None and not hb.get("_error"):
+        cls_row = hb
+        level_rows = hb.get("level_rows", [])
+        is_homebrew = True
+        homebrew_extras = {k: hb.get(k) for k in (
+            "ability_requirements", "allowed_races", "allowed_alignments",
+            "allowed_armor", "weapon_specialization", "casts_spells",
+            "base_movement_rate", "weapon_proficiency_slots",
+            "nonweapon_proficiency_slots", "progression_tables",
+            "source", "source_url",
+        ) if hb.get(k) is not None}
+    elif _2E_DB.exists():
+        name_pattern = slug.replace("-", " ")
+        conn = _db(_2E_DB)
+        cls_row = conn.execute(
+            "SELECT * FROM classes WHERE lower(replace(name,' ','-')) = ? "
+            "OR name LIKE ? COLLATE NOCASE LIMIT 1",
+            (slug, f"%{name_pattern}%"),
+        ).fetchone()
+        if cls_row is not None:
+            level_rows = conn.execute(
+                "SELECT * FROM class_levels WHERE class_id=? ORDER BY level",
+                (cls_row["id"],),
+            ).fetchall()
 
     if cls_row is None:
         abort(404)
 
-    level_rows = conn.execute(
-        "SELECT * FROM class_levels WHERE class_id=? ORDER BY level",
-        (cls_row["id"],),
-    ).fetchall()
+    def _g(row, key):
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return None
 
     try:
-        pr = json.loads(cls_row["prime_requisite"] or "[]")
+        pr = json.loads(_g(cls_row, "prime_requisite") or "[]")
         pr_str = ", ".join(str(p).capitalize() for p in pr) if pr else "—"
     except (json.JSONDecodeError, TypeError):
-        pr_str = str(cls_row["prime_requisite"] or "—")
+        pr_str = str(_g(cls_row, "prime_requisite") or "—")
 
     try:
-        abilities = json.loads(cls_row["special_abilities"] or "[]")
+        abilities = json.loads(_g(cls_row, "special_abilities") or "[]")
     except (json.JSONDecodeError, TypeError):
         abilities = []
 
     # Build XP / progression table
-    has_spells    = any(r["spell_slots"] for r in level_rows)
-    has_turn      = any(r["turn_undead"] for r in level_rows)
+    has_spells = any(_g(r, "spell_slots") for r in level_rows)
 
-    header_cells = "<tr><th>Level</th><th>XP</th><th>HD</th><th>THAC0</th>"
+    header_cells = "<tr><th>Level</th><th>XP</th><th>HD</th><th>THAC0</th><th>Atk</th>"
     header_cells += "<th>Para</th><th>RSW</th><th>Pet</th><th>Brth</th><th>Spell</th>"
     if has_spells:
         header_cells += "<th>Spell Slots</th>"
@@ -1506,25 +5304,27 @@ def class_detail(slug: str):
     tbody = ""
     for r in level_rows:
         slots_str = ""
-        if has_spells and r["spell_slots"]:
+        if has_spells and _g(r, "spell_slots"):
             try:
-                slots = json.loads(r["spell_slots"])
+                slots = json.loads(_g(r, "spell_slots"))
                 slots_str = " / ".join(str(v) for k, v in sorted(slots.items()) if v)
             except Exception:
                 slots_str = "—"
 
-        xp = f"{r['xp_required']:,}" if r["xp_required"] is not None else "—"
+        xp_v = _g(r, "xp_required")
+        xp = f"{xp_v:,}" if xp_v is not None else "—"
         tbody += (
             f"<tr>"
-            f"<td>{r['level']}</td>"
+            f"<td>{_g(r, 'level')}</td>"
             f"<td>{xp}</td>"
-            f"<td>{html.escape(r['hit_dice'] or '—')}</td>"
-            f"<td>{r['thac0'] or '—'}</td>"
-            f"<td>{r['save_paralysis'] or '—'}</td>"
-            f"<td>{r['save_rsw'] or '—'}</td>"
-            f"<td>{r['save_petrify'] or '—'}</td>"
-            f"<td>{r['save_breath'] or '—'}</td>"
-            f"<td>{r['save_spell'] or '—'}</td>"
+            f"<td>{html.escape(_g(r, 'hit_dice') or '—')}</td>"
+            f"<td>{_g(r, 'thac0') or '—'}</td>"
+            f"<td>{html.escape(str(_g(r, 'attacks') or '—'))}</td>"
+            f"<td>{_g(r, 'save_paralysis') or '—'}</td>"
+            f"<td>{_g(r, 'save_rsw') or '—'}</td>"
+            f"<td>{_g(r, 'save_petrify') or '—'}</td>"
+            f"<td>{_g(r, 'save_breath') or '—'}</td>"
+            f"<td>{_g(r, 'save_spell') or '—'}</td>"
             + (f"<td>{slots_str or '—'}</td>" if has_spells else "")
             + "</tr>"
         )
@@ -1537,25 +5337,109 @@ def class_detail(slug: str):
         abilities_html = f"<h2>Special Abilities</h2><ul>{items}</ul>"
 
     desc_html = ""
-    if cls_row["description"]:
-        paras = [p.strip() for p in cls_row["description"].split("\n") if p.strip()]
+    if _g(cls_row, "description"):
+        paras = [p.strip() for p in (_g(cls_row, "description") or "").split("\n") if p.strip()]
         desc_html = "".join(f"<p>{html.escape(p)}</p>" for p in paras[:4])
         if len(paras) > 4:
             desc_html += f"<p class='muted'>…{len(paras)-4} more paragraphs</p>"
 
+    # Homebrew kit metadata block
+    hb_meta_html = ""
+    if is_homebrew and homebrew_extras:
+        meta_rows = []
+        if homebrew_extras.get("ability_requirements"):
+            req = ", ".join(f"{k.upper()} {v}" for k, v in homebrew_extras["ability_requirements"].items())
+            meta_rows.append(("Ability Requirements", req))
+        if homebrew_extras.get("allowed_races"):
+            meta_rows.append(("Allowed Races", ", ".join(homebrew_extras["allowed_races"])))
+        if homebrew_extras.get("allowed_alignments"):
+            meta_rows.append(("Allowed Alignments", ", ".join(homebrew_extras["allowed_alignments"])))
+        if homebrew_extras.get("allowed_armor"):
+            meta_rows.append(("Allowed Armor", ", ".join(homebrew_extras["allowed_armor"])))
+        if homebrew_extras.get("base_movement_rate") is not None:
+            meta_rows.append(("Base Movement", str(homebrew_extras["base_movement_rate"])))
+        if homebrew_extras.get("weapon_specialization") is not None:
+            meta_rows.append(("Weapon Specialization", "yes" if homebrew_extras["weapon_specialization"] else "no"))
+        if homebrew_extras.get("casts_spells") is not None:
+            meta_rows.append(("Casts Spells", "yes" if homebrew_extras["casts_spells"] else "no"))
+        wp = homebrew_extras.get("weapon_proficiency_slots") or {}
+        if wp:
+            meta_rows.append(("Weapon Profs", f"{wp.get('initial','?')} initial, +1 per {wp.get('advance_every_levels','?')} levels"))
+        nwp = homebrew_extras.get("nonweapon_proficiency_slots") or {}
+        if nwp:
+            meta_rows.append(("Nonweapon Profs", f"{nwp.get('initial','?')} initial, +1 per {nwp.get('advance_every_levels','?')} levels"))
+        if meta_rows:
+            rows_html = "".join(
+                f"<tr><th style='text-align:left'>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>"
+                for k, v in meta_rows
+            )
+            hb_meta_html = f"<h2>Class Restrictions</h2><div class='card'><table>{rows_html}</table></div>"
+
+    # Kit progression tables (climb%, leap, etc.)
+    prog_extras_html = ""
+    pt = (homebrew_extras.get("progression_tables") or {}) if is_homebrew else {}
+    if pt:
+        blocks = []
+        for tname, tdata in pt.items():
+            by_level = tdata.get("by_level") or {}
+            if not by_level:
+                continue
+            sample_val = next(iter(by_level.values()))
+            if isinstance(sample_val, dict):
+                cols = sorted(sample_val.keys())
+                head = "<th>Level</th>" + "".join(f"<th>{html.escape(c.replace('_',' ').title())}</th>" for c in cols)
+                rows_h = ""
+                for lvl in sorted(by_level, key=lambda k: int(k)):
+                    cells = "".join(f"<td>{html.escape(str(by_level[lvl].get(c, '—')))}</td>" for c in cols)
+                    rows_h += f"<tr><td>{lvl}</td>{cells}</tr>"
+            else:
+                head = "<th>Level</th><th>Value</th>"
+                rows_h = "".join(
+                    f"<tr><td>{lvl}</td><td>{html.escape(str(by_level[lvl]))}</td></tr>"
+                    for lvl in sorted(by_level, key=lambda k: int(k))
+                )
+            desc = tdata.get("description", "")
+            blocks.append(
+                f"<h3 style='margin-top:14px'>{html.escape(tname.replace('_', ' ').title())}</h3>"
+                + (f"<p class='muted'>{html.escape(desc)}</p>" if desc else "")
+                + f"<table><thead><tr>{head}</tr></thead><tbody>{rows_h}</tbody></table>"
+            )
+        if blocks:
+            prog_extras_html = (
+                f"<h2 style='margin-top:20px'>Kit Progression Tables</h2>"
+                f"<div class='card' style='overflow-x:auto'>{''.join(blocks)}</div>"
+            )
+
+    # Source citation for homebrew
+    src_html = ""
+    if is_homebrew:
+        src_text = homebrew_extras.get("source") or "homebrew"
+        src_url = homebrew_extras.get("source_url") or ""
+        if src_url:
+            src_html = (f"<p class='muted'>Source: "
+                        f"<a href='{html.escape(src_url)}'>{html.escape(src_text)}</a></p>")
+        else:
+            src_html = f"<p class='muted'>Source: {html.escape(src_text)}</p>"
+
+    homebrew_tag = ('<span class="tag" style="background:#1a3a18;color:#6db86d;'
+                    'border-color:#3a6a3a">homebrew</span>' if is_homebrew else "")
+
     body = (
         f'<p><a href="/classes">← Classes</a></p>'
-        f'<h1>{html.escape(cls_row["name"])}</h1>'
+        f'<h1>{html.escape(_g(cls_row, "name"))} {homebrew_tag}</h1>'
         f'<div class="card">'
-        f'<p><strong>Hit Die:</strong> {html.escape(cls_row["hit_die"] or "—")} &nbsp;·&nbsp; '
+        f'<p><strong>Hit Die:</strong> {html.escape(_g(cls_row, "hit_die") or "—")} &nbsp;·&nbsp; '
         f'<strong>Prime Requisite:</strong> {html.escape(pr_str)}</p>'
+        + src_html
         + (f"<hr>{desc_html}" if desc_html else "")
         + f'</div>'
-        f'<h2 style="margin-top:20px">Progression</h2>'
-        f'<div class="card" style="overflow-x:auto">{prog_table}</div>'
+        + hb_meta_html
+        + f'<h2 style="margin-top:20px">Progression</h2>'
+        + f'<div class="card" style="overflow-x:auto">{prog_table}</div>'
         + (f'<div class="card">{abilities_html}</div>' if abilities_html else "")
+        + prog_extras_html
     )
-    return render(f'{html.escape(cls_row["name"])} — Classes', body)
+    return render(f'{html.escape(_g(cls_row, "name"))} — Classes', body)
 
 
 # Item routes are defined in dashboard_items.py and registered at the end of
@@ -1696,6 +5580,141 @@ def combat_state():
         except Exception:
             pass
     return jsonify({"active": False})
+
+
+# ---------------------------------------------------------------------------
+# World maps
+# ---------------------------------------------------------------------------
+from tools import world_map as _world_map
+
+
+@app.route("/maps")
+def maps_index():
+    """List all world maps in the active campaign + their views."""
+    try:
+        d = _world_map._maps_dir()
+    except Exception as e:
+        return render("Maps", f'<h1>World Maps</h1><p style="color:#c66">{html.escape(str(e))}</p>')
+
+    items, fragments = [], []
+    for p in sorted(d.glob("*.map")):
+        slug = p.stem
+        if not _world_map._is_workspace_file(p):
+            fragments.append(slug)
+            continue
+        try:
+            ws = _world_map.parse_file(p)
+            view_links = " · ".join(
+                f'<a href="/maps/{html.escape(slug)}/{html.escape(v.name)}">{html.escape(v.name)}</a>'
+                for v in ws.views
+            ) or '<span style="color:#8a7a60">no views</span>'
+            n_features = len(ws.model)
+            items.append(
+                f'<li style="margin:6px 0">'
+                f'<b style="color:#c8a96e">{html.escape(slug)}</b> '
+                f'<span style="color:#8a7a60;font-size:.9em">({n_features} top-level features)</span><br>'
+                f'<span style="margin-left:1em">Views: {view_links}</span>'
+                f'</li>'
+            )
+        except Exception as e:
+            items.append(
+                f'<li><b>{html.escape(slug)}</b> '
+                f'<span style="color:#c66">parse error: {html.escape(str(e))}</span></li>'
+            )
+
+    if not items and not fragments:
+        body = (
+            '<h1>World Maps</h1>'
+            '<p style="color:#8a7a60">No maps yet. Create one with the MCP tool '
+            '<code>create_world_map(slug)</code>, then populate it via '
+            '<code>update_world_map</code> or <code>add_world_map_feature</code>.</p>'
+        )
+    else:
+        body = '<h1>World Maps</h1>'
+        if items:
+            body += '<ul style="list-style:none;padding:0">' + ''.join(items) + '</ul>'
+        if fragments:
+            frag_html = ', '.join(f'<code>{html.escape(s)}</code>' for s in fragments)
+            body += (
+                '<h3 style="margin-top:24px">Include fragments</h3>'
+                '<p style="color:#8a7a60;font-size:.9em">Files without a top-level <code>workspace</code> block. '
+                'These are inlined by other maps via <code>!include</code>: '
+                + frag_html + '</p>'
+            )
+    return render("World Maps", body)
+
+
+@app.route("/maps/<slug>/<view>")
+def map_view(slug, view):
+    """Render a Leaflet view of a world map."""
+    path = _world_map._maps_dir() / f"{_world_map._safe_slug(slug)}.map"
+    if not path.exists():
+        abort(404)
+    try:
+        _world_map.parse_file(path)  # validate before serving
+    except SyntaxError as e:
+        body = (
+            f'<h1>{html.escape(slug)} — {html.escape(view)}</h1>'
+            f'<p style="color:#c66">DSL error: {html.escape(str(e))}</p>'
+            f'<p><a href="/maps">← back to maps</a></p>'
+        )
+        return render(f"Map: {slug}", body)
+
+    data_url  = f"/api/maps/{slug}/{view}.geojson"
+    party_url = f"/api/maps/{slug}/party.geojson"
+    body = (
+        '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" '
+        'integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">'
+        '<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" '
+        'integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>'
+        '<style>'
+        '  .map-layout { display:flex; gap:12px; align-items:stretch; }'
+        '  #worldmap { flex:1; height:75vh; min-width:0; '
+        '              background:#1a1510; border:1px solid #4a3828; border-radius:6px; }'
+        '  #worldmap-sidebar { width:260px; max-height:75vh; overflow-y:auto; '
+        '                      padding:12px; background:#2a2018; border:1px solid #4a3828; border-radius:6px; }'
+        '  .leaflet-popup-content { color:#1a1510; font-family:Georgia,serif; }'
+        '  .leaflet-control-layers { background:#2a2018; color:#d4c5a9; border:1px solid #4a3828; }'
+        '  .leaflet-control-layers-overlays label { color:#d4c5a9; }'
+        '</style>'
+        f'<h1>{html.escape(slug)} <span style="color:#8a7a60;font-size:.7em">— {html.escape(view)}</span></h1>'
+        '<p style="color:#8a7a60;font-size:.9em"><a href="/maps">← all maps</a></p>'
+        '<div class="map-layout">'
+        '  <div id="worldmap"></div>'
+        '  <div id="worldmap-sidebar">Loading…</div>'
+        '</div>'
+        f'<script>'
+        f'window.WORLD_MAP_SLUG  = {json.dumps(slug)};'
+        f'window.WORLD_MAP_VIEW  = {json.dumps(view)};'
+        f'window.WORLD_MAP_DATA  = {json.dumps(data_url)};'
+        f'window.WORLD_MAP_PARTY = {json.dumps(party_url)};'
+        f'</script>'
+        '<script src="/static/world-map.js"></script>'
+    )
+    return render(f"Map: {slug}/{view}", body)
+
+
+@app.route("/api/maps/<slug>/<view>.geojson")
+def map_geojson(slug, view):
+    """Compile-on-demand GeoJSON for a world-map view."""
+    path = _world_map._maps_dir() / f"{_world_map._safe_slug(slug)}.map"
+    if not path.exists():
+        return jsonify({"error": f"map '{slug}' not found"}), 404
+    try:
+        ws = _world_map.parse_file(path)
+        fc = _world_map.compile_view(ws, view)
+    except (SyntaxError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(fc)
+
+
+@app.route("/api/maps/<slug>/party.geojson")
+def map_party_geojson(slug):
+    """Serve the party-position overlay if it exists (404 otherwise)."""
+    overlay = _world_map._maps_dir() / f"{_world_map._safe_slug(slug)}.party.geojson"
+    if not overlay.exists():
+        return jsonify({"error": "no party overlay"}), 404
+    return Response(overlay.read_text(encoding="utf-8"), mimetype="application/json")
 
 
 # ---------------------------------------------------------------------------

@@ -79,15 +79,32 @@ def main():
         weather_label = weather.split(" (", 1)[0] if weather else ""
         weather_seg = f" · {_c(weather_label, _DIM)}" if weather_label else ""
 
+        # Live HP override from combat_state.json (active combat keeps HP
+        # current there; state.json only updates on end_combat). Combat
+        # conditions come through the same way.
+        combat_hp: dict = {}
+        combat_conds: dict = {}
+        cs_path = camp_dir / "combat_state.json"
+        if cs_path.exists():
+            try:
+                cs = json.loads(cs_path.read_text())
+                if cs.get("active"):
+                    for c in cs.get("combatants", []):
+                        if c.get("side") == "party" and c.get("key"):
+                            combat_hp[c["key"]] = c.get("hp")
+                            combat_conds[c["key"]] = c.get("conditions") or []
+            except Exception:
+                pass
+
         # Party HP
         chars = cfg.get("characters", {})
         char_states = state.get("characters", {})
         hp_parts = []
         for key, char in chars.items():
             max_hp = char.get("hp_max", 0)
-            cur_hp = char_states.get(key, {}).get("hp", max_hp)
+            cur_hp = combat_hp.get(key, char_states.get(key, {}).get("hp", max_hp))
             label = char.get("label", key).split()[0]
-            conds = char_states.get(key, {}).get("conditions", [])
+            conds = combat_conds.get(key, char_states.get(key, {}).get("conditions", []))
             cond_str = _c(f"({','.join(c[:3] for c in conds)})", _DIM) if conds else ""
             hp_parts.append(f"{label} {_hp_color(cur_hp, max_hp)}{cond_str}")
         hp_str = " · ".join(hp_parts)
