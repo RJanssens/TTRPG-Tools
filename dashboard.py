@@ -2024,12 +2024,36 @@ _PLAY_HTML = """
     background: linear-gradient(to right, transparent, var(--rule-hi), transparent);
     border: none;
   }
+  /* Character speech: the DM convention is `> "..."` (occasionally
+     `> *"..."*`). Style the markdown blockquote so the speech reads as
+     distinct from narration — warmer gold-cream tone, subtle gold gradient,
+     italic, with a decorative opening curly-quote glyph. */
   .turn.dm blockquote {
-    margin: 8px 0;
-    padding: 2px 0 2px 14px;
-    border-left: 2px solid var(--accent-gold);
-    color: #c8b88c;
+    position: relative;
+    margin: 12px 0 12px 6px;
+    padding: 6px 16px 6px 22px;
+    border-left: 3px solid var(--accent-gold);
+    background: linear-gradient(to right, rgba(200,169,110,0.07), rgba(200,169,110,0.01) 60%, transparent);
+    color: #e6c98e;
+    font-style: italic;
+    border-radius: 0 2px 2px 0;
   }
+  .turn.dm blockquote::before {
+    content: '\\201C';   /* left double quote */
+    position: absolute;
+    left: 6px;
+    top: -10px;
+    font-family: 'EB Garamond', Georgia, serif;
+    font-style: normal;
+    font-size: 2.4em;
+    line-height: 1;
+    color: var(--accent-gold);
+    opacity: 0.32;
+    pointer-events: none;
+  }
+  /* Inner <em> (e.g. when the DM writes `> *"..."*`) shouldn't double up
+     visually — strip the inner italic so the line stays italicised once. */
+  .turn.dm blockquote em { font-style: normal; }
   .turn.dm ul, .turn.dm ol { margin: 6px 0 6px 22px; }
   .turn.dm li { margin: 1px 0; }
   .turn.dm code { color: var(--accent-gold-hi); }
