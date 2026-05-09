@@ -1783,6 +1783,8 @@ def _play_state() -> dict:
         })
 
     coin = state.get("coin", {}) or {}
+    # Show every non-zero denomination; if the party is genuinely broke,
+    # surface "0 gp" rather than blank — players want to see the zero.
     coin_parts = [f"{coin[d]} {d}" for d in ("gp", "ep", "sp", "cp") if coin.get(d)]
 
     hour = state.get("current_hour")
@@ -1799,7 +1801,7 @@ def _play_state() -> dict:
         "weather": weather_label,
         "location": _latest_location_name(),
         "in_combat": bool(state.get("combat")),
-        "coin": " · ".join(coin_parts),
+        "coin": " · ".join(coin_parts) if coin_parts else "0 gp",
         "characters": chars,
     }
 
