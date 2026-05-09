@@ -2421,6 +2421,32 @@ _PLAY_HTML = """
     flex: 1;
     min-width: 0;
   }
+  /* Pretty-printed tool summary (custom formatter output). */
+  details.turn.tool .tool-glyph {
+    display: inline-block;
+    width: 14px;
+    margin-right: 6px;
+    text-align: center;
+    color: var(--accent-gold);
+    font-family: var(--font-body);
+    flex-shrink: 0;
+  }
+  details.turn.tool .tool-pretty {
+    flex: 1;
+    min-width: 0;
+    color: var(--ink-body);
+    font-family: var(--font-body);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  details.turn.tool .tool-pretty b {
+    color: var(--accent-gold-hi);
+    font-weight: 500;
+  }
+  details.turn.tool .tool-pretty .neg { color: #e08070; }
+  details.turn.tool .tool-pretty .pos { color: #7ab46e; }
+  details.turn.tool .tool-pretty .dim { color: var(--ink-muted); }
   details.turn.tool .tool-body { padding: 10px 14px 12px; }
   details.turn.tool .tool-section + .tool-section { margin-top: 10px; }
   details.turn.tool .tool-section-label {
@@ -3188,6 +3214,198 @@ _PLAY_HTML = """
     return (name || '?').replace(/^mcp__ttrpg__/, '');
   }
 
+  // Pretty-printed summary lines for the high-frequency MCP tools. Each
+  // formatter returns an HTML string that lands inside .tool-pretty.
+  // Parameters: (input, result) — result is null until the matching
+  // tool_result event arrives, then the summary re-renders.
+  const TOOL_PRETTY = {
+    'roll': {
+      glyph: '\\u2682',  // ⚂
+      summary: (i, r) => {
+        const f = i.formula || i.expression || i.dice || 'roll';
+        let s = '<b>' + esc(f) + '</b>';
+        if (i.purpose) s += ' <span class="dim">' + esc(i.purpose) + '</span>';
+        if (r && typeof r.total === 'number') s += ' &rarr; <b>' + r.total + '</b>';
+        else if (r && typeof r.roll === 'number') s += ' &rarr; <b>' + r.roll + '</b>';
+        return s;
+      },
+    },
+    'saving_throw': {
+      glyph: '\\u2756',  // ❖
+      summary: (i, r) => {
+        const who = i.character || '?';
+        const t = (i.type || 'save').replace(/_/g, ' ');
+        let s = esc(who) + ' <span class="dim">·</span> ' + esc(t);
+        if (r && r.success === true)  s += ' &rarr; <b class="pos">passed</b>';
+        if (r && r.success === false) s += ' &rarr; <b class="neg">failed</b>';
+        if (r && typeof r.roll === 'number') s += ' <span class="dim">(' + r.roll + ')</span>';
+        return s;
+      },
+    },
+    'skill_check': {
+      glyph: '\\u2756',
+      summary: (i, r) => {
+        const who = i.character || '?';
+        const sk = i.skill || '?';
+        let s = esc(who) + ' <span class="dim">·</span> ' + esc(sk);
+        if (r && r.success === true)  s += ' &rarr; <b class="pos">success</b>';
+        if (r && r.success === false) s += ' &rarr; <b class="neg">fail</b>';
+        if (r && typeof r.roll === 'number') s += ' <span class="dim">(' + r.roll + ')</span>';
+        return s;
+      },
+    },
+    'attack': {
+      glyph: '\\u2694',  // ⚔
+      summary: (i, r) => {
+        const a = i.attacker || '?';
+        const t = i.target || i.defender || '?';
+        let s = esc(a) + ' &rarr; ' + esc(t);
+        if (r) {
+          if (r.hits === true)  s += ' <b class="pos">hit</b>';
+          if (r.hits === false) s += ' <b class="neg">miss</b>';
+          if (typeof r.damage === 'number' && r.hits) s += ' <b>' + r.damage + '</b>';
+          if (typeof r.roll === 'number') s += ' <span class="dim">(' + r.roll + ')</span>';
+        }
+        return s;
+      },
+    },
+    'apply_damage': {
+      glyph: '\\u25BC',  // ▼
+      summary: (i, r) => {
+        const who = i.character || i.name || '?';
+        let s = '<b class="neg">&minus;' + (i.amount ?? '?') + ' HP</b> &rarr; ' + esc(who);
+        if (r && typeof r.hp_after === 'number') s += ' <span class="dim">(' + r.hp_after + ')</span>';
+        if (r && r.dead) s += ' <b class="neg">dead</b>';
+        else if (r && r.downed) s += ' <b class="neg">downed</b>';
+        return s;
+      },
+    },
+    'apply_combat_damage': null,    // alias (filled below)
+    'apply_heal': {
+      glyph: '\\u25B2',  // ▲
+      summary: (i, r) => {
+        const who = i.character || i.name || '?';
+        let s = '<b class="pos">+' + (i.amount ?? '?') + ' HP</b> &rarr; ' + esc(who);
+        if (r && typeof r.hp_after === 'number') s += ' <span class="dim">(' + r.hp_after + ')</span>';
+        return s;
+      },
+    },
+    'apply_combat_heal': null,
+    'apply_combat_damage_override': null, // placeholder names if any
+    'award_xp': {
+      glyph: '\\u2730',  // ✰
+      summary: (i, r) => {
+        let s = '<b class="pos">+' + (i.amount ?? '?') + ' XP</b> &rarr; ' + esc(i.character || '?');
+        if (r && typeof r.new_total === 'number') s += ' <span class="dim">(' + r.new_total.toLocaleString() + ')</span>';
+        return s;
+      },
+    },
+    'award_treasure': {
+      glyph: '\\u29C9',  // ⧉
+      summary: (i) => {
+        const parts = [];
+        for (const d of ['gp','ep','sp','cp']) if (i[d]) parts.push(i[d] + ' ' + d);
+        return parts.length ? parts.join(', ') : 'treasure';
+      },
+    },
+    'update_coin': {
+      glyph: '\\u29C9',
+      summary: (i) => {
+        const parts = [];
+        for (const d of ['gp','ep','sp','cp']) {
+          if (i[d] != null && i[d] !== 0) {
+            const sign = i[d] > 0 ? 'pos' : 'neg';
+            parts.push('<span class="' + sign + '">' + (i[d] > 0 ? '+' : '') + i[d] + ' ' + d + '</span>');
+          }
+        }
+        return parts.length ? parts.join(', ') : 'coin update';
+      },
+    },
+    'add_inventory': {
+      glyph: '\\u25C8',  // ◈
+      summary: (i) => {
+        const who = i.character || '?';
+        const item = i.item || '?';
+        const qty = i.qty || i.quantity || 1;
+        return esc(who) + ' &larr; ' + esc(item) + (qty > 1 ? ' <b>&times;' + qty + '</b>' : '');
+      },
+    },
+    'consume': {
+      glyph: '\\u25C8',
+      summary: (i) => {
+        const who = i.character || '?';
+        const item = i.item || '?';
+        const qty = i.qty || 1;
+        return esc(who) + ' uses <b>' + esc(item) + '</b>' + (qty > 1 ? ' &times;' + qty : '');
+      },
+    },
+    'advance_time': {
+      glyph: '\\u29D6',  // ⧖
+      summary: (i) => '<b>+' + (i.minutes ?? '?') + ' min</b>',
+    },
+    'advance_calendar': {
+      glyph: '\\u29D6',
+      summary: (i) => {
+        const d = i.days ?? '?';
+        return '<b>+' + d + ' day' + (d === 1 ? '' : 's') + '</b>';
+      },
+    },
+    'set_time': {
+      glyph: '\\u29D6',
+      summary: (i) => '<b>' + (i.hour != null ? String(i.hour).padStart(2,'0') + ':' + String(i.minute || 0).padStart(2,'0') : '?') + '</b>',
+    },
+    'introduce_npc': {
+      glyph: '\\u2766',  // ❦
+      summary: (i, r) => {
+        const desc = [i.race, i.gender].filter(Boolean).join(' ');
+        let s = 'NPC <span class="dim">' + esc(desc || '?') + '</span>';
+        if (r && r.name) s += ' &rarr; <b>' + esc(r.name) + '</b>';
+        return s;
+      },
+    },
+    'reaction': {
+      glyph: '\\u2766',
+      summary: (i, r) => {
+        let s = 'Reaction';
+        if (i.npc) s += ' <span class="dim">' + esc(i.npc) + '</span>';
+        if (r && (r.attitude || r.reaction)) s += ' &rarr; <b>' + esc(r.attitude || r.reaction) + '</b>';
+        return s;
+      },
+    },
+    'morale_check': {
+      glyph: '\\u2766',
+      summary: (i, r) => {
+        let s = 'Morale';
+        if (r) {
+          if (r.broke === true || r.broken === true || r.success === false) s += ' &rarr; <b class="neg">broke</b>';
+          else if (r.broke === false || r.success === true) s += ' &rarr; <b class="pos">held</b>';
+        }
+        return s;
+      },
+    },
+    'next_turn': {
+      glyph: '\\u29D6',
+      summary: (i, r) => {
+        if (r && r.round != null) return 'Round <b>' + r.round + '</b>' + (r.actor ? ' <span class="dim">' + esc(r.actor) + '</span>' : '');
+        return 'next turn';
+      },
+    },
+    'add_world_map_feature': {
+      glyph: '\\u2316',  // ⌖
+      summary: (i) => 'map feature: <b>' + esc((i.dsl_fragment || '').slice(0, 60)) + '</b>',
+    },
+  };
+  // Aliases: pairs that share the same renderer.
+  TOOL_PRETTY.apply_combat_damage = TOOL_PRETTY.apply_damage;
+  TOOL_PRETTY.apply_combat_heal   = TOOL_PRETTY.apply_heal;
+
+  function renderPrettySummary(name, input, result) {
+    const fmt = TOOL_PRETTY[name];
+    if (!fmt) return null;
+    return '<span class="tool-glyph">' + fmt.glyph + '</span>'
+         + '<span class="tool-pretty">' + fmt.summary(input || {}, result) + '</span>';
+  }
+
   function summarizeArgs(input) {
     if (!input || typeof input !== 'object') return '';
     const keys = Object.keys(input).slice(0, 4);
@@ -3225,14 +3443,18 @@ _PLAY_HTML = """
     const det = document.createElement('details');
     det.className = 'turn tool';
     const name = shortToolName(block.name);
-    const argsPreview = summarizeArgs(block.input);
-    const argSuffix = argsPreview ? '(' + argsPreview + ')' : '()';
     const inputJson = JSON.stringify(block.input || {}, null, 2);
+
+    // Prefer a custom pretty summary when one exists; otherwise fall back
+    // to the original name(arg-preview) layout.
+    const pretty = renderPrettySummary(name, block.input, null);
+    const summaryInner = pretty
+      ? pretty
+      : ('<span class="tool-name">' + esc(name) + '</span>'
+       + '<span class="tool-args">' + esc(summarizeArgs(block.input) ? '(' + summarizeArgs(block.input) + ')' : '()') + '</span>');
+
     det.innerHTML =
-        '<summary>'
-      +   '<span class="tool-name">' + esc(name) + '</span>'
-      +   '<span class="tool-args">' + esc(argSuffix) + '</span>'
-      + '</summary>'
+        '<summary>' + summaryInner + '</summary>'
       + '<div class="tool-body">'
       +   '<div class="tool-section">'
       +     '<div class="tool-section-label">Input</div>'
@@ -3249,18 +3471,34 @@ _PLAY_HTML = """
       log.appendChild(det);
     }
     log.scrollTop = log.scrollHeight;
-    if (block.id) toolElements.set(block.id, det);
+    if (block.id) toolElements.set(block.id, {el: det, name: name, input: block.input || {}});
     return det;
   }
 
   function fillToolResult(toolUseId, content, isError) {
-    const det = toolElements.get(toolUseId);
-    if (!det) return;
+    const entry = toolElements.get(toolUseId);
+    if (!entry) return;
+    const det = entry.el;
+
+    // Body: always show the raw result text in the expandable section.
     const resultEl = det.querySelector('.tool-result');
-    if (!resultEl) return;
     const text = renderToolResult(content);
-    resultEl.textContent = text || '(empty)';
-    if (isError) resultEl.classList.add('tool-error');
+    if (resultEl) {
+      resultEl.textContent = text || '(empty)';
+      if (isError) resultEl.classList.add('tool-error');
+    }
+
+    // Summary: re-render with the parsed result so e.g. a roll updates from
+    // "1d20" to "1d20 → 17". Skip if there's no formatter for this tool.
+    if (TOOL_PRETTY[entry.name]) {
+      let parsed = null;
+      try { parsed = text ? JSON.parse(text) : null; } catch (e) { /* leave null */ }
+      const summary = det.querySelector('summary');
+      if (summary) {
+        const re = renderPrettySummary(entry.name, entry.input, parsed);
+        if (re) summary.innerHTML = re;
+      }
+    }
   }
 
   function startThinking() {
