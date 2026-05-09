@@ -6,6 +6,7 @@ import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 import _campaign as _c
+from tools import homebrew_classes as _hb
 
 BASE_DIR = Path(__file__).parent.parent
 
@@ -148,88 +149,119 @@ def register(mcp):
 
     @mcp.tool()
     def class_lookup(class_name: str, level: int = 0) -> dict:
-        """Look up AD&D 2e class progression data.
+        """Look up AD&D 2e class progression data. Searches PHB classes
+        (global/2e.db) first, then homebrew classes (global/homebrew/classes/*.json).
+
         If level > 0: returns that level's stats (THAC0, saves, spell slots, XP required,
-        XP to next level). Also returns special abilities gained at that level.
+        XP to next level). Also returns special abilities for the class.
         If level == 0: returns class overview (hit die, prime requisite, XP table summary,
         and all special abilities).
-        class_name: Fighter, Mage, Cleric, Thief, Ranger, Paladin, Druid, Bard, etc."""
+        class_name: Fighter, Mage, Cleric, Thief, Ranger, Paladin, Druid, Bard, Barbarian, ..."""
+        # Try PHB DB first.
         db_path = _find_db(_2E_DB_CANDIDATES)
-        if db_path is None:
-            return {"error": "2e.db not found. Run tools/build_2e_db.py first."}
+        cls_row = None
+        level_rows: list = []
+        source = "phb"
+        homebrew_extras: dict = {}
 
-        conn = sqlite3.connect(str(db_path))
-        conn.row_factory = sqlite3.Row
-        try:
-            cls_row = conn.execute(
-                "SELECT * FROM classes WHERE name LIKE ? COLLATE NOCASE LIMIT 1",
-                (f"%{class_name}%",),
-            ).fetchone()
-            if cls_row is None:
-                return {"error": f"No class matching '{class_name}' found."}
-
-            class_id = cls_row["id"]
-            special_abilities = json.loads(cls_row["special_abilities"] or "[]")
-            prime_req = cls_row["prime_requisite"]
+        if db_path is not None:
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
             try:
-                prime_req = json.loads(prime_req) if prime_req else []
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-            if level > 0:
-                lvl_row = conn.execute(
-                    "SELECT * FROM class_levels WHERE class_id=? AND level=?",
-                    (class_id, level),
+                cls_row = conn.execute(
+                    "SELECT * FROM classes WHERE name LIKE ? COLLATE NOCASE LIMIT 1",
+                    (f"%{class_name}%",),
                 ).fetchone()
-                if lvl_row is None:
-                    return {"error": f"No data for {cls_row['name']} level {level}."}
+                if cls_row is not None:
+                    level_rows = list(conn.execute(
+                        "SELECT * FROM class_levels WHERE class_id=? ORDER BY level",
+                        (cls_row["id"],),
+                    ).fetchall())
+            finally:
+                conn.close()
 
-                next_row = conn.execute(
-                    "SELECT xp_required FROM class_levels WHERE class_id=? AND level=?",
-                    (class_id, level + 1),
-                ).fetchone()
+        # Fall back to homebrew if PHB miss.
+        if cls_row is None:
+            hb = _hb.get_homebrew(class_name)
+            if hb is None:
+                return {"error": f"No class matching '{class_name}' found in PHB or homebrew."}
+            cls_row = hb
+            level_rows = hb.get("level_rows", [])
+            source = "homebrew"
+            homebrew_extras = {
+                k: hb[k] for k in (
+                    "ability_requirements", "allowed_races", "allowed_alignments",
+                    "allowed_armor", "weapon_specialization", "casts_spells",
+                    "base_movement_rate", "weapon_proficiency_slots",
+                    "nonweapon_proficiency_slots", "progression_tables",
+                    "source", "source_url",
+                ) if hb.get(k) is not None
+            }
 
-                spell_slots = json.loads(lvl_row["spell_slots"]) if lvl_row["spell_slots"] else None
-                turn_undead = json.loads(lvl_row["turn_undead"]) if lvl_row["turn_undead"] else None
+        # Decode common fields (works for both sqlite Row and homebrew dict)
+        def _g(row, key):
+            try:
+                return row[key]
+            except (KeyError, IndexError):
+                return None
 
-                return {
-                    "class":        cls_row["name"],
-                    "level":        level,
-                    "xp_required":  lvl_row["xp_required"],
-                    "xp_next_level": next_row["xp_required"] if next_row else "max level",
-                    "hit_dice":     lvl_row["hit_dice"],
-                    "attacks":      lvl_row["attacks"],
-                    "thac0":        lvl_row["thac0"],
-                    "saving_throws": {
-                        "paralysis_poison_death": lvl_row["save_paralysis"],
-                        "rod_staff_wand":         lvl_row["save_rsw"],
-                        "petrify_polymorph":      lvl_row["save_petrify"],
-                        "breath_weapon":          lvl_row["save_breath"],
-                        "spell":                  lvl_row["save_spell"],
-                    },
-                    "spell_slots":  spell_slots,
-                    "turn_undead":  turn_undead,
-                    "special_abilities": special_abilities,
-                }
-            else:
-                # Overview: XP table
-                level_rows = conn.execute(
-                    "SELECT level, xp_required, hit_dice, thac0 FROM class_levels WHERE class_id=? ORDER BY level",
-                    (class_id,),
-                ).fetchall()
-                xp_table = [
-                    {"level": r["level"], "xp": r["xp_required"], "hd": r["hit_dice"], "thac0": r["thac0"]}
-                    for r in level_rows
-                ]
-                return {
-                    "class":             cls_row["name"],
-                    "hit_die":           cls_row["hit_die"],
-                    "prime_requisite":   prime_req,
-                    "special_abilities": special_abilities,
-                    "xp_table":          xp_table,
-                }
-        finally:
-            conn.close()
+        special_abilities = json.loads(_g(cls_row, "special_abilities") or "[]")
+        prime_req = _g(cls_row, "prime_requisite")
+        try:
+            prime_req = json.loads(prime_req) if prime_req else []
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if level > 0:
+            lvl_row = next((r for r in level_rows if int(_g(r, "level") or 0) == level), None)
+            if lvl_row is None:
+                return {"error": f"No data for {_g(cls_row, 'name')} level {level}."}
+            next_row = next((r for r in level_rows if int(_g(r, "level") or 0) == level + 1), None)
+
+            spell_slots = json.loads(_g(lvl_row, "spell_slots")) if _g(lvl_row, "spell_slots") else None
+            turn_undead = json.loads(_g(lvl_row, "turn_undead")) if _g(lvl_row, "turn_undead") else None
+
+            result = {
+                "class":         _g(cls_row, "name"),
+                "level":         level,
+                "xp_required":   _g(lvl_row, "xp_required"),
+                "xp_next_level": _g(next_row, "xp_required") if next_row else "max level",
+                "hit_dice":      _g(lvl_row, "hit_dice"),
+                "attacks":       _g(lvl_row, "attacks"),
+                "thac0":         _g(lvl_row, "thac0"),
+                "saving_throws": {
+                    "paralysis_poison_death": _g(lvl_row, "save_paralysis"),
+                    "rod_staff_wand":         _g(lvl_row, "save_rsw"),
+                    "petrify_polymorph":      _g(lvl_row, "save_petrify"),
+                    "breath_weapon":          _g(lvl_row, "save_breath"),
+                    "spell":                  _g(lvl_row, "save_spell"),
+                },
+                "spell_slots":       spell_slots,
+                "turn_undead":       turn_undead,
+                "special_abilities": special_abilities,
+                "source":            source,
+            }
+            if homebrew_extras:
+                result["homebrew"] = homebrew_extras
+            return result
+
+        # Overview
+        xp_table = [
+            {"level": _g(r, "level"), "xp": _g(r, "xp_required"),
+             "hd": _g(r, "hit_dice"), "thac0": _g(r, "thac0")}
+            for r in level_rows
+        ]
+        result = {
+            "class":             _g(cls_row, "name"),
+            "hit_die":           _g(cls_row, "hit_die"),
+            "prime_requisite":   prime_req,
+            "special_abilities": special_abilities,
+            "xp_table":          xp_table,
+            "source":            source,
+        }
+        if homebrew_extras:
+            result["homebrew"] = homebrew_extras
+        return result
 
     @mcp.tool()
     def generate_treasure(treasure_types: str) -> dict:

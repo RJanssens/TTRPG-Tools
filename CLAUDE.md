@@ -28,6 +28,7 @@ The DM simulates a world. The DM does not tell a story with the player as protag
 - Have NPCs behave conveniently — they act in their own interest, always
 - Say "you can try!" when the honest answer is "that won't work"
 - Escalate a local problem into a world-spanning conspiracy unprompted
+- Connect unrelated adventures through recurring NPCs, shared antagonists, or treasure that feeds the main plot
 
 **On player plans:** A plan that wouldn't work doesn't work. Don't quietly adjust the world to make it succeed. Say why it failed and let the player decide what to do next.
 
@@ -45,6 +46,21 @@ Stakes must be proportional to character level:
 "You find a mysterious letter" → the hook resolves within a day's travel, not a voyage across the world. Shadowy organisations, chosen-one prophecies, and ancient conspiracies require the player to actively pursue them — never push them uninvited.
 
 Prefer: someone is missing, a location is dangerous, a merchant needs an escort, a crime needs solving. Concrete and immediate beats abstract and epic at low levels.
+
+---
+
+## Independent Plots
+
+The world is many unrelated stories happening at once. The DM simulates a world; the DM does not write a novel with a unified throughline. Most threads do not connect.
+
+**Failure modes — all forbidden:**
+
+- **Cross-contamination.** Placing NPCs, factions, or hooks from one storyline into an unrelated module or side adventure. If the party runs I3 Pharaoh for XP, do not put main-campaign NPCs in its first chamber.
+- **Conspiracy creep.** Revealing that ostensibly unrelated villains all secretly serve the main antagonist. Most evil in the world is not connected. A bandit lord is just a bandit lord; a cult is its own cult.
+- **Fetch-quest collapse.** Reframing a self-contained adventure as "the artefact here turns out to be needed for the main quest." Modules produce module-relevant treasure. They do not exist to feed the central plot.
+- **Small recurring cast.** Reusing the same handful of NPCs as recurring villains or allies across unrelated locations. The world has thousands of people. A new face for a new place is the default; reappearances must be earned by geography or the party's own prior choices, not narrative convenience.
+
+If the player says "we want XP, not plot" — believe them. Run the module straight. Do not improvise connections. Do not foreshadow.
 
 ---
 
@@ -231,6 +247,55 @@ Use two-level location hierarchy:
 
 ---
 
+## World Maps
+
+The campaign can hold one or more **world maps** authored in a Structurizr-style DSL (`campaigns/<active>/maps/<slug>.map`). Each map describes kingdoms, cities, roads, terrain, rivers, POIs and (optionally) detailed city layouts and dungeon overviews. The same DSL produces multiple GeoJSON **views** at different scopes, rendered in the dashboard at `/maps/<slug>/<view>` with Leaflet.
+
+**When to use a map:** the party is travelling overland and geography matters; you want to visualise a kingdom's territory, a road network, or a town layout; you need to record the position of an event (sandstorm, ambush, sighting) on the map.
+
+**Don't use a map for** a single tactical encounter — that's `combat_map`'s job (5ft grid, walls, doors).
+
+### Authoring
+
+Build maps incrementally as locations come into play:
+- `create_world_map(slug)` — stamp an empty workspace skeleton.
+- `add_world_map_feature(slug, dsl_fragment)` — append one feature block to the model. Useful when a new city, road, or POI shows up in play.
+- `update_world_map(slug, dsl)` — overwrite the whole DSL (for bulk edits).
+- `remove_world_map_feature(slug, name)` — delete a feature; rejected if anything still references it.
+
+A minimum feature looks like:
+```
+city orlane { at 398,224; pop 100; in geoff; description "Farming village." }
+road south-trade { from hochoch; to orlane; surface dirt }
+terrain rushmoors { polygon 350,200 380,180 390,260 360,280; biome marsh }
+```
+
+**Generic feature properties** allowed on any feature: `description "..."`, `tags [a, b, c]`, `doc locations/<slug>.md` (soft link, not validated). **Reserved kinds:** `kingdom`, `city`, `road`, `river`, `lake`, `terrain`, `poi`, `building`, `street`, `dungeon`, `room`, `passage`. Buildings and rooms take either `at x,y` + `size w,h` (axis-aligned rectangle) or an explicit `polygon`.
+
+**Style overrides** live in a `styles { … }` block at workspace level (defaults) or inside a specific `view { … }` (per-view override). Selectors: by kind (`city`), kind + property (`terrain.biome=desert`, `city.pop>1000`), or tag (`[walled]`). Built-in defaults cover common biomes (marsh, forest, hills, desert, mountain, plains, tundra, jungle).
+
+**Includes** are fully supported — `!include shared/orlane-buildings.map` works at any nesting depth, including inside `contains { }`.
+
+### Querying
+
+- `list_world_maps()` — slugs in this campaign.
+- `list_world_map_views(slug)` — view names + their scope, include, units.
+- `get_world_map(slug, format='dsl')` — read the source.
+- `get_world_map(slug, format='geojson', view=...)` — compiled GeoJSON.
+- `compile_world_map_view(slug, view)` — force-recompile and write a static `<slug>.<view>.geojson` artifact alongside the DSL.
+
+### Distance and routing
+
+- `world_map_distance_direct(slug, a, b)` — Euclidean. `a`/`b` are feature idents OR `'x,y'` literals.
+- `world_map_distance_via_roads(slug, a, b)` — shortest road path. Both ends must be cities. Returns total distance, the city path, and the roads traversed. Edge weights use surface multipliers (paved 0.8, dirt 1.0, track 1.2, trail 1.5, rough 1.8).
+- `world_map_nearest(slug, point, kind, n)` — N nearest features of `kind` to `point`. Useful for "which city is closest to the party?".
+
+### Party position
+
+- `place_party_on_map(slug, x, y, label="")` — writes a separate `<slug>.party.geojson` overlay, rendered above all map layers. Call it whenever the party moves between locations on the world map. Coordinates use the same authoring frame as the DSL.
+
+---
+
 ## Dashboard
 
 Run `python3 dashboard.py [--port 5000]` for the web interface:
@@ -239,6 +304,7 @@ Run `python3 dashboard.py [--port 5000]` for the web interface:
 - `/log` — session chronicle
 - `/characters` — NPC index with portraits
 - `/locations` — two-level location browser
+- `/maps` — world-map index (per-slug Leaflet views with kind-toggle layers)
 - `/sheets/<slug>` — character sheet
 
 ---

@@ -18,12 +18,14 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.parent
 DB_PATH = BASE_DIR / "global" / "2e.db"
 
-SPELLS_URL = "https://raw.githubusercontent.com/brandonm4/2ERPGDB/master/2E/spells.json"
+SPELLS_URL  = "https://raw.githubusercontent.com/brandonm4/2ERPGDB/master/2E/spells.json"
 CLASSES_URL = "https://raw.githubusercontent.com/brandonm4/2ERPGDB/master/2E/classes.json"
+ITEMS_URL   = "https://raw.githubusercontent.com/brandonm4/2ERPGDB/master/2E/items.json"
 
 # Allow local overrides (set by caller or pre-downloaded)
-SPELLS_CACHE = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+SPELLS_CACHE  = Path(sys.argv[1]) if len(sys.argv) > 1 else None
 CLASSES_CACHE = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+ITEMS_CACHE   = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 
 
 def fetch_json(url: str, cache: Path | None) -> dict | list:
@@ -190,6 +192,93 @@ def build_classes(conn: sqlite3.Connection, data: dict) -> int:
     return total_levels
 
 
+_ITEM_RARITY: dict[str, int] = {
+    "armor":                    0,
+    "weapon_melee":             0,
+    "weapon_ranged":            0,
+    "weapon_ammo":              0,
+    "misc_equipment":           0,
+    "provisions":               0,
+    "clothing":                 0,
+    "item_food_lodging":        0,
+    "services":                 0,
+    "animals":                  0,
+    "tack_harness":             0,
+    "scroll":                   10,
+    "potion":                   15,
+    "wand":                     30,
+    "ring":                     45,
+    "rod":                      55,
+    "staff":                    60,
+    "magic_item_armor_special": 50,
+    "magic_item_weapon_special":50,
+}
+
+
+def build_items(conn: sqlite3.Connection, data: dict) -> int:
+    conn.execute("DROP TABLE IF EXISTS items")
+    conn.execute("""
+        CREATE TABLE items (
+            id          INTEGER PRIMARY KEY,
+            name        TEXT NOT NULL COLLATE NOCASE,
+            item_type   TEXT,
+            cost        TEXT,
+            weight      TEXT,
+            description TEXT,
+            source      TEXT,
+            rarity      INTEGER DEFAULT 0,
+            ac          INTEGER,
+            size        TEXT,
+            weapon_type TEXT,
+            speed       INTEGER,
+            damage_sm   TEXT,
+            damage_l    TEXT,
+            rof         TEXT,
+            range_s     TEXT,
+            range_m     TEXT,
+            range_l     TEXT,
+            xp_value    INTEGER
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_name ON items(name COLLATE NOCASE)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_type ON items(item_type)")
+
+    all_items: list[dict] = []
+    for section in ("armor", "weapons", "items", "magic_items"):
+        all_items.extend(data.get(section, []))
+
+    rows = []
+    for item in all_items:
+        itype = item.get("itemType", "")
+        default_rarity = _ITEM_RARITY.get(itype, 65 if itype.startswith("misc_magic") else 0)
+        rows.append((
+            item.get("id"),
+            item.get("name", ""),
+            itype,
+            item.get("cost"),
+            str(item.get("weight", "")) or None,
+            item.get("description"),
+            item.get("source"),
+            default_rarity,
+            _int_or_none(item.get("ac")),
+            item.get("size"),
+            item.get("type"),
+            _int_or_none(item.get("speed")),
+            item.get("damage_sm"),
+            item.get("damage_l"),
+            item.get("rof"),
+            item.get("range_s"),
+            item.get("range_m"),
+            item.get("range_l"),
+            _int_or_none(item.get("xpValue")),
+        ))
+    conn.executemany(
+        "INSERT OR IGNORE INTO items VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    return len(rows)
+
+
 def _int_or_none(v) -> int | None:
     if v is None:
         return None
@@ -203,8 +292,9 @@ def main():
     print(f"Building {DB_PATH}")
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    spell_data   = fetch_json(SPELLS_URL, SPELLS_CACHE)
+    spell_data   = fetch_json(SPELLS_URL,  SPELLS_CACHE)
     classes_data = fetch_json(CLASSES_URL, CLASSES_CACHE)
+    items_data   = fetch_json(ITEMS_URL,   ITEMS_CACHE)
 
     conn = sqlite3.connect(str(DB_PATH))
     try:
@@ -213,6 +303,8 @@ def main():
             print(f"  Inserted {n_spells} spells")
             n_levels = build_classes(conn, classes_data)
             print(f"  Inserted {n_levels} class level rows")
+            n_items = build_items(conn, items_data)
+            print(f"  Inserted {n_items} items")
         print(f"Done → {DB_PATH}")
     finally:
         conn.close()

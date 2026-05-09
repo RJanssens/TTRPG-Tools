@@ -15,64 +15,23 @@ The actual minute-by-minute decrement happens in tools/log.py advance_time
 import sqlite3
 from pathlib import Path
 import _campaign as _c
+from tools import item_weights as _iw
 
 BASE_DIR = Path(__file__).parent.parent
 _2E_DB = BASE_DIR / "global" / "2e.db"
 
-# STR → (light, moderate, heavy, severe) load thresholds in lbs (PHB Table 1 / quick ref).
-# Caller may pass intermediate STR; we use the floor of the bracket.
-_STR_BANDS = {
-    3:  (5,   10,  15,  20),
-    5:  (10,  20,  30,  45),
-    7:  (20,  35,  45,  65),
-    9:  (30,  45,  65,  85),
-    11: (40,  55,  85,  115),
-    13: (50,  75,  105, 140),
-    15: (65,  90,  130, 170),
-    17: (85,  120, 175, 240),
-    18: (110, 160, 235, 335),
-    19: (485, 535, 635, 785),
-}
+# PHB Table 47 STR bands and the encumbrance calculator are in
+# tools/item_weights.py so the dashboard and the MCP tool report identically.
+_str_thresholds = _iw.str_band_for
 
 
-def _str_thresholds(strength: int) -> tuple[int, int, int, int]:
-    """Return (light, moderate, heavy, severe) cap weights for a STR score."""
-    keys = sorted(_STR_BANDS.keys())
-    # Find largest key ≤ strength
-    pick = keys[0]
-    for k in keys:
-        if k <= strength:
-            pick = k
-        else:
-            break
-    return _STR_BANDS[pick]
+def _item_weight(name: str, conn: sqlite3.Connection | None = None) -> float:
+    """Resolve an inventory string to its weight in pounds. Honors
+    INVENTORY_ALIASES, PHB_OVERRIDES, and the 'x N' qty suffix.
 
-
-def _item_weight(name: str) -> float:
-    """Look up an item's weight in 2e.db (returns 0 if unknown).
-    Best-effort — strips quantity prefixes and matches partially."""
-    if not _2E_DB.exists():
-        return 0.0
-    # Strip leading numbers and common prefixes
-    cleaned = name.strip().lstrip("0123456789x ").strip()
-    if not cleaned:
-        return 0.0
-    try:
-        conn = sqlite3.connect(str(_2E_DB))
-        row = conn.execute(
-            "SELECT weight FROM items WHERE name LIKE ? COLLATE NOCASE LIMIT 1",
-            (f"%{cleaned}%",),
-        ).fetchone()
-        conn.close()
-        if row and row[0] is not None:
-            try:
-                # weight may be string ('3', '1/2', '*'); accept numeric only
-                return float(str(row[0]).strip())
-            except ValueError:
-                return 0.0
-    except sqlite3.Error:
-        return 0.0
-    return 0.0
+    See tools/item_weights.py for resolution order. Pass a sqlite3 connection
+    to amortize open cost across many lookups."""
+    return _iw.item_weight(name, conn=conn)
 
 
 _LIGHT_DEFAULTS = {
@@ -266,9 +225,12 @@ def register(mcp):
         consumables, vs their STR encumbrance bands.
 
         Returns total weight, applicable band (light/moderate/heavy/severe),
-        movement-rate penalty, and a per-item breakdown. Items with no DB
-        match return 0 weight (the DM can override by setting weight on the
-        item via item_update).
+        movement-rate penalty, and a per-item breakdown with weight source.
+
+        Resolution honors PHB Chapter 6 weights, item-name aliases (e.g.
+        'longsword' → 'Long sword'), and 'x N' quantity suffixes. Items with
+        no PHB or DB match return 0 lb and source='unknown'; override via
+        item_update if needed.
 
         Use after major loot pickups, before long marches, and when the player
         argues 'I don't have to drop the chest'."""
@@ -279,46 +241,15 @@ def register(mcp):
         if key is None:
             return {"error": f"Character '{character}' not found."}
 
-        ab = char.get("ability_scores") or {}
-        strength = int(ab.get("str", 10))
-
-        breakdown: list[dict] = []
-        total = 0.0
-
-        # Static inventory (free-form strings on the character file)
-        for raw in char.get("inventory", []):
-            item_str = str(raw)
-            w = _item_weight(item_str)
-            total += w
-            breakdown.append({"item": item_str, "qty": 1, "weight_lb": w})
-
-        # Tracked consumables (state.consumables[key] = {item: qty})
-        bag = state.get("consumables", {}).get(key, {})
-        for item_name, qty in bag.items():
-            w = _item_weight(item_name) * qty
-            total += w
-            breakdown.append({"item": item_name, "qty": qty, "weight_lb": w})
-
-        light, moderate, heavy, severe = _str_thresholds(strength)
-        if total <= light:
-            band, penalty = "light", 0
-        elif total <= moderate:
-            band, penalty = "moderate", -3
-        elif total <= heavy:
-            band, penalty = "heavy", -6
-        elif total <= severe:
-            band, penalty = "severe", -9
-        else:
-            band, penalty = "overloaded", -12
-
+        enc = _iw.compute_encumbrance(char, state, key)
         return {
-            "character":      label,
-            "strength":       strength,
-            "total_weight":   round(total, 1),
-            "thresholds":     {"light": light, "moderate": moderate, "heavy": heavy, "severe": severe},
-            "band":           band,
-            "movement_penalty": penalty,
-            "items":          breakdown,
+            "character":        label,
+            "strength":         enc["strength"],
+            "total_weight":     enc["weight"],
+            "thresholds":       enc["thresholds"],
+            "band":             enc["band"],
+            "movement_penalty": enc["penalty"],
+            "items":            enc["items"],
         }
 
     @mcp.tool()

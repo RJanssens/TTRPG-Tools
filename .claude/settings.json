@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "mcp__ttrpg__*"
+    ]
+  },
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sid=$(python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get(\"session_id\",\"\"))'); [ -n \"$sid\" ] && python3 tools/export_session.py --session \"$sid\" -o \"campaigns/_session-logs/$sid.md\" 2>/dev/null || true",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

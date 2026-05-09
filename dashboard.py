@@ -9,9 +9,14 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from datetime import datetime
+
 from flask import Flask, Response, abort, jsonify, render_template_string, request, send_from_directory
 
 import _campaign as _c
+from tools import export_session as _export
+from tools import item_weights as _iw
+from tools import homebrew_classes as _hb
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -65,6 +70,142 @@ def _reload_cfg() -> None:
     cfg.clear()
     cfg.update(fresh)
     _cfg_mtime = m
+
+
+def _combat_hp_overrides() -> dict:
+    """If a combat session is active, return a dict mapping party-character
+    keys to live HP from combat_state.json so /party (and the status line)
+    show current HP during combat instead of stale state.json values."""
+    if not cfg:
+        return {}
+    cs_path = cfg["_dir"] / "combat_state.json"
+    if not cs_path.exists():
+        return {}
+    try:
+        cs = json.loads(cs_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not cs.get("active"):
+        return {}
+    out: dict = {}
+    for c in cs.get("combatants", []):
+        if c.get("side") != "party":
+            continue
+        key = c.get("key")
+        if key:
+            out[key] = c.get("hp")
+    return out
+
+
+def _combat_effects_overrides() -> dict:
+    """Return {character_key: [effect_dict, ...]} for party members in an
+    active combat session. Empty dict if no combat is active."""
+    if not cfg:
+        return {}
+    cs_path = cfg["_dir"] / "combat_state.json"
+    if not cs_path.exists():
+        return {}
+    try:
+        cs = json.loads(cs_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not cs.get("active"):
+        return {}
+    out: dict = {}
+    for c in cs.get("combatants", []):
+        if c.get("side") != "party":
+            continue
+        key = c.get("key")
+        effects = c.get("effects") or []
+        if key and effects:
+            out[key] = effects
+    return out
+
+
+_class_xp_cache: dict[str, list[int]] = {}
+
+# 2e kits and common synonyms map onto their PHB base class for XP-table
+# lookup. The kits use the base class's progression in the published rules.
+_CLASS_ALIASES: dict[str, str] = {
+    "barbarian":   "Fighter",   # Complete Barbarian's Handbook (Fighter kit)
+    "berserker":   "Fighter",
+    "cavalier":    "Fighter",
+    "gladiator":   "Fighter",
+    "samurai":     "Fighter",
+    "wizard":      "Mage",
+    "necromancer": "Specialist Mage",
+    "abjurer":     "Specialist Mage",
+    "conjurer":    "Specialist Mage",
+    "diviner":     "Specialist Mage",
+    "enchanter":   "Specialist Mage",
+    "illusionist": "Specialist Mage",
+    "invoker":     "Specialist Mage",
+    "transmuter":  "Specialist Mage",
+    "monk":        "Cleric",    # Scarlet Brotherhood / OA-style monk uses Priest table
+    "assassin":    "Thief",     # 2e: Assassin kit of Thief
+    "swashbuckler":"Thief",
+}
+
+
+def _class_xp_table(cls: str) -> list[int]:
+    """Return [xp_required at level 1, level 2, ...] for a class.
+
+    Resolution order:
+      1. Homebrew classes (global/homebrew/classes/*.json) — preferred so
+         home-brewed entries win over aliases.
+      2. PHB classes (global/2e.db).
+      3. Kit→base alias fallback (legacy; will be empty for classes whose
+         homebrew JSON has been authored).
+    Empty list if nothing matches. Process-cached."""
+    key = (cls or "").strip().lower()
+    if not key:
+        return []
+    if key in _class_xp_cache:
+        return _class_xp_cache[key]
+
+    table: list[int] = _hb.homebrew_xp_table(key)
+    if not table:
+        candidates = [key]
+        if key in _CLASS_ALIASES:
+            candidates.append(_CLASS_ALIASES[key].lower())
+        try:
+            conn = _db(_2E_DB)
+            for candidate in candidates:
+                row = conn.execute(
+                    "SELECT id FROM classes WHERE lower(name) = ? LIMIT 1", (candidate,),
+                ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        "SELECT id FROM classes WHERE lower(name) LIKE ? LIMIT 1",
+                        (candidate + "%",),
+                    ).fetchone()
+                if row is not None:
+                    for r in conn.execute(
+                        "SELECT xp_required FROM class_levels WHERE class_id=? ORDER BY level",
+                        (row["id"],),
+                    ).fetchall():
+                        table.append(int(r["xp_required"]))
+                    break
+        except sqlite3.Error:
+            table = []
+
+    _class_xp_cache[key] = table
+    return table
+
+
+# Encumbrance bands (PHB Table 47) and computation live in tools/item_weights.py.
+# These thin wrappers inject the dashboard's cached sqlite connection.
+def _item_weight_resolve(name: str) -> dict:
+    return _iw.resolve_weight(name, conn=_db(_2E_DB))
+
+
+def _item_weight_lookup(name: str) -> float:
+    return _item_weight_resolve(name)["lb"]
+
+
+def _encumbrance_band(char: dict, state: dict, key: str) -> dict:
+    """Compute encumbrance for a character. See item_weights.compute_encumbrance."""
+    return _iw.compute_encumbrance(char, state, key, conn=_db(_2E_DB))
 
 
 @app.before_request
@@ -218,6 +359,100 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     border-radius: 4px;
     border: 1px solid #4a3828;
   }}
+  .party-card {{ display: flex; gap: 16px; align-items: flex-start; }}
+  .party-portrait {{
+    width: 110px; height: 110px;
+    object-fit: cover;
+    border-radius: 4px;
+    border: 1px solid #4a3828;
+    flex-shrink: 0;
+  }}
+  .party-body {{ flex: 1; min-width: 0; }}
+  .party-body h2 {{ margin-top: 0; }}
+  .spell-ready {{ color: #d4c5a9; }}
+  .spell-cast  {{ color: #6a5a48; }}
+  .memorized {{ margin: 8px 0; }}
+  .spell-level {{ margin: 4px 0 6px; }}
+  .spell-level-head {{
+    font-size: 0.88em;
+    color: #c8a96e;
+    margin: 4px 0 2px;
+    border-bottom: 1px dotted #4a3828;
+  }}
+  .spell-list {{
+    list-style: disc;
+    margin: 2px 0 4px 22px;
+    padding: 0;
+  }}
+  .spell-list li {{ margin: 1px 0; line-height: 1.35; }}
+  .effect-chip {{
+    display: inline-block;
+    background: #1a2a3a;
+    border: 1px solid #3a5a7a;
+    border-radius: 3px;
+    padding: 2px 8px;
+    margin: 2px 2px 2px 0;
+    font-size: 0.85em;
+    color: #a0c0e0;
+  }}
+  .light-chip {{
+    display: inline-block;
+    background: #3a2818;
+    border: 1px solid #6a4828;
+    border-radius: 3px;
+    padding: 2px 8px;
+    margin: 2px 2px 2px 0;
+    font-size: 0.85em;
+    color: #e8c080;
+  }}
+  .light-chip.guttering {{
+    background: #3a2418;
+    border-color: #b56a3a;
+    color: #ff8a6a;
+  }}
+  .enc-card {{ margin-top: 16px; }}
+  .enc-bar {{
+    height: 10px;
+    background: #1a1510;
+    border: 1px solid #4a3828;
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 6px 0 10px;
+  }}
+  .enc-fill {{ height: 100%; transition: width .3s; }}
+  .enc-bands {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+  }}
+  .enc-band {{
+    background: #1a1510;
+    border: 1px solid #4a3828;
+    border-radius: 3px;
+    padding: 6px 8px;
+    font-size: 0.85em;
+    text-align: center;
+  }}
+  .enc-band-name {{
+    display: block;
+    color: #8a7a60;
+    text-transform: capitalize;
+    font-size: 0.85em;
+  }}
+  .enc-band-cap {{ display: block; color: #d4c5a9; }}
+  .enc-band-active {{
+    border-color: #c8a96e;
+    background: #2a2018;
+  }}
+  .enc-band-active .enc-band-name {{ color: #c8a96e; }}
+  .enc-items {{ margin: 12px 0 4px; font-size: 0.92em; }}
+  .enc-items th {{ font-weight: normal; color: #c8a96e; }}
+  .enc-items td, .enc-items th {{ padding: 4px 8px; }}
+  .enc-items tfoot td {{ border-top: 1px solid #4a3828; background: #1a1510; }}
+  @media (max-width: 480px) {{
+    .party-card {{ flex-direction: column; }}
+    .party-portrait {{ width: 100%; height: auto; max-width: 200px; }}
+  }}
   .clearfix::after {{ content: ''; display: table; clear: both; }}
   .muted {{ color: #8a7a60; font-size: 0.9em; }}
   pre {{ background: #110e0a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }}
@@ -249,6 +484,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/world">World</a>
   <a href="/quests">Quests</a>
   <a href="/log">Chronicle</a>
+  <a href="/sessions">Sessions</a>
   <a href="/characters">Characters</a>
   <a href="/locations">Locations</a>
   <a href="/monsters">Monsters</a>
@@ -256,6 +492,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/classes">Classes</a>
   <a href="/items">Items</a>
   <a href="/combat">Combat</a>
+  <a href="/maps">Maps</a>
 </nav>
 <div class="container">
 {body}
@@ -603,6 +840,10 @@ def party():
     state = _c.load_state(cfg)
     campaign_name = cfg.get("name", "Campaign")
     characters = cfg.get("characters", {})
+    combat_hp = _combat_hp_overrides()
+    combat_effects = _combat_effects_overrides()
+    image_index = _load_image_index()
+    light_sources = state.get("light_sources", []) or []
 
     coin = state.get("coin", {})
     coin_parts = []
@@ -619,14 +860,102 @@ def party():
     for key, char in characters.items():
         cstate = state.get("characters", {}).get(key, {})
         hp_max = char.get("hp_max", 0)
-        hp_cur = cstate.get("hp", hp_max)
+        hp_cur = combat_hp.get(key, cstate.get("hp", hp_max))
         label = char.get("label", key)
         cls = char.get("cls", "")
+        level = int(char.get("level", 1) or 1)
+        ac = char.get("ac")
+        thac0 = char.get("thac0")
         xp = cstate.get("xp", 0)
         conditions = cstate.get("conditions", [])
 
         bar = _hp_bar(hp_cur, hp_max)
         cond_tags = "".join(f'<span class="tag">{html.escape(c)}</span>' for c in conditions)
+
+        # Portrait
+        portrait = _find_portrait(label, image_index, key)
+        portrait_html = ""
+        if portrait:
+            fn = html.escape(portrait["filename"])
+            portrait_html = (
+                f'<img src="/images/{fn}" alt="{html.escape(label)}" '
+                f'class="party-portrait">'
+            )
+
+        # Class line: "Cleric 3"
+        cls_line = html.escape(cls)
+        if cls and level:
+            cls_line = f"{html.escape(cls)} {level}"
+
+        # Combat stats line
+        stats_parts = []
+        if ac is not None:
+            stats_parts.append(f"<strong>AC:</strong> {html.escape(str(ac))}")
+        if thac0 is not None:
+            stats_parts.append(f"<strong>THAC0:</strong> {html.escape(str(thac0))}")
+        stats_html = ""
+        if stats_parts:
+            stats_html = "<p>" + " &nbsp;·&nbsp; ".join(stats_parts) + "</p>"
+
+        # XP / next-level threshold
+        xp_table = _class_xp_table(cls)
+        next_xp_str = ""
+        if xp_table and level < len(xp_table):
+            next_xp = xp_table[level]   # xp_required for (level+1) — table is 0-indexed by level
+            if next_xp > xp:
+                next_xp_str = f' <span class="muted">/ {next_xp:,}</span>'
+            else:
+                next_xp_str = ' <span class="tag" style="background:#1a3a18;color:#6db86d">level up</span>'
+
+        # Active effects (combat-only)
+        effects = combat_effects.get(key, [])
+        effects_html = ""
+        if effects:
+            chips = []
+            for eff in effects:
+                name = html.escape(eff.get("name", "?"))
+                dur = eff.get("duration", 0)
+                mods = []
+                for k, sym in (("to_hit", "hit"), ("ac", "AC"), ("dmg", "dmg"), ("save", "save")):
+                    v = eff.get(k)
+                    if v:
+                        mods.append(f"{sym}{int(v):+d}")
+                mod_str = f" <span class='muted'>({', '.join(mods)})</span>" if mods else ""
+                chips.append(
+                    f'<span class="effect-chip">{name} '
+                    f'<span class="muted">{dur}r</span>{mod_str}</span>'
+                )
+            effects_html = "<p><strong>Effects:</strong> " + " ".join(chips) + "</p>"
+
+        # Encumbrance — only show when not "light" (the common case)
+        enc = _encumbrance_band(char, state, key)
+        enc_html = ""
+        if enc["band"] != "light":
+            color = {
+                "moderate":   "#c8a96e",
+                "heavy":      "#e0a060",
+                "severe":     "#e08060",
+                "overloaded": "#ff6a4a",
+            }.get(enc["band"], "#c8a96e")
+            penalty_str = f" ({enc['penalty']:+d} move)" if enc["penalty"] else ""
+            enc_html = (
+                f'<p><strong>Load:</strong> '
+                f'<span style="color:{color}">{html.escape(enc["band"])}</span> '
+                f'<span class="muted">— {enc["weight"]} lb{penalty_str}</span></p>'
+            )
+
+        # Light source carried by this character
+        carried_lit = [s for s in light_sources
+                       if s.get("lit") and s.get("holder") == key]
+        light_chip_html = ""
+        if carried_lit:
+            chips = []
+            for s in carried_lit:
+                mins = s.get("minutes_remaining", 0)
+                cls_chip = "light-chip guttering" if mins <= 5 else "light-chip"
+                stype = html.escape(s.get("type", "?"))
+                chips.append(f'<span class="{cls_chip}">{stype} · {mins} min</span>')
+            light_chip_html = "<p><strong>Carrying:</strong> " + " ".join(chips) + "</p>"
 
         # Spell slots
         slot_cfg = char.get("spell_slots") or {}
@@ -637,16 +966,92 @@ def party():
             slot_lines.append(f"L{lvl}: {remaining}/{max_count}")
         slots_html = ""
         if slot_lines:
-            slots_html = "<p><strong>Spells:</strong> " + " &nbsp; ".join(slot_lines) + "</p>"
+            slots_html = "<p><strong>Slots:</strong> " + " &nbsp; ".join(slot_lines) + "</p>"
+
+        # Memorized spells, itemized and grouped by spell level.
+        memorized = cstate.get("memorized_spells") or []
+        mem_html = ""
+        if memorized:
+            # Resolve missing levels from the spell DB (entries are often
+            # stored with level=0 by the MCP layer).
+            unknown_names = sorted({
+                (s.get("name") if isinstance(s, dict) else str(s)).strip()
+                for s in memorized
+                if not (isinstance(s, dict) and int(s.get("level", 0) or 0) > 0)
+            })
+            unknown_names = [n for n in unknown_names if n]
+            level_map: dict[str, int] = {}
+            if unknown_names:
+                placeholders = ",".join("?" * len(unknown_names))
+                rows = _db(_2E_DB).execute(
+                    f"SELECT name, level FROM spells WHERE lower(name) IN ({placeholders})",
+                    [n.lower() for n in unknown_names],
+                ).fetchall()
+                level_map = {r["name"].lower(): int(r["level"]) for r in rows}
+
+            by_level: dict[int, list[dict]] = {}
+            for s in memorized:
+                if isinstance(s, dict):
+                    name = (s.get("name") or "").strip()
+                    lvl = int(s.get("level", 0) or 0)
+                    cast = bool(s.get("cast"))
+                else:
+                    name, lvl, cast = str(s).strip(), 0, False
+                if lvl <= 0:
+                    lvl = level_map.get(name.lower(), 0)
+                by_level.setdefault(lvl, []).append({"name": name, "cast": cast})
+
+            def _render_spell_li(s: dict) -> str:
+                name_esc = html.escape(s["name"])
+                if s["cast"]:
+                    return (
+                        f'<li class="spell-cast" title="cast">'
+                        f'<s>{name_esc}</s></li>'
+                    )
+                return f'<li class="spell-ready">{name_esc}</li>'
+
+            blocks = []
+            for lvl in sorted(by_level):
+                spells_at_level = by_level[lvl]
+                ready_at_level = sum(1 for s in spells_at_level if not s["cast"])
+                total_at_level = len(spells_at_level)
+                label_lvl = f"Level {lvl}" if lvl > 0 else "Unleveled"
+                items = "".join(_render_spell_li(s) for s in spells_at_level)
+                blocks.append(
+                    f'<div class="spell-level">'
+                    f'<div class="spell-level-head">{label_lvl} '
+                    f'<span class="muted">({ready_at_level}/{total_at_level})</span></div>'
+                    f'<ul class="spell-list">{items}</ul>'
+                    f'</div>'
+                )
+
+            ready_count = sum(1 for s in memorized
+                              if not (isinstance(s, dict) and s.get("cast")))
+            total_count = len(memorized)
+            mem_html = (
+                f'<div class="memorized">'
+                f'<p style="margin-bottom:4px"><strong>Memorized</strong> '
+                f'<span class="muted">({ready_count}/{total_count} ready)</span></p>'
+                f'{"".join(blocks)}'
+                f'</div>'
+            )
 
         cards.append(
-            f'<div class="card">'
+            f'<div class="card party-card clearfix">'
+            f'{portrait_html}'
+            f'<div class="party-body">'
             f'<h2><a href="/sheets/{html.escape(key)}">{html.escape(label)}</a></h2>'
-            f"<p class='muted'>{html.escape(cls)}</p>"
+            f"<p class='muted'>{cls_line}</p>"
             f"<p><strong>HP:</strong> {html.escape(str(hp_cur))}/{html.escape(str(hp_max))} {bar}</p>"
-            f"<p><strong>XP:</strong> {xp:,}</p>"
+            f"{stats_html}"
+            f"<p><strong>XP:</strong> {xp:,}{next_xp_str}</p>"
+            f"{enc_html}"
+            f"{light_chip_html}"
+            f"{effects_html}"
             f"{slots_html}"
+            f"{mem_html}"
             f'<p>{cond_tags}</p>'
+            f'</div>'
             f"</div>"
         )
 
@@ -931,6 +1336,235 @@ def log():
     return render(f"{campaign_name} — Chronicle", body)
 
 
+def _sessions_dir() -> Path:
+    return _export.PROJECTS_DIR / _export.encode_cwd(Path(__file__).parent)
+
+
+def _session_teaser(path: Path, max_chars: int = 140) -> str:
+    """First non-empty player prompt in the session, trimmed."""
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "user":
+                    continue
+                content = rec.get("message", {}).get("content", "")
+                if not isinstance(content, str):
+                    continue
+                cleaned = _export.clean_user_text(content)
+                if cleaned:
+                    cleaned = cleaned.replace("\n", " ").strip()
+                    return cleaned[:max_chars] + ("…" if len(cleaned) > max_chars else "")
+    except OSError:
+        pass
+    return ""
+
+
+@app.route("/sessions")
+def sessions_index():
+    sdir = _sessions_dir()
+    if not sdir.is_dir():
+        body = "<h1>Sessions</h1><p class='muted'>No transcript directory found.</p>"
+        return render("Sessions", body)
+
+    files = _export.list_sessions(sdir)
+    rows = []
+    for p in files:
+        st = p.stat()
+        when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+        size_kb = st.st_size / 1024
+        teaser = html.escape(_session_teaser(p))
+        sid = p.stem
+        rows.append(
+            f'<tr>'
+            f'<td><a href="/sessions/{html.escape(sid)}"><code>{html.escape(sid[:8])}</code></a></td>'
+            f'<td class="muted">{when}</td>'
+            f'<td class="muted" style="text-align:right">{size_kb:,.1f} KB</td>'
+            f'<td>{teaser or "<span class=muted>—</span>"}</td>'
+            f'</tr>'
+        )
+
+    if not rows:
+        body = "<h1>Sessions</h1><p class='muted'>No sessions yet.</p>"
+    else:
+        body = (
+            "<h1>Sessions</h1>"
+            f"<p class='muted'>{len(rows)} session(s). Newest first.</p>"
+            '<div class="card"><table style="width:100%;border-collapse:collapse">'
+            "<thead><tr>"
+            '<th style="text-align:left;padding:6px 8px">ID</th>'
+            '<th style="text-align:left;padding:6px 8px">When</th>'
+            '<th style="text-align:right;padding:6px 8px">Size</th>'
+            '<th style="text-align:left;padding:6px 8px">First prompt</th>'
+            "</tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></div>"
+        )
+    return render("Sessions", body)
+
+
+@app.route("/sessions/<sid>")
+def session_view(sid: str):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+        abort(404)
+    sdir = _sessions_dir()
+    path = sdir / f"{sid}.jsonl"
+    if not path.is_file():
+        abort(404)
+
+    include_tools = request.args.get("tools", "0") not in ("0", "", "false")
+    dm_only = request.args.get("dm_only", "0") not in ("0", "", "false")
+
+    turns = _export.parse_session(path)
+    md = _export.render(
+        turns,
+        include_tools=include_tools,
+        dm_only=dm_only,
+        player_only=False,
+        show_timestamps=True,
+    )
+    content_html = _markdown_to_html(md)
+
+    when = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    toggle = (
+        f'<a href="/sessions/{html.escape(sid)}?tools={"0" if include_tools else "1"}'
+        f'{"&dm_only=1" if dm_only else ""}">'
+        f'{"Hide" if include_tools else "Show"} tool calls</a> · '
+        f'<a href="/sessions/{html.escape(sid)}?dm_only={"0" if dm_only else "1"}'
+        f'{"&tools=1" if include_tools else ""}">'
+        f'{"Show all turns" if dm_only else "DM only"}</a>'
+    )
+
+    body = (
+        f"<h1>Session <code>{html.escape(sid[:8])}</code></h1>"
+        f"<p class='muted'>{when} · {toggle} · "
+        f'<a href="/sessions">← back to index</a></p>'
+        f'<div class="card">{content_html}</div>'
+    )
+    return render(f"Session {sid[:8]}", body)
+
+
+def _encumbrance_html(char: dict, state: dict, key: str) -> str:
+    """Render a 'Carrying' block: total weight, band, and STR-keyed thresholds.
+    Returns an empty string if the character has no usable ability scores."""
+    ab = char.get("ability_scores") or {}
+    if "str" not in ab:
+        return ""
+
+    enc = _encumbrance_band(char, state, key)
+    band = enc["band"]
+    weight = enc["weight"]
+    penalty = enc["penalty"]
+    th = enc["thresholds"]
+    strength = enc["strength"]
+
+    band_color = {
+        "light":      "#6db86d",
+        "moderate":   "#c8a96e",
+        "heavy":      "#e0a060",
+        "severe":     "#e08060",
+        "overloaded": "#ff6a4a",
+    }.get(band, "#c8a96e")
+    penalty_str = f" &nbsp;·&nbsp; {penalty:+d} move" if penalty else ""
+
+    # Bar — fraction of severe (overloaded cap). Cap at 1.0.
+    severe_cap = max(th["severe"], 1)
+    pct = min(100.0, weight / severe_cap * 100.0)
+    pct_color = band_color
+
+    rows = []
+    for tname in ("light", "moderate", "heavy", "severe"):
+        cap = th[tname]
+        active = " enc-band-active" if band == tname else ""
+        rows.append(
+            f'<div class="enc-band{active}">'
+            f'<span class="enc-band-name">{tname}</span>'
+            f'<span class="enc-band-cap">≤ {cap} lb</span>'
+            f'</div>'
+        )
+
+    # Per-item breakdown
+    item_rows = []
+    for it in enc["items"]:
+        name = html.escape(it["item"])
+        qty = it["qty"]
+        unit = it["unit_lb"]
+        sub = it["weight_lb"]
+        wsrc = it.get("source", "unknown")
+
+        if wsrc == "unknown":
+            unit_cell = '<span class="muted" title="not found in 2e item DB or PHB">— lb</span>'
+            sub_cell  = '<span class="muted">—</span>'
+        elif wsrc == "negligible":
+            unit_cell = '<span class="muted" title="PHB lists this as negligible (10/lb)">≈ 0</span>'
+            sub_cell  = '<span class="muted">—</span>'
+        else:
+            unit_cell = f'{unit:g} lb'
+            sub_cell  = f'<strong>{sub:g} lb</strong>'
+
+        src_chips = []
+        if it.get("origin") == "consumable":
+            src_chips.append('<span class="tag" style="font-size:.7em">consumable</span>')
+        if wsrc == "phb":
+            src_chips.append('<span class="tag" style="font-size:.7em;background:#1a2a3a;color:#a0c0e0;border-color:#3a5a7a" title="weight from PHB Chapter 6">PHB</span>')
+        elif wsrc == "alias":
+            src_chips.append('<span class="tag" style="font-size:.7em" title="resolved via alias to a canonical 2e item">alias</span>')
+        chips_html = " ".join(src_chips)
+
+        qty_cell = f'×{qty}' if qty > 1 else ''
+        item_rows.append(
+            f'<tr>'
+            f'<td>{name} {chips_html}</td>'
+            f'<td style="text-align:right">{qty_cell}</td>'
+            f'<td style="text-align:right">{unit_cell}</td>'
+            f'<td style="text-align:right">{sub_cell}</td>'
+            f'</tr>'
+        )
+    item_table = ""
+    if item_rows:
+        item_table = (
+            '<table class="enc-items">'
+            '<thead><tr>'
+            '<th>Item</th>'
+            '<th style="text-align:right">Qty</th>'
+            '<th style="text-align:right">Unit</th>'
+            '<th style="text-align:right">Weight</th>'
+            '</tr></thead>'
+            f'<tbody>{"".join(item_rows)}</tbody>'
+            '<tfoot><tr>'
+            '<td colspan="3" style="text-align:right"><strong>Total</strong></td>'
+            f'<td style="text-align:right"><strong>{weight} lb</strong></td>'
+            '</tr></tfoot>'
+            '</table>'
+        )
+    else:
+        item_table = ('<p class="muted" style="font-size:.85em">'
+                      'No items recorded.</p>')
+
+    return (
+        f'<div class="card enc-card">'
+        f'<h3 style="margin-top:0">Carrying</h3>'
+        f'<p><strong>Weight:</strong> {weight} lb '
+        f'&nbsp;·&nbsp; <span style="color:{band_color}"><strong>{band}</strong></span>'
+        f'{penalty_str} '
+        f'<span class="muted">(STR {strength})</span></p>'
+        f'<div class="enc-bar"><div class="enc-fill" '
+        f'style="width:{pct:.1f}%;background:{pct_color}"></div></div>'
+        f'<div class="enc-bands">{"".join(rows)}</div>'
+        f'{item_table}'
+        f'<p class="muted" style="font-size:.8em;margin-top:6px">'
+        f'Sources: 2e item DB · <span class="tag" style="font-size:.7em">alias</span> matched to canonical name · '
+        f'<span class="tag" style="font-size:.7em;background:#1a2a3a;color:#a0c0e0;border-color:#3a5a7a">PHB</span> '
+        f'sourced from PHB Chapter 6 · '
+        f'“≈ 0” means PHB lists the item as negligible (10 per pound) · '
+        f'“— lb” means no match — override with <code>item_update</code>.</p>'
+        f'</div>'
+    )
+
+
 @app.route("/sheets/<slug>")
 def character_sheet(slug: str):
     campaign_name = cfg.get("name", "Campaign")
@@ -957,11 +1591,19 @@ def character_sheet(slug: str):
             f'</div>'
         )
 
+    # Encumbrance block — only for characters known to the campaign config
+    char = cfg.get("characters", {}).get(slug) or cfg.get("npcs", {}).get(slug)
+    enc_html = ""
+    if char:
+        state = _c.load_state(cfg)
+        enc_html = _encumbrance_html(char, state, slug)
+
     body = (
         f'<div class="card clearfix">'
         f"{portrait_html}"
         f"{content_html}"
         f"</div>"
+        f"{enc_html}"
     )
     return render(f"{html.escape(name)} — {html.escape(campaign_name)}", body)
 
@@ -1432,27 +2074,56 @@ def spell_detail(spell_id: int):
 
 @app.route("/classes")
 def classes():
-    if not _2E_DB.exists():
+    # Collect (name, slug, hit_die, pr_str, is_homebrew) entries from both sources.
+    entries: list[tuple[str, str, str, str, bool, str]] = []
+
+    if _2E_DB.exists():
+        conn = _db(_2E_DB)
+        for r in conn.execute(
+            "SELECT name, hit_die, prime_requisite FROM classes ORDER BY name"
+        ).fetchall():
+            slug = re.sub(r"[^a-z0-9]+", "-", r["name"].lower()).strip("-")
+            try:
+                pr = json.loads(r["prime_requisite"] or "[]")
+                pr_str = ", ".join(p.capitalize() for p in pr) if pr else "—"
+            except (json.JSONDecodeError, TypeError):
+                pr_str = str(r["prime_requisite"] or "—")
+            entries.append((r["name"], slug, r["hit_die"] or "—", pr_str, False, ""))
+
+    for hb in _hb.list_homebrew():
+        if hb.get("_error"):
+            entries.append((
+                hb.get("name", "?"), hb.get("slug", "?"),
+                "—", "—", True,
+                f'<span class="tag" style="background:#3a1818;color:#c87a7a">load error</span>',
+            ))
+            continue
+        try:
+            pr = json.loads(hb.get("prime_requisite") or "[]")
+            pr_str = ", ".join(p.capitalize() for p in pr) if pr else "—"
+        except (json.JSONDecodeError, TypeError):
+            pr_str = "—"
+        entries.append((
+            hb["name"], hb["slug"], hb.get("hit_die") or "—",
+            pr_str, True, "",
+        ))
+
+    if not entries:
         body = "<h1>Classes</h1><p class='muted'>2e.db not found. Run tools/build_2e_db.py.</p>"
         return render("Classes", body)
 
-    conn = _db(_2E_DB)
-    rows = conn.execute("SELECT id, name, hit_die, prime_requisite FROM classes ORDER BY name").fetchall()
+    entries.sort(key=lambda e: e[0].lower())
 
     cards = []
-    for r in rows:
-        slug = re.sub(r"[^a-z0-9]+", "-", r["name"].lower()).strip("-")
-        try:
-            pr = json.loads(r["prime_requisite"] or "[]")
-            pr_str = ", ".join(pr).capitalize() if pr else "—"
-        except (json.JSONDecodeError, TypeError):
-            pr_str = str(r["prime_requisite"] or "—")
+    for name, slug, hit_die, pr_str, is_homebrew, extra in entries:
+        tag = ('<span class="tag" style="background:#1a3a18;color:#6db86d;'
+               'border-color:#3a6a3a">homebrew</span>' if is_homebrew else "")
         cards.append(
             f'<div class="card" style="padding:10px 14px">'
             f'<h2 style="margin:0 0 2px">'
-            f'<a href="/classes/{html.escape(slug)}">{html.escape(r["name"])}</a></h2>'
+            f'<a href="/classes/{html.escape(slug)}">{html.escape(name)}</a> {tag}{extra}</h2>'
             f'<p class="muted" style="margin:0;font-size:.9em">'
-            f'Hit Die: {html.escape(r["hit_die"] or "—")} &nbsp;·&nbsp; '
+            f'Hit Die: {html.escape(hit_die)} &nbsp;·&nbsp; '
             f'Prime Requisite: {html.escape(pr_str)}'
             f'</p></div>'
         )
@@ -1463,41 +2134,63 @@ def classes():
 
 @app.route("/classes/<slug>")
 def class_detail(slug: str):
-    if not _2E_DB.exists():
-        abort(404)
+    # Try homebrew first; the JSON files are authoritative for any class they
+    # define, so a homebrew Barbarian wins over any same-named PHB entry.
+    cls_row: dict | None = None
+    level_rows: list = []
+    is_homebrew = False
+    homebrew_extras: dict = {}
 
-    name_pattern = slug.replace("-", " ")
-    conn = _db(_2E_DB)
-    cls_row = conn.execute(
-        "SELECT * FROM classes WHERE lower(replace(name,' ','-')) = ? "
-        "OR name LIKE ? COLLATE NOCASE LIMIT 1",
-        (slug, f"%{name_pattern}%"),
-    ).fetchone()
+    hb = _hb.get_homebrew(slug)
+    if hb is not None and not hb.get("_error"):
+        cls_row = hb
+        level_rows = hb.get("level_rows", [])
+        is_homebrew = True
+        homebrew_extras = {k: hb.get(k) for k in (
+            "ability_requirements", "allowed_races", "allowed_alignments",
+            "allowed_armor", "weapon_specialization", "casts_spells",
+            "base_movement_rate", "weapon_proficiency_slots",
+            "nonweapon_proficiency_slots", "progression_tables",
+            "source", "source_url",
+        ) if hb.get(k) is not None}
+    elif _2E_DB.exists():
+        name_pattern = slug.replace("-", " ")
+        conn = _db(_2E_DB)
+        cls_row = conn.execute(
+            "SELECT * FROM classes WHERE lower(replace(name,' ','-')) = ? "
+            "OR name LIKE ? COLLATE NOCASE LIMIT 1",
+            (slug, f"%{name_pattern}%"),
+        ).fetchone()
+        if cls_row is not None:
+            level_rows = conn.execute(
+                "SELECT * FROM class_levels WHERE class_id=? ORDER BY level",
+                (cls_row["id"],),
+            ).fetchall()
 
     if cls_row is None:
         abort(404)
 
-    level_rows = conn.execute(
-        "SELECT * FROM class_levels WHERE class_id=? ORDER BY level",
-        (cls_row["id"],),
-    ).fetchall()
+    def _g(row, key):
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return None
 
     try:
-        pr = json.loads(cls_row["prime_requisite"] or "[]")
+        pr = json.loads(_g(cls_row, "prime_requisite") or "[]")
         pr_str = ", ".join(str(p).capitalize() for p in pr) if pr else "—"
     except (json.JSONDecodeError, TypeError):
-        pr_str = str(cls_row["prime_requisite"] or "—")
+        pr_str = str(_g(cls_row, "prime_requisite") or "—")
 
     try:
-        abilities = json.loads(cls_row["special_abilities"] or "[]")
+        abilities = json.loads(_g(cls_row, "special_abilities") or "[]")
     except (json.JSONDecodeError, TypeError):
         abilities = []
 
     # Build XP / progression table
-    has_spells    = any(r["spell_slots"] for r in level_rows)
-    has_turn      = any(r["turn_undead"] for r in level_rows)
+    has_spells = any(_g(r, "spell_slots") for r in level_rows)
 
-    header_cells = "<tr><th>Level</th><th>XP</th><th>HD</th><th>THAC0</th>"
+    header_cells = "<tr><th>Level</th><th>XP</th><th>HD</th><th>THAC0</th><th>Atk</th>"
     header_cells += "<th>Para</th><th>RSW</th><th>Pet</th><th>Brth</th><th>Spell</th>"
     if has_spells:
         header_cells += "<th>Spell Slots</th>"
@@ -1506,25 +2199,27 @@ def class_detail(slug: str):
     tbody = ""
     for r in level_rows:
         slots_str = ""
-        if has_spells and r["spell_slots"]:
+        if has_spells and _g(r, "spell_slots"):
             try:
-                slots = json.loads(r["spell_slots"])
+                slots = json.loads(_g(r, "spell_slots"))
                 slots_str = " / ".join(str(v) for k, v in sorted(slots.items()) if v)
             except Exception:
                 slots_str = "—"
 
-        xp = f"{r['xp_required']:,}" if r["xp_required"] is not None else "—"
+        xp_v = _g(r, "xp_required")
+        xp = f"{xp_v:,}" if xp_v is not None else "—"
         tbody += (
             f"<tr>"
-            f"<td>{r['level']}</td>"
+            f"<td>{_g(r, 'level')}</td>"
             f"<td>{xp}</td>"
-            f"<td>{html.escape(r['hit_dice'] or '—')}</td>"
-            f"<td>{r['thac0'] or '—'}</td>"
-            f"<td>{r['save_paralysis'] or '—'}</td>"
-            f"<td>{r['save_rsw'] or '—'}</td>"
-            f"<td>{r['save_petrify'] or '—'}</td>"
-            f"<td>{r['save_breath'] or '—'}</td>"
-            f"<td>{r['save_spell'] or '—'}</td>"
+            f"<td>{html.escape(_g(r, 'hit_dice') or '—')}</td>"
+            f"<td>{_g(r, 'thac0') or '—'}</td>"
+            f"<td>{html.escape(str(_g(r, 'attacks') or '—'))}</td>"
+            f"<td>{_g(r, 'save_paralysis') or '—'}</td>"
+            f"<td>{_g(r, 'save_rsw') or '—'}</td>"
+            f"<td>{_g(r, 'save_petrify') or '—'}</td>"
+            f"<td>{_g(r, 'save_breath') or '—'}</td>"
+            f"<td>{_g(r, 'save_spell') or '—'}</td>"
             + (f"<td>{slots_str or '—'}</td>" if has_spells else "")
             + "</tr>"
         )
@@ -1537,25 +2232,109 @@ def class_detail(slug: str):
         abilities_html = f"<h2>Special Abilities</h2><ul>{items}</ul>"
 
     desc_html = ""
-    if cls_row["description"]:
-        paras = [p.strip() for p in cls_row["description"].split("\n") if p.strip()]
+    if _g(cls_row, "description"):
+        paras = [p.strip() for p in (_g(cls_row, "description") or "").split("\n") if p.strip()]
         desc_html = "".join(f"<p>{html.escape(p)}</p>" for p in paras[:4])
         if len(paras) > 4:
             desc_html += f"<p class='muted'>…{len(paras)-4} more paragraphs</p>"
 
+    # Homebrew kit metadata block
+    hb_meta_html = ""
+    if is_homebrew and homebrew_extras:
+        meta_rows = []
+        if homebrew_extras.get("ability_requirements"):
+            req = ", ".join(f"{k.upper()} {v}" for k, v in homebrew_extras["ability_requirements"].items())
+            meta_rows.append(("Ability Requirements", req))
+        if homebrew_extras.get("allowed_races"):
+            meta_rows.append(("Allowed Races", ", ".join(homebrew_extras["allowed_races"])))
+        if homebrew_extras.get("allowed_alignments"):
+            meta_rows.append(("Allowed Alignments", ", ".join(homebrew_extras["allowed_alignments"])))
+        if homebrew_extras.get("allowed_armor"):
+            meta_rows.append(("Allowed Armor", ", ".join(homebrew_extras["allowed_armor"])))
+        if homebrew_extras.get("base_movement_rate") is not None:
+            meta_rows.append(("Base Movement", str(homebrew_extras["base_movement_rate"])))
+        if homebrew_extras.get("weapon_specialization") is not None:
+            meta_rows.append(("Weapon Specialization", "yes" if homebrew_extras["weapon_specialization"] else "no"))
+        if homebrew_extras.get("casts_spells") is not None:
+            meta_rows.append(("Casts Spells", "yes" if homebrew_extras["casts_spells"] else "no"))
+        wp = homebrew_extras.get("weapon_proficiency_slots") or {}
+        if wp:
+            meta_rows.append(("Weapon Profs", f"{wp.get('initial','?')} initial, +1 per {wp.get('advance_every_levels','?')} levels"))
+        nwp = homebrew_extras.get("nonweapon_proficiency_slots") or {}
+        if nwp:
+            meta_rows.append(("Nonweapon Profs", f"{nwp.get('initial','?')} initial, +1 per {nwp.get('advance_every_levels','?')} levels"))
+        if meta_rows:
+            rows_html = "".join(
+                f"<tr><th style='text-align:left'>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>"
+                for k, v in meta_rows
+            )
+            hb_meta_html = f"<h2>Class Restrictions</h2><div class='card'><table>{rows_html}</table></div>"
+
+    # Kit progression tables (climb%, leap, etc.)
+    prog_extras_html = ""
+    pt = (homebrew_extras.get("progression_tables") or {}) if is_homebrew else {}
+    if pt:
+        blocks = []
+        for tname, tdata in pt.items():
+            by_level = tdata.get("by_level") or {}
+            if not by_level:
+                continue
+            sample_val = next(iter(by_level.values()))
+            if isinstance(sample_val, dict):
+                cols = sorted(sample_val.keys())
+                head = "<th>Level</th>" + "".join(f"<th>{html.escape(c.replace('_',' ').title())}</th>" for c in cols)
+                rows_h = ""
+                for lvl in sorted(by_level, key=lambda k: int(k)):
+                    cells = "".join(f"<td>{html.escape(str(by_level[lvl].get(c, '—')))}</td>" for c in cols)
+                    rows_h += f"<tr><td>{lvl}</td>{cells}</tr>"
+            else:
+                head = "<th>Level</th><th>Value</th>"
+                rows_h = "".join(
+                    f"<tr><td>{lvl}</td><td>{html.escape(str(by_level[lvl]))}</td></tr>"
+                    for lvl in sorted(by_level, key=lambda k: int(k))
+                )
+            desc = tdata.get("description", "")
+            blocks.append(
+                f"<h3 style='margin-top:14px'>{html.escape(tname.replace('_', ' ').title())}</h3>"
+                + (f"<p class='muted'>{html.escape(desc)}</p>" if desc else "")
+                + f"<table><thead><tr>{head}</tr></thead><tbody>{rows_h}</tbody></table>"
+            )
+        if blocks:
+            prog_extras_html = (
+                f"<h2 style='margin-top:20px'>Kit Progression Tables</h2>"
+                f"<div class='card' style='overflow-x:auto'>{''.join(blocks)}</div>"
+            )
+
+    # Source citation for homebrew
+    src_html = ""
+    if is_homebrew:
+        src_text = homebrew_extras.get("source") or "homebrew"
+        src_url = homebrew_extras.get("source_url") or ""
+        if src_url:
+            src_html = (f"<p class='muted'>Source: "
+                        f"<a href='{html.escape(src_url)}'>{html.escape(src_text)}</a></p>")
+        else:
+            src_html = f"<p class='muted'>Source: {html.escape(src_text)}</p>"
+
+    homebrew_tag = ('<span class="tag" style="background:#1a3a18;color:#6db86d;'
+                    'border-color:#3a6a3a">homebrew</span>' if is_homebrew else "")
+
     body = (
         f'<p><a href="/classes">← Classes</a></p>'
-        f'<h1>{html.escape(cls_row["name"])}</h1>'
+        f'<h1>{html.escape(_g(cls_row, "name"))} {homebrew_tag}</h1>'
         f'<div class="card">'
-        f'<p><strong>Hit Die:</strong> {html.escape(cls_row["hit_die"] or "—")} &nbsp;·&nbsp; '
+        f'<p><strong>Hit Die:</strong> {html.escape(_g(cls_row, "hit_die") or "—")} &nbsp;·&nbsp; '
         f'<strong>Prime Requisite:</strong> {html.escape(pr_str)}</p>'
+        + src_html
         + (f"<hr>{desc_html}" if desc_html else "")
         + f'</div>'
-        f'<h2 style="margin-top:20px">Progression</h2>'
-        f'<div class="card" style="overflow-x:auto">{prog_table}</div>'
+        + hb_meta_html
+        + f'<h2 style="margin-top:20px">Progression</h2>'
+        + f'<div class="card" style="overflow-x:auto">{prog_table}</div>'
         + (f'<div class="card">{abilities_html}</div>' if abilities_html else "")
+        + prog_extras_html
     )
-    return render(f'{html.escape(cls_row["name"])} — Classes', body)
+    return render(f'{html.escape(_g(cls_row, "name"))} — Classes', body)
 
 
 # Item routes are defined in dashboard_items.py and registered at the end of
@@ -1696,6 +2475,141 @@ def combat_state():
         except Exception:
             pass
     return jsonify({"active": False})
+
+
+# ---------------------------------------------------------------------------
+# World maps
+# ---------------------------------------------------------------------------
+from tools import world_map as _world_map
+
+
+@app.route("/maps")
+def maps_index():
+    """List all world maps in the active campaign + their views."""
+    try:
+        d = _world_map._maps_dir()
+    except Exception as e:
+        return render("Maps", f'<h1>World Maps</h1><p style="color:#c66">{html.escape(str(e))}</p>')
+
+    items, fragments = [], []
+    for p in sorted(d.glob("*.map")):
+        slug = p.stem
+        if not _world_map._is_workspace_file(p):
+            fragments.append(slug)
+            continue
+        try:
+            ws = _world_map.parse_file(p)
+            view_links = " · ".join(
+                f'<a href="/maps/{html.escape(slug)}/{html.escape(v.name)}">{html.escape(v.name)}</a>'
+                for v in ws.views
+            ) or '<span style="color:#8a7a60">no views</span>'
+            n_features = len(ws.model)
+            items.append(
+                f'<li style="margin:6px 0">'
+                f'<b style="color:#c8a96e">{html.escape(slug)}</b> '
+                f'<span style="color:#8a7a60;font-size:.9em">({n_features} top-level features)</span><br>'
+                f'<span style="margin-left:1em">Views: {view_links}</span>'
+                f'</li>'
+            )
+        except Exception as e:
+            items.append(
+                f'<li><b>{html.escape(slug)}</b> '
+                f'<span style="color:#c66">parse error: {html.escape(str(e))}</span></li>'
+            )
+
+    if not items and not fragments:
+        body = (
+            '<h1>World Maps</h1>'
+            '<p style="color:#8a7a60">No maps yet. Create one with the MCP tool '
+            '<code>create_world_map(slug)</code>, then populate it via '
+            '<code>update_world_map</code> or <code>add_world_map_feature</code>.</p>'
+        )
+    else:
+        body = '<h1>World Maps</h1>'
+        if items:
+            body += '<ul style="list-style:none;padding:0">' + ''.join(items) + '</ul>'
+        if fragments:
+            frag_html = ', '.join(f'<code>{html.escape(s)}</code>' for s in fragments)
+            body += (
+                '<h3 style="margin-top:24px">Include fragments</h3>'
+                '<p style="color:#8a7a60;font-size:.9em">Files without a top-level <code>workspace</code> block. '
+                'These are inlined by other maps via <code>!include</code>: '
+                + frag_html + '</p>'
+            )
+    return render("World Maps", body)
+
+
+@app.route("/maps/<slug>/<view>")
+def map_view(slug, view):
+    """Render a Leaflet view of a world map."""
+    path = _world_map._maps_dir() / f"{_world_map._safe_slug(slug)}.map"
+    if not path.exists():
+        abort(404)
+    try:
+        _world_map.parse_file(path)  # validate before serving
+    except SyntaxError as e:
+        body = (
+            f'<h1>{html.escape(slug)} — {html.escape(view)}</h1>'
+            f'<p style="color:#c66">DSL error: {html.escape(str(e))}</p>'
+            f'<p><a href="/maps">← back to maps</a></p>'
+        )
+        return render(f"Map: {slug}", body)
+
+    data_url  = f"/api/maps/{slug}/{view}.geojson"
+    party_url = f"/api/maps/{slug}/party.geojson"
+    body = (
+        '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" '
+        'integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">'
+        '<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" '
+        'integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>'
+        '<style>'
+        '  .map-layout { display:flex; gap:12px; align-items:stretch; }'
+        '  #worldmap { flex:1; height:75vh; min-width:0; '
+        '              background:#1a1510; border:1px solid #4a3828; border-radius:6px; }'
+        '  #worldmap-sidebar { width:260px; max-height:75vh; overflow-y:auto; '
+        '                      padding:12px; background:#2a2018; border:1px solid #4a3828; border-radius:6px; }'
+        '  .leaflet-popup-content { color:#1a1510; font-family:Georgia,serif; }'
+        '  .leaflet-control-layers { background:#2a2018; color:#d4c5a9; border:1px solid #4a3828; }'
+        '  .leaflet-control-layers-overlays label { color:#d4c5a9; }'
+        '</style>'
+        f'<h1>{html.escape(slug)} <span style="color:#8a7a60;font-size:.7em">— {html.escape(view)}</span></h1>'
+        '<p style="color:#8a7a60;font-size:.9em"><a href="/maps">← all maps</a></p>'
+        '<div class="map-layout">'
+        '  <div id="worldmap"></div>'
+        '  <div id="worldmap-sidebar">Loading…</div>'
+        '</div>'
+        f'<script>'
+        f'window.WORLD_MAP_SLUG  = {json.dumps(slug)};'
+        f'window.WORLD_MAP_VIEW  = {json.dumps(view)};'
+        f'window.WORLD_MAP_DATA  = {json.dumps(data_url)};'
+        f'window.WORLD_MAP_PARTY = {json.dumps(party_url)};'
+        f'</script>'
+        '<script src="/static/world-map.js"></script>'
+    )
+    return render(f"Map: {slug}/{view}", body)
+
+
+@app.route("/api/maps/<slug>/<view>.geojson")
+def map_geojson(slug, view):
+    """Compile-on-demand GeoJSON for a world-map view."""
+    path = _world_map._maps_dir() / f"{_world_map._safe_slug(slug)}.map"
+    if not path.exists():
+        return jsonify({"error": f"map '{slug}' not found"}), 404
+    try:
+        ws = _world_map.parse_file(path)
+        fc = _world_map.compile_view(ws, view)
+    except (SyntaxError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(fc)
+
+
+@app.route("/api/maps/<slug>/party.geojson")
+def map_party_geojson(slug):
+    """Serve the party-position overlay if it exists (404 otherwise)."""
+    overlay = _world_map._maps_dir() / f"{_world_map._safe_slug(slug)}.party.geojson"
+    if not overlay.exists():
+        return jsonify({"error": "no party overlay"}), 404
+    return Response(overlay.read_text(encoding="utf-8"), mimetype="application/json")
 
 
 # ---------------------------------------------------------------------------
