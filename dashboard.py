@@ -1812,17 +1812,24 @@ _PLAY_HTML = """
   .container:has(.play-shell) {
     max-width: none;
     width: 100%;
-    padding-left: 28px;
-    padding-right: 28px;
+    padding: 20px 28px;
+    height: calc(100vh - 50px);   /* viewport minus sticky nav */
+    display: flex;
+    flex-direction: column;
   }
+  /* Suppress the page-level scrollbar on /play — the chat log owns its
+     own scroll. */
+  body:has(.play-shell) { overflow: hidden; }
   .play-shell {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 320px;
+    grid-template-rows: 100%;
     gap: 18px;
-    height: calc(100vh - 110px);
+    flex: 1;
+    min-height: 0;               /* allow inner overflow:auto to actually scroll */
   }
-  .play-main { display: flex; flex-direction: column; min-width: 0; }
-  .play-side { min-width: 0; overflow-y: auto; }
+  .play-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .play-side { min-width: 0; min-height: 0; overflow-y: auto; }
 
   .play-toolbar {
     display: flex;
@@ -1878,43 +1885,40 @@ _PLAY_HTML = """
     min-width: 80px;
   }
 
-  /* Filter strip — toggles which message types are visible. */
-  .play-filters {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0 0 10px;
+  /* Toolbar filter group: three icon-only toggle pills for message-type
+     visibility. Active = type is shown (gold + opaque); inactive = hidden
+     (dim). Tooltip exposes the full label. */
+  .filter-group {
+    display: inline-flex;
+    gap: 4px;
+    margin-left: 4px;
   }
-  .play-filters .filter-label {
-    color: var(--ink-muted);
-    font-family: var(--font-display);
-    text-transform: uppercase;
-    letter-spacing: 0.22em;
-    font-size: 0.66em;
-    margin-right: 4px;
-  }
-  .turn-toggle {
+  .turn-toggle.icon {
+    width: 30px;
+    height: 26px;
+    padding: 0;
     background: transparent;
     border: 1px solid var(--rule);
     border-radius: 2px;
-    padding: 3px 11px;
-    font-family: var(--font-display);
-    font-size: 0.68em;
-    text-transform: uppercase;
-    letter-spacing: 0.18em;
-    cursor: pointer;
     color: var(--ink-muted);
+    font-family: var(--font-body);
+    font-size: 1em;
+    line-height: 1;
+    letter-spacing: 0;
+    cursor: pointer;
+    opacity: 0.45;
     transition: all 180ms ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
-  .turn-toggle::before { content: '○ '; opacity: 0.55; }
-  .turn-toggle.active {
+  .turn-toggle.icon:hover { opacity: 0.85; border-color: var(--rule-hi); }
+  .turn-toggle.icon.active {
+    opacity: 1;
+    color: var(--accent-gold);
     border-color: var(--accent-gold);
-    color: var(--accent-gold-hi);
     background: rgba(200,169,110,0.08);
   }
-  .turn-toggle.active::before { content: '● '; opacity: 1; color: var(--accent-gold); }
-  .turn-toggle:hover { border-color: var(--rule-hi); }
-  .turn-toggle.active:hover { border-color: var(--accent-gold-hi); }
 
   /* Visibility filters applied to .play-log via JS (toggle pills + localStorage). */
   .play-log.hide-tools .turn.tool { display: none; }
@@ -1922,7 +1926,8 @@ _PLAY_HTML = """
   .play-log.hide-player .turn.player { display: none; }
 
   .play-log {
-    flex: 1;
+    flex: 1 1 0;
+    min-height: 0;
     overflow-y: auto;
     background:
       linear-gradient(135deg, rgba(255,220,180,0.022), transparent 50%),
@@ -1980,8 +1985,37 @@ _PLAY_HTML = """
   }
   .turn.dm {
     color: var(--ink-body);
-    white-space: pre-wrap;
   }
+  /* Markdown rendered inside DM turns — scope headings/rules/etc so they
+     don't carry their full-page sizing into the chat log. */
+  .turn.dm > *:first-child { margin-top: 0; }
+  .turn.dm > *:last-child { margin-bottom: 0; }
+  .turn.dm p { margin: 6px 0; }
+  .turn.dm h1, .turn.dm h2, .turn.dm h3, .turn.dm h4 {
+    margin: 12px 0 4px;
+    border-bottom: none;
+    padding: 0;
+  }
+  .turn.dm h1 { font-size: 1.20em; letter-spacing: 0.08em; }
+  .turn.dm h2 { font-size: 1.08em; letter-spacing: 0.06em; }
+  .turn.dm h3 { font-size: 1.0em; letter-spacing: 0.05em; }
+  .turn.dm h4 { font-size: 0.95em; }
+  .turn.dm hr {
+    margin: 14px 0;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--rule-hi), transparent);
+    border: none;
+  }
+  .turn.dm blockquote {
+    margin: 8px 0;
+    padding: 2px 0 2px 14px;
+    border-left: 2px solid var(--accent-gold);
+    color: #c8b88c;
+  }
+  .turn.dm ul, .turn.dm ol { margin: 6px 0 6px 22px; }
+  .turn.dm li { margin: 1px 0; }
+  .turn.dm code { color: var(--accent-gold-hi); }
+  .turn.dm a { color: var(--accent-gold); }
   .turn.tool {
     font-family: var(--font-mono);
     font-size: 0.78em;
@@ -2335,16 +2369,15 @@ _PLAY_HTML = """
     <div class="play-toolbar">
       <h1>Live Play</h1>
       <span class="sid">session<code id="play-sid">…</code></span>
+      <span class="filter-group" role="group" aria-label="Show message types">
+        <button class="turn-toggle icon" data-filter="player" type="button" title="Show player echoes" aria-label="Show player echoes">◇</button>
+        <button class="turn-toggle icon" data-filter="tools"  type="button" title="Show tool calls"     aria-label="Show tool calls">⚙</button>
+        <button class="turn-toggle icon" data-filter="meta"   type="button" title="Show meta lines"     aria-label="Show meta lines">✦</button>
+      </span>
       <span class="spacer"></span>
       <span id="play-status"></span>
       <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
       <button id="play-reset" type="button">New session</button>
-    </div>
-    <div class="play-filters">
-      <span class="filter-label">Show:</span>
-      <button class="turn-toggle" data-filter="player" type="button">Player echoes</button>
-      <button class="turn-toggle" data-filter="tools" type="button">Tool calls</button>
-      <button class="turn-toggle" data-filter="meta" type="button">Meta</button>
     </div>
     <div class="play-log" id="play-log">
       <div class="empty-state">
@@ -2394,6 +2427,94 @@ _PLAY_HTML = """
       {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
+  function renderInline(s) {
+    // s is already HTML-escaped. Order matters: process triple-asterisk
+    // before double, double before single, code spans before italic so the
+    // backticks don't fight asterisk parsing.
+    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+    s = s.replace(/\\*\\*\\*(.+?)\\*\\*\\*/g, '<strong><em>$1</em></strong>');
+    s = s.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
+    s = s.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
+    s = s.replace(/(^|[^\\w])_(.+?)_(?!\\w)/g, '$1<em>$2</em>');
+    s = s.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
+    return s;
+  }
+
+  function renderMarkdown(text) {
+    if (!text) return '';
+    const escaped = esc(text);
+    const lines = escaped.split('\\n');
+    const out = [];
+    let para = [];
+
+    function flushPara() {
+      if (para.length) {
+        out.push('<p>' + renderInline(para.join(' ')) + '</p>');
+        para = [];
+      }
+    }
+
+    let i = 0;
+    while (i < lines.length) {
+      const raw = lines[i];
+      const t = raw.trim();
+
+      if (!t) { flushPara(); i++; continue; }
+
+      const h = /^(#{1,6})\\s+(.+)$/.exec(t);
+      if (h) {
+        flushPara();
+        const lvl = Math.min(h[1].length, 4);
+        out.push('<h' + lvl + '>' + renderInline(h[2]) + '</h' + lvl + '>');
+        i++; continue;
+      }
+
+      if (/^(-{3,}|\\*{3,}|_{3,})$/.test(t)) {
+        flushPara();
+        out.push('<hr>');
+        i++; continue;
+      }
+
+      if (/^>\\s?/.test(t)) {
+        flushPara();
+        const bq = [];
+        while (i < lines.length && /^>\\s?/.test(lines[i].trim())) {
+          bq.push(lines[i].trim().replace(/^>\\s?/, ''));
+          i++;
+        }
+        out.push('<blockquote>' + bq.map(renderInline).join('<br>') + '</blockquote>');
+        continue;
+      }
+
+      if (/^[-*+]\\s+/.test(t)) {
+        flushPara();
+        const items = [];
+        while (i < lines.length && /^[-*+]\\s+/.test(lines[i].trim())) {
+          items.push(lines[i].trim().replace(/^[-*+]\\s+/, ''));
+          i++;
+        }
+        out.push('<ul>' + items.map(it => '<li>' + renderInline(it) + '</li>').join('') + '</ul>');
+        continue;
+      }
+
+      if (/^\\d+\\.\\s+/.test(t)) {
+        flushPara();
+        const items = [];
+        while (i < lines.length && /^\\d+\\.\\s+/.test(lines[i].trim())) {
+          items.push(lines[i].trim().replace(/^\\d+\\.\\s+/, ''));
+          i++;
+        }
+        out.push('<ol>' + items.map(it => '<li>' + renderInline(it) + '</li>').join('') + '</ol>');
+        continue;
+      }
+
+      para.push(t);
+      i++;
+    }
+    flushPara();
+    return out.join('\\n');
+  }
+
   function append(role, text) {
     if (firstAppend) {
       log.innerHTML = '';
@@ -2401,7 +2522,11 @@ _PLAY_HTML = """
     }
     const div = document.createElement('div');
     div.className = 'turn ' + role;
-    div.textContent = text;
+    if (role === 'dm') {
+      div.innerHTML = renderMarkdown(text);
+    } else {
+      div.textContent = text;
+    }
     log.appendChild(div);
     log.scrollTop = log.scrollHeight;
   }
