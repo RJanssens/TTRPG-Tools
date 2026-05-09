@@ -2647,11 +2647,13 @@ _PLAY_HTML = """
         i++; continue;
       }
 
-      if (/^>\\s?/.test(t)) {
+      // Note: block-level detection runs *after* esc(), so a markdown ">"
+      // arrives here as the entity "&gt;". Match that, not literal ">".
+      if (/^&gt;\\s?/.test(t)) {
         flushPara();
         const bq = [];
-        while (i < lines.length && /^>\\s?/.test(lines[i].trim())) {
-          bq.push(lines[i].trim().replace(/^>\\s?/, ''));
+        while (i < lines.length && /^&gt;\\s?/.test(lines[i].trim())) {
+          bq.push(lines[i].trim().replace(/^&gt;\\s?/, ''));
           i++;
         }
         out.push('<blockquote>' + bq.map(renderInline).join('<br>') + '</blockquote>');
