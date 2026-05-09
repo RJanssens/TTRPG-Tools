@@ -1966,12 +1966,17 @@ def sessions_index():
         size_kb = st.st_size / 1024
         teaser = html.escape(_session_teaser(p))
         sid = p.stem
+        sid_safe = html.escape(sid)
         rows.append(
             f'<tr>'
-            f'<td><a href="/sessions/{html.escape(sid)}"><code>{html.escape(sid[:8])}</code></a></td>'
+            f'<td><a href="/sessions/{sid_safe}"><code>{html.escape(sid[:8])}</code></a></td>'
             f'<td class="muted">{when}</td>'
             f'<td class="muted" style="text-align:right">{size_kb:,.1f} KB</td>'
             f'<td>{teaser or "<span class=muted>—</span>"}</td>'
+            f'<td style="text-align:center;width:36px;padding:4px">'
+            f'<button class="session-delete" type="button" data-sid="{sid_safe}" '
+            f'title="Delete session" aria-label="Delete this session">×</button>'
+            f'</td>'
             f'</tr>'
         )
 
@@ -1979,6 +1984,25 @@ def sessions_index():
         body = "<h1>Sessions</h1><p class='muted'>No sessions yet.</p>"
     else:
         body = (
+            "<style>"
+            ".session-delete {"
+            "  width: 24px; height: 24px; padding: 0;"
+            "  border-radius: 50%;"
+            "  background: transparent;"
+            "  border: 1px solid var(--rule);"
+            "  color: var(--ink-muted);"
+            "  font-family: var(--font-body); font-size: 1.0em; line-height: 1;"
+            "  cursor: pointer;"
+            "  display: inline-flex; align-items: center; justify-content: center;"
+            "  opacity: 0.55;"
+            "  transition: opacity 180ms ease, color 180ms ease, border-color 180ms ease, transform 180ms ease;"
+            "}"
+            ".session-delete:hover {"
+            "  opacity: 1; color: #e8a090; border-color: var(--accent-rust);"
+            "  transform: scale(1.08);"
+            "}"
+            ".session-delete:disabled { opacity: 0.3; cursor: not-allowed; }"
+            "</style>"
             "<h1>Sessions</h1>"
             f"<p class='muted'>{len(rows)} session(s). Newest first.</p>"
             '<div class="card"><table style="width:100%;border-collapse:collapse">'
@@ -1987,9 +2011,35 @@ def sessions_index():
             '<th style="text-align:left;padding:6px 8px">When</th>'
             '<th style="text-align:right;padding:6px 8px">Size</th>'
             '<th style="text-align:left;padding:6px 8px">First prompt</th>'
+            '<th style="width:36px"></th>'
             "</tr></thead><tbody>"
             + "".join(rows)
             + "</tbody></table></div>"
+            "<script>(function(){"
+            "document.querySelectorAll('.session-delete').forEach(function(btn){"
+            "  btn.addEventListener('click', async function(e){"
+            "    e.stopPropagation();"
+            "    const sid = btn.dataset.sid;"
+            "    if (!sid) return;"
+            "    if (!confirm('Delete session ' + sid.slice(0,8) + '?')) return;"
+            "    btn.disabled = true;"
+            "    try {"
+            "      const r = await fetch('/api/sessions/' + encodeURIComponent(sid), {method:'DELETE'});"
+            "      if (!r.ok) {"
+            "        const d = await r.json().catch(()=>({}));"
+            "        alert('Delete failed: ' + (d.error || ('HTTP '+r.status)));"
+            "        return;"
+            "      }"
+            "      const row = btn.closest('tr');"
+            "      if (row) row.remove();"
+            "    } catch (err) {"
+            "      alert('Delete failed: ' + err);"
+            "    } finally {"
+            "      btn.disabled = false;"
+            "    }"
+            "  });"
+            "});"
+            "})();</script>"
         )
     return render("Sessions", body)
 
@@ -4888,6 +4938,39 @@ def location_detail(area: str, slug: str):
 def serve_image(filename: str):
     images_dir = cfg["_data_dir"] / "images"
     return send_from_directory(str(images_dir), filename)
+
+
+@app.route("/api/sessions/<sid>", methods=["DELETE"])
+def api_session_delete(sid: str):
+    """Delete a Claude Code session JSONL transcript and the matching
+    campaigns/_session-logs/<sid>.md export if one exists.
+    Validates the session id against the same charset the /sessions/<sid>
+    viewer accepts."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+        return jsonify({"error": "invalid session id"}), 400
+
+    sdir = _sessions_dir()
+    target = sdir / f"{sid}.jsonl"
+    if not target.is_file():
+        return jsonify({"error": "session not found"}), 404
+    try:
+        target.unlink()
+    except OSError as exc:
+        return jsonify({"error": f"transcript delete failed: {exc}"}), 500
+
+    # Best-effort: also remove the corresponding markdown export written by
+    # the SessionEnd hook (campaigns/_session-logs/<sid>.md). Failures here
+    # don't fail the response — the primary JSONL is gone.
+    log_md = Path(__file__).parent / "campaigns" / "_session-logs" / f"{sid}.md"
+    log_removed = False
+    if log_md.is_file():
+        try:
+            log_md.unlink()
+            log_removed = True
+        except OSError:
+            pass
+
+    return jsonify({"ok": True, "deleted": sid, "log_removed": log_removed})
 
 
 @app.route("/api/images/<filename>", methods=["DELETE"])
