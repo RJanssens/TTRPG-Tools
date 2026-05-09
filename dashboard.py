@@ -9,7 +9,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Flask, Response, abort, jsonify, render_template_string, request, send_from_directory
 
@@ -18,6 +18,7 @@ from tools import export_session as _export
 from tools import item_weights as _iw
 from tools import homebrew_classes as _hb
 from tools import dm_session as _dm
+from tools import images as _img
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -222,259 +223,521 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+  :root {{
+    --bg-base:        #14100b;
+    --bg-deep:        #0a0805;
+    --bg-card:        #221a12;
+    --bg-card-hi:     #2a2018;
+    --bg-rec:         #0f0b07;
+    --bg-nav:         rgba(13, 10, 7, 0.92);
+    --ink-body:       #e8d8b8;
+    --ink-display:    #f0d9a4;
+    --ink-muted:      #8e7e5e;
+    --accent-gold:    #c8a96e;
+    --accent-gold-hi: #f0d196;
+    --accent-rust:    #b56a3a;
+    --accent-blood:   #c83a2a;
+    --accent-cool:    #6a9ec0;
+    --rule:           #3d2c1e;
+    --rule-hi:        #5a4030;
+    --hp-good:        #7ab46e;
+    --hp-warn:        #d4a14a;
+    --hp-bad:         #c8503a;
+    --shadow-deep:    0 10px 30px rgba(0,0,0,.55);
+    --shadow-card:    0 2px 10px rgba(0,0,0,.30);
+    --inset-warm:     inset 0 1px 0 rgba(220,180,120,0.05);
+    --font-display:   'Cinzel', 'Trajan Pro', Georgia, serif;
+    --font-body:      'EB Garamond', Georgia, 'Times New Roman', serif;
+    --font-mono:      'JetBrains Mono', Menlo, Consolas, monospace;
+  }}
+
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  html {{ scrollbar-color: var(--rule-hi) var(--bg-deep); }}
+  ::selection {{ background: rgba(200,169,110,0.35); color: var(--ink-display); }}
+
   body {{
-    background: #1a1510;
-    color: #d4c5a9;
-    font-family: Georgia, 'Times New Roman', serif;
-    font-size: 16px;
-    line-height: 1.6;
+    background: var(--bg-base);
+    background-image:
+      radial-gradient(ellipse at 18% -10%, rgba(120,80,40,0.16), transparent 55%),
+      radial-gradient(ellipse at 85% 105%, rgba(80,50,25,0.14), transparent 50%),
+      linear-gradient(180deg, #15110c 0%, #100c08 100%);
+    background-attachment: fixed;
+    color: var(--ink-body);
+    font-family: var(--font-body);
+    font-size: 18px;
+    line-height: 1.62;
+    font-feature-settings: "liga", "kern", "onum";
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
   }}
+
+  /* Subtle parchment grain over the entire viewport. */
+  body::before {{
+    content: '';
+    position: fixed; inset: 0;
+    pointer-events: none;
+    z-index: 1;
+    opacity: 0.045;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' seed='4'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0.6 0.6 0.6 0 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  }}
+
   .container {{
-    max-width: 900px;
+    max-width: 980px;
     margin: 0 auto;
-    padding: 20px;
+    padding: 28px 24px 60px;
+    position: relative;
+    z-index: 2;
   }}
+
+  /* ---- Navigation ---- */
   nav {{
-    background: #110e0a;
-    border-bottom: 1px solid #4a3828;
-    padding: 10px 20px;
-    margin-bottom: 24px;
+    background: var(--bg-nav);
+    border-bottom: 1px solid var(--rule);
+    box-shadow: 0 1px 0 rgba(200,169,110,0.04), 0 4px 16px rgba(0,0,0,0.4);
+    padding: 14px 28px;
+    position: sticky; top: 0;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    z-index: 50;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
   }}
   nav a {{
-    color: #c8a96e;
+    color: var(--accent-gold);
     text-decoration: none;
-    margin-right: 18px;
-    font-size: 0.95em;
-    letter-spacing: 0.03em;
+    font-family: var(--font-display);
+    font-size: 0.72em;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    padding: 4px 16px;
+    position: relative;
+    transition: color 180ms ease;
   }}
-  nav a:hover {{ color: #e8c98e; text-decoration: underline; }}
-  h1, h2, h3, h4 {{ color: #c8a96e; margin: 16px 0 8px; }}
-  h1 {{ font-size: 1.8em; border-bottom: 1px solid #4a3828; padding-bottom: 8px; }}
-  h2 {{ font-size: 1.3em; }}
-  h3 {{ font-size: 1.1em; }}
+  nav a:not(:last-child)::after {{
+    content: '';
+    position: absolute;
+    right: 0; top: 28%; bottom: 28%;
+    width: 1px;
+    background: linear-gradient(to bottom, transparent, rgba(200,169,110,0.24), transparent);
+  }}
+  nav a:hover {{ color: var(--accent-gold-hi); }}
+  nav a.is-active {{ color: var(--ink-display); }}
+  nav a.is-active::before {{
+    content: '';
+    position: absolute;
+    left: 14px; right: 14px; bottom: -16px;
+    height: 2px;
+    background: var(--accent-gold);
+  }}
+
+  /* ---- Typography ---- */
+  h1, h2, h3, h4 {{
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    margin: 22px 0 10px;
+  }}
+  h1 {{
+    font-size: 2.05em;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 12px;
+    margin-bottom: 18px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--ink-display);
+  }}
+  h2 {{ font-size: 1.32em; letter-spacing: 0.06em; }}
+  h3 {{ font-size: 1.10em; letter-spacing: 0.05em; color: var(--accent-gold); }}
+  h4 {{ font-size: 0.98em; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-gold); }}
   p {{ margin: 8px 0; }}
   ul, ol {{ margin: 8px 0 8px 24px; }}
-  a {{ color: #c8a96e; }}
-  a:hover {{ color: #e8c98e; }}
+  a {{ color: var(--accent-gold); transition: color 160ms ease; }}
+  a:hover {{ color: var(--accent-gold-hi); }}
+
+  /* ---- Cards & layout ---- */
   .card {{
-    background: #2a2018;
-    border: 1px solid #4a3828;
-    border-radius: 6px;
-    padding: 16px;
-    margin: 8px 0;
+    background:
+      linear-gradient(135deg, rgba(255,220,180,0.020), transparent 45%),
+      linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 18px 22px;
+    margin: 12px 0;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    position: relative;
   }}
   .card h2 {{ margin-top: 0; }}
   .grid {{
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 16px;
+    gap: 18px;
     margin-top: 16px;
   }}
   .grid-item {{
-    background: #2a2018;
-    border: 1px solid #4a3828;
-    border-radius: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
     overflow: hidden;
+    transition: border-color 200ms ease, transform 200ms ease;
   }}
-  .grid-item img {{
-    width: 100%;
-    display: block;
-    border-radius: 4px 4px 0 0;
-  }}
-  .grid-item .caption {{
-    padding: 10px 12px;
-    font-size: 0.9em;
-    color: #b0a080;
-  }}
-  .grid-item .caption strong {{
-    display: block;
-    color: #d4c5a9;
-    margin-bottom: 4px;
-  }}
+  .grid-item:hover {{ border-color: var(--rule-hi); transform: translateY(-2px); }}
+  .grid-item img {{ width: 100%; display: block; border-radius: 3px 3px 0 0; }}
+  .grid-item .caption {{ padding: 12px 14px; font-size: 0.92em; color: var(--ink-muted); }}
+  .grid-item .caption strong {{ display: block; color: var(--ink-body); margin-bottom: 4px; font-family: var(--font-display); font-size: 0.95em; letter-spacing: 0.04em; }}
+
+  /* ---- HP bar (legacy text-block form, kept for back-compat) ---- */
   .hp-bar {{
     display: inline-block;
-    font-family: monospace;
+    font-family: var(--font-mono);
     letter-spacing: 1px;
-    font-size: 0.9em;
+    font-size: 0.88em;
   }}
-  .hp-bar .filled {{ color: #6db86d; }}
-  .hp-bar .empty  {{ color: #5a3a3a; }}
+  .hp-bar .filled {{ color: var(--hp-good); }}
+  .hp-bar .empty  {{ color: #4a2a2a; }}
+
+  /* ---- HP meter (graphical, used by /play sidebar and elsewhere) ---- */
+  .hp-meter {{
+    display: block;
+    height: 8px;
+    background: var(--bg-rec);
+    border: 1px solid var(--rule);
+    border-radius: 1px;
+    overflow: hidden;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
+    position: relative;
+  }}
+  .hp-meter > i {{
+    display: block;
+    height: 100%;
+    background: linear-gradient(to right, var(--hp-bad) 0%, var(--hp-warn) 45%, var(--hp-good) 75%);
+    transition: width 380ms ease;
+  }}
+
+  /* ---- Info bar (e.g. /party header strip) ---- */
   .info-bar {{
-    background: #221a12;
-    border: 1px solid #4a3828;
-    border-radius: 6px;
-    padding: 10px 14px;
-    margin: 0 0 16px 0;
+    background: linear-gradient(to bottom, #1d160f, #16110b);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 12px 16px;
+    margin: 0 0 18px 0;
     display: flex;
     flex-wrap: wrap;
-    gap: 14px 24px;
-    font-size: 0.95em;
+    gap: 14px 26px;
+    font-size: 0.96em;
+    box-shadow: var(--inset-warm);
   }}
-  .info-bar .item strong {{ color: #c8a96e; margin-right: 4px; }}
+  .info-bar .item strong {{ color: var(--accent-gold); margin-right: 6px; font-family: var(--font-display); font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.1em; }}
+
+  /* ---- Clocks (faction timers) ---- */
   .clock {{
     display: inline-block;
-    padding: 4px 10px;
-    border-radius: 3px;
-    border: 1px solid #4a3828;
-    background: #2a2018;
+    padding: 4px 11px;
+    border-radius: 2px;
+    border: 1px solid var(--rule);
+    background: var(--bg-card);
     font-size: 0.9em;
     margin: 2px 4px 2px 0;
+    font-family: var(--font-display);
+    letter-spacing: 0.05em;
   }}
-  .clock.urgent {{ border-color: #b56a3a; color: #e8b487; background: #3a2418; }}
-  .clock.expired {{ border-color: #6a2818; color: #ff7a5a; background: #3a1812; }}
-  .truth-true        {{ color: #6db86d; font-size: 0.8em; }}
-  .truth-partly_true {{ color: #c8a96e; font-size: 0.8em; }}
+  .clock.urgent  {{ border-color: var(--accent-rust); color: #e8b487; background: #2e1d12; }}
+  .clock.expired {{ border-color: #6a2818; color: #ff7a5a; background: #2e1410; }}
+
+  /* ---- Truth/secret indicators (DM views) ---- */
+  .truth-true        {{ color: var(--hp-good); font-size: 0.8em; }}
+  .truth-partly_true {{ color: var(--accent-gold); font-size: 0.8em; }}
   .truth-false       {{ color: #c87a7a; font-size: 0.8em; }}
-  .truth-fabrication {{ color: #ff5a4a; font-size: 0.8em; font-weight: bold; }}
+  .truth-fabrication {{ color: #ff5a4a; font-size: 0.8em; font-weight: 600; }}
   .secret-card {{
-    background: #2a1818;
+    background: linear-gradient(to bottom, #2a1818, #221212);
     border: 1px solid #6a3828;
-    border-left: 4px solid #c8503a;
-    padding: 12px 16px;
-    margin: 8px 0;
-    border-radius: 4px;
+    border-left: 4px solid var(--accent-blood);
+    padding: 14px 18px;
+    margin: 10px 0;
+    border-radius: 3px;
+    box-shadow: var(--shadow-card);
   }}
   .scope-warning {{ color: #e8b487; font-size: 0.85em; }}
+
+  /* ---- Tags / chips ---- */
   .tag {{
     display: inline-block;
-    background: #3a2818;
-    border: 1px solid #5a4030;
-    border-radius: 3px;
-    padding: 1px 7px;
-    font-size: 0.8em;
+    background: #322012;
+    border: 1px solid var(--rule-hi);
+    border-radius: 2px;
+    padding: 1px 8px;
+    font-size: 0.78em;
     margin: 2px;
-    color: #c8a96e;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    letter-spacing: 0.06em;
   }}
-  .two-col {{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-  }}
+
+  /* ---- Layout helpers ---- */
+  .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}
   @media (max-width: 600px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
+
+  /* ---- Portrait (inline within prose) ---- */
   .portrait {{
     float: right;
-    margin: 0 0 12px 16px;
+    margin: 0 0 14px 18px;
     max-width: 180px;
-    border-radius: 4px;
-    border: 1px solid #4a3828;
+    border-radius: 3px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: var(--shadow-card);
   }}
-  .party-card {{ display: flex; gap: 16px; align-items: flex-start; }}
+
+  /* ---- Party card (used on /party page) ---- */
+  .party-card {{ display: flex; gap: 18px; align-items: flex-start; }}
   .party-portrait {{
-    width: 110px; height: 110px;
+    width: 116px; height: 116px;
     object-fit: cover;
-    border-radius: 4px;
-    border: 1px solid #4a3828;
+    border-radius: 3px;
+    border: 1px solid var(--rule-hi);
     flex-shrink: 0;
+    box-shadow: var(--shadow-card), inset 0 0 0 1px rgba(0,0,0,0.4);
   }}
   .party-body {{ flex: 1; min-width: 0; }}
   .party-body h2 {{ margin-top: 0; }}
-  .spell-ready {{ color: #d4c5a9; }}
-  .spell-cast  {{ color: #6a5a48; }}
+
+  /* ---- Spells ---- */
+  .spell-ready {{ color: var(--ink-body); }}
+  .spell-cast  {{ color: #6a5a48; text-decoration: line-through; text-decoration-color: rgba(106,90,72,0.5); }}
   .memorized {{ margin: 8px 0; }}
-  .spell-level {{ margin: 4px 0 6px; }}
+  .spell-level {{ margin: 6px 0; }}
   .spell-level-head {{
-    font-size: 0.88em;
-    color: #c8a96e;
-    margin: 4px 0 2px;
-    border-bottom: 1px dotted #4a3828;
+    font-size: 0.82em;
+    color: var(--accent-gold);
+    margin: 4px 0 4px;
+    border-bottom: 1px dotted var(--rule);
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    padding-bottom: 3px;
   }}
-  .spell-list {{
-    list-style: disc;
-    margin: 2px 0 4px 22px;
-    padding: 0;
-  }}
-  .spell-list li {{ margin: 1px 0; line-height: 1.35; }}
+  .spell-list {{ list-style: disc; margin: 2px 0 4px 22px; padding: 0; }}
+  .spell-list li {{ margin: 1px 0; line-height: 1.42; }}
+
+  /* ---- Effect / light chips ---- */
   .effect-chip {{
     display: inline-block;
-    background: #1a2a3a;
+    background: #182734;
     border: 1px solid #3a5a7a;
-    border-radius: 3px;
+    border-radius: 2px;
     padding: 2px 8px;
     margin: 2px 2px 2px 0;
     font-size: 0.85em;
     color: #a0c0e0;
+    font-family: var(--font-display);
+    letter-spacing: 0.04em;
   }}
   .light-chip {{
     display: inline-block;
-    background: #3a2818;
+    background: #322014;
     border: 1px solid #6a4828;
-    border-radius: 3px;
+    border-radius: 2px;
     padding: 2px 8px;
     margin: 2px 2px 2px 0;
     font-size: 0.85em;
     color: #e8c080;
+    font-family: var(--font-display);
+    letter-spacing: 0.04em;
   }}
   .light-chip.guttering {{
-    background: #3a2418;
-    border-color: #b56a3a;
+    background: #321810;
+    border-color: var(--accent-rust);
     color: #ff8a6a;
+    animation: flicker 1.4s ease-in-out infinite;
   }}
+  @keyframes flicker {{
+    0%, 100% {{ opacity: 1; }}
+    47% {{ opacity: 0.78; }}
+    52% {{ opacity: 1; }}
+    78% {{ opacity: 0.86; }}
+  }}
+
+  /* ---- Encumbrance widgets ---- */
   .enc-card {{ margin-top: 16px; }}
   .enc-bar {{
     height: 10px;
-    background: #1a1510;
-    border: 1px solid #4a3828;
-    border-radius: 3px;
+    background: var(--bg-rec);
+    border: 1px solid var(--rule);
+    border-radius: 1px;
     overflow: hidden;
     margin: 6px 0 10px;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
   }}
-  .enc-fill {{ height: 100%; transition: width .3s; }}
-  .enc-bands {{
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 6px;
-  }}
+  .enc-fill {{ height: 100%; transition: width .35s ease; }}
+  .enc-bands {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }}
   .enc-band {{
-    background: #1a1510;
-    border: 1px solid #4a3828;
-    border-radius: 3px;
-    padding: 6px 8px;
+    background: var(--bg-rec);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 7px 8px;
     font-size: 0.85em;
     text-align: center;
   }}
   .enc-band-name {{
     display: block;
-    color: #8a7a60;
-    text-transform: capitalize;
-    font-size: 0.85em;
+    color: var(--ink-muted);
+    text-transform: uppercase;
+    font-size: 0.78em;
+    font-family: var(--font-display);
+    letter-spacing: 0.1em;
   }}
-  .enc-band-cap {{ display: block; color: #d4c5a9; }}
-  .enc-band-active {{
-    border-color: #c8a96e;
-    background: #2a2018;
-  }}
-  .enc-band-active .enc-band-name {{ color: #c8a96e; }}
+  .enc-band-cap {{ display: block; color: var(--ink-body); font-family: var(--font-mono); font-size: 0.92em; }}
+  .enc-band-active {{ border-color: var(--accent-gold); background: var(--bg-card); }}
+  .enc-band-active .enc-band-name {{ color: var(--accent-gold); }}
   .enc-items {{ margin: 12px 0 4px; font-size: 0.92em; }}
-  .enc-items th {{ font-weight: normal; color: #c8a96e; }}
-  .enc-items td, .enc-items th {{ padding: 4px 8px; }}
-  .enc-items tfoot td {{ border-top: 1px solid #4a3828; background: #1a1510; }}
+  .enc-items th {{ font-weight: 500; color: var(--accent-gold); font-family: var(--font-display); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.82em; }}
+  .enc-items td, .enc-items th {{ padding: 5px 9px; }}
+  .enc-items tfoot td {{ border-top: 1px solid var(--rule); background: var(--bg-rec); }}
   @media (max-width: 480px) {{
     .party-card {{ flex-direction: column; }}
-    .party-portrait {{ width: 100%; height: auto; max-width: 200px; }}
+    .party-portrait {{ width: 100%; height: auto; max-width: 220px; }}
   }}
+
+  /* ---- Misc primitives ---- */
   .clearfix::after {{ content: ''; display: table; clear: both; }}
-  .muted {{ color: #8a7a60; font-size: 0.9em; }}
-  pre {{ background: #110e0a; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }}
-  code {{ font-family: monospace; }}
-  blockquote {{ border-left: 3px solid #4a3828; padding-left: 12px; color: #a09070; }}
-  hr {{ border: none; border-top: 1px solid #4a3828; margin: 20px 0; }}
-  table {{ width: 100%; border-collapse: collapse; margin: 12px 0; }}
-  th, td {{ border: 1px solid #4a3828; padding: 6px 10px; text-align: left; }}
-  th {{ background: #2a2018; color: #c8a96e; }}
+  .muted {{ color: var(--ink-muted); font-size: 0.92em; }}
+  pre {{
+    background: var(--bg-deep);
+    padding: 14px 16px;
+    border-radius: 3px;
+    border: 1px solid var(--rule);
+    overflow-x: auto;
+    font-size: 0.86em;
+    font-family: var(--font-mono);
+  }}
+  code {{ font-family: var(--font-mono); font-size: 0.92em; color: var(--accent-gold-hi); }}
+  pre code {{ color: var(--ink-body); }}
+  blockquote {{
+    border-left: 3px solid var(--accent-gold);
+    padding: 4px 0 4px 16px;
+    color: #b8a982;
+    font-style: italic;
+    margin: 12px 0;
+  }}
+  hr {{
+    border: none;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--rule-hi), transparent);
+    margin: 28px 0;
+  }}
+  table {{ width: 100%; border-collapse: collapse; margin: 14px 0; }}
+  th, td {{ border: 1px solid var(--rule); padding: 7px 11px; text-align: left; }}
+  th {{
+    background: linear-gradient(to bottom, #2c2218, #221912);
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.84em;
+  }}
   img:not(#lb-img) {{ cursor: zoom-in; }}
+
+  /* ---- Spoiler accordion (rumors, DM notes, sheet descriptions) ---- */
+  details.spoiler {{
+    border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent-rust);
+    background: linear-gradient(to bottom, #1d1410, #16100b);
+    border-radius: 3px;
+    margin: 12px 0;
+    box-shadow: var(--inset-warm);
+  }}
+  details.spoiler[open] {{ border-left-color: var(--accent-gold); }}
+  details.spoiler > summary {{
+    cursor: pointer;
+    padding: 11px 16px;
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.78em;
+    color: var(--accent-rust);
+    user-select: none;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    transition: color 180ms ease;
+  }}
+  details.spoiler > summary::-webkit-details-marker {{ display: none; }}
+  details.spoiler > summary::before {{
+    content: '▶';
+    font-size: 0.7em;
+    transition: transform 200ms ease;
+    color: inherit;
+  }}
+  details.spoiler[open] > summary {{
+    color: var(--accent-gold);
+    border-bottom: 1px solid var(--rule);
+  }}
+  details.spoiler[open] > summary::before {{ transform: rotate(90deg); }}
+  details.spoiler > summary .spoiler-warn {{
+    color: var(--ink-muted);
+    font-style: italic;
+    font-family: var(--font-body);
+    text-transform: none;
+    letter-spacing: 0.01em;
+    font-size: 0.86em;
+    margin-left: auto;
+    font-weight: normal;
+  }}
+  details.spoiler > .spoiler-body {{
+    padding: 14px 18px;
+  }}
+  details.spoiler > .spoiler-body > *:first-child {{ margin-top: 0; }}
+  details.spoiler > .spoiler-body > *:last-child {{ margin-bottom: 0; }}
+
+  /* Compact details (e.g. portrait description on character sheets) — quieter than .spoiler. */
+  details.portrait-desc {{ margin-top: 8px; text-align: left; }}
+  details.portrait-desc > summary {{
+    cursor: pointer;
+    font-size: 0.78em;
+    color: var(--ink-muted);
+    font-style: italic;
+    list-style: none;
+    user-select: none;
+    padding: 2px 0;
+  }}
+  details.portrait-desc > summary::-webkit-details-marker {{ display: none; }}
+  details.portrait-desc > summary::before {{
+    content: '▸ ';
+    color: var(--accent-gold);
+    font-style: normal;
+  }}
+  details.portrait-desc[open] > summary::before {{ content: '▾ '; }}
+  details.portrait-desc > p {{
+    margin-top: 6px;
+    color: var(--ink-muted);
+    font-size: 0.84em;
+    line-height: 1.5;
+    text-align: left;
+  }}
+
+  /* ---- Lightbox ---- */
   #lb {{
     display: none; position: fixed; inset: 0;
-    background: rgba(0,0,0,.88); z-index: 9999;
+    background: rgba(0,0,0,.92); z-index: 9999;
     align-items: center; justify-content: center;
     padding: 20px; cursor: zoom-out;
+    backdrop-filter: blur(4px);
   }}
   #lb.open {{ display: flex; }}
   #lb img {{
     max-width: 90vw; max-height: 90vh; object-fit: contain;
-    border-radius: 6px; border: 2px solid #5a4030;
-    box-shadow: 0 8px 40px rgba(0,0,0,.9); cursor: zoom-out;
+    border-radius: 3px; border: 1px solid var(--accent-gold);
+    box-shadow: 0 12px 60px rgba(0,0,0,.95); cursor: zoom-out;
   }}
 </style>
 </head>
@@ -510,6 +773,12 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     if(t.tagName==='IMG'&&t.id!=='lb-img'){{li.src=t.src;li.alt=t.alt;lb.classList.add('open');}}
   }});
   document.addEventListener('keydown',function(e){{if(e.key==='Escape')lb.classList.remove('open');}});
+  // Highlight the active nav link based on the current path.
+  var p = location.pathname;
+  document.querySelectorAll('nav a').forEach(function(a){{
+    var href = a.getAttribute('href');
+    if (href === '/' ? p === '/' : p.indexOf(href) === 0) a.classList.add('is-active');
+  }});
 }})();
 </script>
 </body>
@@ -1234,15 +1503,26 @@ def world_view():
         else '<p class="muted">No DM-only notes recorded.</p>'
     )
 
+    rumor_count = len(rumors)
+    secret_count = len(secret_rows)
+
     body = (
         f"<h1>{html.escape(campaign_name)} — World</h1>"
         + _world_info_bar(state)
         + "<h2>Factions</h2>" + factions_html
         + "<h2>World Clocks</h2>" + clocks_html
-        + "<h2>Rumors <span class='muted' style='font-size:0.6em'>(DM view — shows truth tier)</span></h2>"
-        + rumors_html
-        + "<h2>DM-Only Notes <span class='muted' style='font-size:0.6em'>(never narrate to player)</span></h2>"
-        + secrets_html
+        + '<details class="spoiler">'
+        + f'<summary>Rumors <span class="muted">({rumor_count})</span>'
+        + '<span class="spoiler-warn">DM view — reveals truth tier · click to expand</span>'
+        + '</summary>'
+        + f'<div class="spoiler-body">{rumors_html}</div>'
+        + '</details>'
+        + '<details class="spoiler">'
+        + f'<summary>DM-Only Notes <span class="muted">({secret_count})</span>'
+        + '<span class="spoiler-warn">Never narrate to the player · click to expand</span>'
+        + '</summary>'
+        + f'<div class="spoiler-body">{secrets_html}</div>'
+        + '</details>'
     )
     return render(f"{campaign_name} — World", body)
 
@@ -1453,38 +1733,595 @@ def session_view(sid: str):
 # Live play surface — drives `claude -p` via tools/dm_session.py
 # ---------------------------------------------------------------------------
 
+def _latest_location_name() -> str:
+    """Most recent location_visited from events.json, or empty string."""
+    if not cfg:
+        return ""
+    p = cfg["_dir"] / "events.json"
+    if not p.exists():
+        return ""
+    try:
+        events = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return ""
+    for ev in reversed(events):
+        if ev.get("type") == "location_visited":
+            return ev.get("name") or ev.get("slug") or ""
+    return ""
+
+
+def _play_state() -> dict:
+    """Assemble the live data the /play surface needs: party (with portraits
+    and HP), plus the equivalent of the statusline footer (location, time,
+    weather, day, session, combat, coin)."""
+    if not cfg:
+        return {"campaign": None, "characters": [], "session": 0, "day": 0,
+                "time": "", "weather": "", "location": "", "in_combat": False, "coin": ""}
+
+    _reload_cfg()
+    state = _c.load_state(cfg)
+    combat_hp = _combat_hp_overrides()
+    image_index = _load_image_index()
+
+    chars = []
+    for key, char in cfg.get("characters", {}).items():
+        cstate = state.get("characters", {}).get(key, {})
+        hp_max = char.get("hp_max", 0)
+        hp_cur = combat_hp.get(key, cstate.get("hp", hp_max))
+        portrait = _find_portrait(char.get("label", key), image_index, key)
+        chars.append({
+            "key": key,
+            "label": char.get("label", key),
+            "cls": char.get("cls", ""),
+            "level": int(char.get("level", 1) or 1),
+            "hp": hp_cur,
+            "hp_max": hp_max,
+            "ac": char.get("ac"),
+            "thac0": char.get("thac0"),
+            "conditions": cstate.get("conditions", []),
+            "portrait": f"/images/{portrait['filename']}" if portrait else None,
+        })
+
+    coin = state.get("coin", {}) or {}
+    coin_parts = [f"{coin[d]} {d}" for d in ("gp", "ep", "sp", "cp") if coin.get(d)]
+
+    hour = state.get("current_hour")
+    minute = state.get("current_minute")
+    time_str = f"{hour:02d}:{minute:02d}" if isinstance(hour, int) and isinstance(minute, int) else ""
+    weather_full = state.get("current_weather") or ""
+    weather_label = weather_full.split(" (", 1)[0] if weather_full else ""
+
+    return {
+        "campaign": {"name": cfg.get("name"), "slug": cfg.get("_name")},
+        "session": state.get("current_session", 0),
+        "day": state.get("current_day", 1),
+        "time": time_str,
+        "weather": weather_label,
+        "location": _latest_location_name(),
+        "in_combat": bool(state.get("combat")),
+        "coin": " · ".join(coin_parts),
+        "characters": chars,
+    }
+
+
 _PLAY_HTML = """
 <style>
-  .play-shell { display: flex; flex-direction: column; height: calc(100vh - 160px); }
-  .play-bar { display: flex; gap: 12px; align-items: center; font-size: 0.9em; color: #b0a080; margin-bottom: 8px; }
-  .play-bar code { background: #2a2018; padding: 2px 6px; border-radius: 3px; }
-  .play-bar button { background: transparent; color: #c8a96e; border: 1px solid #4a3828; border-radius: 3px; padding: 3px 10px; font-family: Georgia, serif; font-size: 0.85em; cursor: pointer; }
-  .play-bar button:hover { background: #2a2018; }
-  .play-log { flex: 1; overflow-y: auto; background: #2a2018; border: 1px solid #4a3828; border-radius: 6px; padding: 16px; }
-  .play-log .turn { margin-bottom: 14px; line-height: 1.6; }
-  .play-log .turn.player { border-left: 3px solid #c8a96e; padding-left: 12px; color: #b0a080; font-style: italic; white-space: pre-wrap; }
-  .play-log .turn.dm { color: #d4c5a9; white-space: pre-wrap; }
-  .play-log .turn.tool { font-family: Menlo, Consolas, monospace; font-size: 0.82em; color: #806848; }
-  .play-log .turn.error { color: #e08070; }
-  .play-log .turn.meta { color: #806848; font-size: 0.85em; font-style: italic; }
-  .play-input { margin-top: 12px; display: flex; gap: 8px; }
-  .play-input textarea { flex: 1; background: #1a1510; color: #d4c5a9; border: 1px solid #4a3828; border-radius: 4px; padding: 8px 10px; font-family: Georgia, serif; font-size: 1em; resize: vertical; min-height: 56px; }
-  .play-input button { background: #4a3828; color: #d4c5a9; border: 1px solid #6a5848; border-radius: 4px; padding: 0 18px; font-family: Georgia, serif; font-size: 1em; cursor: pointer; }
-  .play-input button:hover:not(:disabled) { background: #6a5848; }
-  .play-input button:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Take the entire viewport on /play — narrative window grows to fill all
+     remaining width to the left of the sidebar. The :has() check scopes this
+     to the play page so other routes keep the standard 980px container. */
+  .container:has(.play-shell) {
+    max-width: none;
+    width: 100%;
+    padding-left: 28px;
+    padding-right: 28px;
+  }
+  .play-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 320px;
+    gap: 18px;
+    height: calc(100vh - 110px);
+  }
+  .play-main { display: flex; flex-direction: column; min-width: 0; }
+  .play-side { min-width: 0; overflow-y: auto; }
+
+  .play-toolbar {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+  .play-toolbar h1 {
+    font-size: 1.45em;
+    border-bottom: none;
+    padding: 0;
+    margin: 0;
+    flex: 0 0 auto;
+    color: var(--ink-display);
+    letter-spacing: 0.18em;
+  }
+  .play-toolbar .sid {
+    color: var(--ink-muted);
+    font-size: 0.82em;
+    font-family: var(--font-display);
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+  .play-toolbar .sid code {
+    color: var(--accent-gold);
+    font-family: var(--font-mono);
+    text-transform: none;
+    letter-spacing: 0;
+    margin-left: 6px;
+  }
+  .play-toolbar .spacer { flex: 1; }
+  .play-toolbar button {
+    background: transparent;
+    color: var(--accent-gold);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    padding: 5px 12px;
+    font-family: var(--font-display);
+    font-size: 0.7em;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    cursor: pointer;
+    transition: all 180ms ease;
+  }
+  .play-toolbar button:hover {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold-hi);
+  }
+  .play-toolbar #play-status {
+    color: var(--ink-muted);
+    font-size: 0.82em;
+    font-style: italic;
+    min-width: 80px;
+  }
+
+  .play-log {
+    flex: 1;
+    overflow-y: auto;
+    background:
+      linear-gradient(135deg, rgba(255,220,180,0.022), transparent 50%),
+      linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px 30px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    line-height: 1.72;
+    font-size: 1.02em;
+  }
+  .play-log .empty-state {
+    text-align: center;
+    color: var(--ink-muted);
+    font-style: italic;
+    margin: 24px auto 0;
+    max-width: 520px;
+  }
+  .play-log .empty-state .play-hero {
+    display: block;
+    width: min(360px, 70%);
+    margin: 0 auto 20px;
+    border-radius: 4px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: 0 8px 28px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(0,0,0,0.4);
+    cursor: default;
+    opacity: 0.96;
+  }
+  .play-log .empty-state .empty-state-text {
+    font-size: 0.95em;
+    letter-spacing: 0.02em;
+    color: var(--ink-muted);
+  }
+  .play-log .empty-state .empty-state-text::before {
+    content: '✦';
+    color: var(--accent-gold);
+    font-style: normal;
+    margin-right: 8px;
+    font-size: 0.9em;
+  }
+  .turn { margin-bottom: 18px; }
+  .turn.player {
+    border-left: 2px solid var(--accent-gold);
+    padding: 2px 0 2px 16px;
+    color: #c8b48a;
+    font-style: italic;
+    white-space: pre-wrap;
+  }
+  .turn.player::before {
+    content: '◇';
+    color: var(--accent-gold);
+    margin-right: 8px;
+    font-style: normal;
+    font-size: 0.85em;
+  }
+  .turn.dm {
+    color: var(--ink-body);
+    white-space: pre-wrap;
+  }
+  .turn.tool {
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    color: var(--ink-muted);
+    background: rgba(15,11,7,0.55);
+    border-left: 1px solid var(--rule);
+    padding: 5px 12px;
+    margin: 8px 0;
+    border-radius: 0 2px 2px 0;
+  }
+  .turn.tool::before {
+    content: '⚙ ';
+    color: var(--accent-gold);
+    margin-right: 4px;
+  }
+  .turn.error {
+    color: #e08070;
+    border-left: 2px solid var(--accent-blood);
+    padding: 6px 12px;
+    background: rgba(70,20,15,0.3);
+  }
+  .turn.meta {
+    color: var(--ink-muted);
+    font-size: 0.78em;
+    text-align: center;
+    margin: 18px 0 6px;
+    font-family: var(--font-display);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    position: relative;
+  }
+  .turn.meta::before, .turn.meta::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: 25%;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--rule-hi), transparent);
+  }
+  .turn.meta::before { left: 8%; }
+  .turn.meta::after { right: 8%; transform: scaleX(-1); }
+
+  .play-form {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+  }
+  .play-form textarea {
+    background: var(--bg-rec);
+    color: var(--ink-body);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 14px 16px;
+    font-family: var(--font-body);
+    font-size: 1.14em;
+    resize: vertical;
+    min-height: 68px;
+    line-height: 1.55;
+    transition: border-color 200ms ease, box-shadow 200ms ease;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3);
+  }
+  .play-form textarea:focus {
+    outline: none;
+    border-color: var(--accent-gold);
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.3), 0 0 0 1px rgba(200,169,110,0.25);
+  }
+  .play-form textarea::placeholder { color: var(--ink-muted); font-style: italic; }
+  .play-form button {
+    background: linear-gradient(to bottom, #4a3625, #2e2014);
+    color: var(--ink-display);
+    border: 1px solid var(--rule-hi);
+    border-radius: 3px;
+    width: 64px;
+    padding: 0;
+    cursor: pointer;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+    transition: all 180ms ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .play-form button svg {
+    width: 26px;
+    height: 26px;
+    transition: transform 180ms ease;
+  }
+  .play-form button:hover:not(:disabled) {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold-hi);
+    background: linear-gradient(to bottom, #5a4030, #3a2818);
+  }
+  .play-form button:hover:not(:disabled) svg { transform: translateX(2px); }
+  .play-form button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Generated scene image inline in the chat log. */
+  .turn.scene {
+    text-align: center;
+    margin: 22px 0;
+  }
+  .turn.scene img {
+    max-width: 100%;
+    max-height: 460px;
+    border-radius: 4px;
+    border: 1px solid var(--rule-hi);
+    box-shadow: var(--shadow-deep);
+    display: inline-block;
+  }
+  .turn.scene .caption {
+    display: block;
+    font-family: var(--font-display);
+    font-size: 0.7em;
+    color: var(--ink-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    margin-top: 8px;
+    font-style: normal;
+  }
+  .turn.generating {
+    text-align: center;
+    color: var(--ink-muted);
+    font-style: italic;
+    font-size: 0.88em;
+    padding: 14px;
+    border: 1px dashed var(--rule);
+    border-radius: 3px;
+    margin: 18px 0;
+  }
+  .turn.generating::before {
+    content: '◌';
+    color: var(--accent-gold);
+    font-style: normal;
+    margin-right: 8px;
+    display: inline-block;
+    animation: spin 1.6s linear infinite;
+  }
+  @keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+
+  /* ---- Sidebar ---- */
+  .play-side {
+    background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 18px 16px 14px;
+    box-shadow: var(--inset-warm), var(--shadow-card);
+  }
+
+  /* Campaign banner at the very top of the sidebar. */
+  .side-camp {
+    font-family: var(--font-display);
+    color: var(--accent-gold-hi);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    text-align: center;
+    font-size: 0.82em;
+    font-weight: 500;
+    line-height: 1.35;
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .side-camp:empty { display: none; }
+
+  /* Stats rows: session/day/time, weather/gold, location, combat. */
+  .side-stats { display: flex; flex-direction: column; gap: 9px; margin-bottom: 12px; }
+  .side-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .side-row .pip { display: inline-flex; align-items: baseline; gap: 6px; line-height: 1; }
+  .side-row .pip .pip-label {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    font-size: 0.62em;
+    color: var(--ink-muted);
+  }
+  .side-row .pip .pip-val {
+    font-family: var(--font-body);
+    color: var(--ink-body);
+    font-size: 0.96em;
+  }
+  .side-row.row-loc { padding-top: 4px; }
+  .side-row.row-loc .pip-val {
+    color: var(--accent-gold-hi);
+    font-style: italic;
+    font-size: 1.0em;
+  }
+  .side-row.row-combat {
+    padding: 4px 10px;
+    background: rgba(70,18,15,0.4);
+    border: 1px solid #6a2818;
+    border-radius: 2px;
+  }
+  .side-row.row-combat .pip-val {
+    color: var(--accent-blood);
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    font-size: 0.8em;
+    font-weight: 500;
+    animation: combatPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes combatPulse {
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.55; }}
+  }
+  .pip.pip-gold .pip-val {
+    color: var(--accent-gold);
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    letter-spacing: 0;
+  }
+
+  .side-title {
+    font-family: var(--font-display);
+    color: var(--accent-gold);
+    text-transform: uppercase;
+    letter-spacing: 0.26em;
+    font-size: 0.74em;
+    text-align: center;
+    margin: 0 0 14px;
+    padding: 10px 0;
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+    position: relative;
+  }
+  .side-title::after {
+    content: '◆';
+    position: absolute;
+    left: 50%;
+    bottom: -7px;
+    transform: translateX(-50%);
+    background: var(--bg-card-hi);
+    color: var(--accent-gold);
+    padding: 0 6px;
+    font-size: 0.6em;
+    letter-spacing: 0;
+  }
+  .party-list { display: flex; flex-direction: column; gap: 16px; }
+  .party-mini { display: flex; gap: 12px; align-items: flex-start; }
+  .portrait-frame {
+    flex-shrink: 0;
+    width: 58px; height: 58px;
+    border-radius: 50%;
+    background: var(--bg-deep);
+    border: 1px solid var(--accent-gold);
+    box-shadow: 0 0 0 1px var(--bg-deep), 0 0 0 2px var(--rule), 0 2px 6px rgba(0,0,0,0.5);
+    overflow: hidden;
+    position: relative;
+    text-decoration: none;
+    color: inherit;
+    display: block;
+    transition: box-shadow 200ms ease, transform 200ms ease;
+  }
+  a.portrait-frame:hover {
+    box-shadow: 0 0 0 1px var(--bg-deep), 0 0 0 2px var(--accent-gold-hi), 0 4px 12px rgba(200,169,110,0.25);
+    transform: translateY(-1px);
+  }
+  .portrait-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .portrait-frame.empty {
+    background: linear-gradient(135deg, #1a130c, #0f0a07);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--rule-hi);
+    font-family: var(--font-display);
+    font-size: 1.4em;
+    letter-spacing: 0;
+  }
+  .portrait-frame.kod {
+    border-color: var(--hp-bad);
+    box-shadow: 0 0 0 1px var(--bg-deep), 0 0 0 2px #4a1a14, 0 0 12px rgba(200,80,58,0.4);
+    filter: grayscale(0.4);
+  }
+
+  .party-mini-body { flex: 1; min-width: 0; }
+  .party-mini-name {
+    font-family: var(--font-display);
+    color: var(--ink-display);
+    font-size: 0.94em;
+    letter-spacing: 0.06em;
+    line-height: 1.2;
+    display: block;
+    text-decoration: none;
+    transition: color 180ms ease;
+  }
+  a.party-mini-name:hover {
+    color: var(--accent-gold-hi);
+    text-decoration: underline;
+    text-decoration-color: var(--rule-hi);
+    text-underline-offset: 3px;
+  }
+  .party-mini-class {
+    font-family: var(--font-body);
+    font-style: italic;
+    color: var(--ink-muted);
+    font-size: 0.84em;
+    margin-top: 1px;
+  }
+  .party-mini-hp {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  .party-mini-hp .hp-meter { flex: 1; }
+  .party-mini-hp-text {
+    font-family: var(--font-mono);
+    font-size: 0.74em;
+    color: var(--ink-muted);
+    min-width: 42px;
+    text-align: right;
+    letter-spacing: 0;
+  }
+  .party-mini-conds {
+    margin-top: 5px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+  }
+  .cond-chip {
+    font-family: var(--font-display);
+    font-size: 0.62em;
+    padding: 1px 6px;
+    border: 1px solid var(--accent-rust);
+    background: #2e1d12;
+    color: #e8b487;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    border-radius: 1px;
+  }
+
+  @media (max-width: 900px) {
+    .play-shell {
+      grid-template-columns: 1fr;
+      height: auto;
+    }
+    .play-side { max-height: 480px; }
+  }
 </style>
 
 <div class="play-shell">
-  <div class="play-bar">
-    <span>Session: <code id="play-sid">…</code></span>
-    <button id="play-reset" type="button">New session</button>
-    <span id="play-status" style="margin-left:auto"></span>
-  </div>
-  <div class="play-log" id="play-log"></div>
-  <form class="play-input" id="play-form">
-    <textarea id="play-input" placeholder="Describe your action… (Ctrl+Enter to send)" autocomplete="off"></textarea>
-    <button type="submit" id="play-send">Send</button>
-  </form>
+  <section class="play-main">
+    <div class="play-toolbar">
+      <h1>Live Play</h1>
+      <span class="sid">session<code id="play-sid">…</code></span>
+      <span class="spacer"></span>
+      <span id="play-status"></span>
+      <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
+      <button id="play-reset" type="button">New session</button>
+    </div>
+    <div class="play-log" id="play-log">
+      <div class="empty-state">
+        <img src="/static/play-hero.png" alt="" class="play-hero">
+        <div class="empty-state-text">Begin when ready. Describe an action below to address the DM.</div>
+      </div>
+    </div>
+    <form class="play-form" id="play-form">
+      <textarea id="play-input" placeholder="Describe your action…  (Ctrl+Enter to send)" autocomplete="off"></textarea>
+      <button type="submit" id="play-send" title="Send (Ctrl+Enter)" aria-label="Send">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3.5 11.6 21 4l-7.5 17-2.2-7.4-7.8-2z"/>
+          <path d="m11.3 13.6 4.6-4.6" opacity="0.7"/>
+        </svg>
+      </button>
+    </form>
+  </section>
+
+  <aside class="play-side">
+    <div class="side-camp" id="side-camp"></div>
+    <div class="side-stats" id="side-stats"></div>
+    <div class="side-title">The Party</div>
+    <div class="party-list" id="party-list">
+      <div class="muted" style="text-align:center; font-size:0.84em; font-style:italic">…</div>
+    </div>
+  </aside>
 </div>
 
 <script>
@@ -1496,8 +2333,23 @@ _PLAY_HTML = """
   const sidEl = document.getElementById('play-sid');
   const statusEl = document.getElementById('play-status');
   const resetBtn = document.getElementById('play-reset');
+  const partyList = document.getElementById('party-list');
+  const sideCamp = document.getElementById('side-camp');
+  const sideStats = document.getElementById('side-stats');
+  const makePicBtn = document.getElementById('play-make-pic');
+  let firstAppend = true;
+  let lastDmText = '';
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+      {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
 
   function append(role, text) {
+    if (firstAppend) {
+      log.innerHTML = '';
+      firstAppend = false;
+    }
     const div = document.createElement('div');
     div.className = 'turn ' + role;
     div.textContent = text;
@@ -1512,20 +2364,21 @@ _PLAY_HTML = """
       for (const block of evt.message.content) {
         if (block.type === 'text' && block.text) {
           append('dm', block.text);
+          lastDmText = block.text;  // remember for "Make picture"
         } else if (block.type === 'tool_use') {
           const args = block.input ? Object.keys(block.input).slice(0, 3).join(', ') : '';
-          append('tool', '⚙ ' + (block.name || '?') + '(' + args + ')');
+          append('tool', (block.name || '?') + '(' + args + ')');
         }
       }
     } else if (evt.type === 'result') {
       const parts = ['turn complete'];
       if (typeof evt.duration_ms === 'number') parts.push((evt.duration_ms / 1000).toFixed(1) + 's');
       if (typeof evt.total_cost_usd === 'number') parts.push('$' + evt.total_cost_usd.toFixed(4));
-      append('meta', '— ' + parts.join(' · '));
+      append('meta', parts.join(' · '));
+      refreshState();
     } else if (evt.type === 'error') {
-      append('error', 'Error (rc=' + evt.returncode + '): ' + (evt.stderr || '').slice(0, 500));
+      append('error', 'rc=' + evt.returncode + '  ' + (evt.stderr || '').slice(0, 500));
     }
-    // user-role echoes, raw lines, and other event types are ignored.
   }
 
   async function submitTurn(text) {
@@ -1555,7 +2408,7 @@ _PLAY_HTML = """
           buf = buf.slice(nl + 1);
           if (!line) continue;
           try { handleEvent(JSON.parse(line)); }
-          catch (e) { append('error', 'Bad JSON: ' + line.slice(0, 80)); }
+          catch (e) { append('error', 'bad json: ' + line.slice(0, 80)); }
         }
       }
     } catch (err) {
@@ -1564,6 +2417,77 @@ _PLAY_HTML = """
       send.disabled = false;
       statusEl.textContent = '';
       input.focus();
+    }
+  }
+
+  function pip(label, value, klass) {
+    return '<span class="pip ' + (klass || '') + '">'
+      + (label ? '<span class="pip-label">' + esc(label) + '</span>' : '')
+      + '<span class="pip-val">' + esc(value) + '</span>'
+      + '</span>';
+  }
+
+  function renderParty(chars) {
+    if (!chars || !chars.length) {
+      partyList.innerHTML = '<div class="muted" style="text-align:center; font-size:0.82em; font-style:italic">No characters in roster.</div>';
+      return;
+    }
+    partyList.innerHTML = chars.map(c => {
+      const pct = c.hp_max > 0 ? Math.max(0, Math.min(100, (c.hp / c.hp_max) * 100)) : 0;
+      const ko = (c.hp || 0) <= 0;
+      const portrait = c.portrait
+        ? '<img src="' + esc(c.portrait) + '" alt="' + esc(c.label) + '">'
+        : '<span>' + esc((c.label || '?').slice(0, 1).toUpperCase()) + '</span>';
+      const conds = (c.conditions || []).map(x =>
+        '<span class="cond-chip">' + esc(x) + '</span>').join('');
+      const cls = [c.cls, c.level].filter(Boolean).join(' ').trim();
+      const sheetUrl = '/sheets/' + encodeURIComponent(c.key || '');
+      return ''
+        + '<article class="party-mini">'
+        +   '<a class="portrait-frame ' + (ko ? 'kod ' : '') + (c.portrait ? '' : 'empty') + '" href="' + sheetUrl + '" title="Open ' + esc(c.label) + '\\u2019s sheet">' + portrait + '</a>'
+        +   '<div class="party-mini-body">'
+        +     '<a class="party-mini-name" href="' + sheetUrl + '">' + esc(c.label) + '</a>'
+        +     (cls ? '<div class="party-mini-class">' + esc(cls) + '</div>' : '')
+        +     '<div class="party-mini-hp">'
+        +       '<span class="hp-meter"><i style="width:' + pct.toFixed(1) + '%"></i></span>'
+        +       '<span class="party-mini-hp-text">' + esc(c.hp) + '/' + esc(c.hp_max) + '</span>'
+        +     '</div>'
+        +     (conds ? '<div class="party-mini-conds">' + conds + '</div>' : '')
+        +   '</div>'
+        + '</article>';
+    }).join('');
+  }
+
+  function renderSidebarStats(s) {
+    sideCamp.innerHTML = (s.campaign && s.campaign.name) ? esc(s.campaign.name) : '';
+    const rows = [];
+    const r1 = [];
+    if (s.session) r1.push(pip('Sess', s.session));
+    if (s.day) r1.push(pip('Day', s.day));
+    if (s.time) r1.push(pip('Time', s.time));
+    if (r1.length) rows.push('<div class="side-row">' + r1.join('') + '</div>');
+    const r2 = [];
+    if (s.weather) r2.push(pip('Sky', s.weather));
+    if (s.coin) r2.push(pip('Gold', s.coin, 'pip-gold'));
+    if (r2.length) rows.push('<div class="side-row">' + r2.join('') + '</div>');
+    if (s.location) {
+      rows.push('<div class="side-row row-loc">' + pip('At', s.location) + '</div>');
+    }
+    if (s.in_combat) {
+      rows.push('<div class="side-row row-combat">' + pip('', '⚔ In Combat') + '</div>');
+    }
+    sideStats.innerHTML = rows.join('');
+  }
+
+  async function refreshState() {
+    try {
+      const r = await fetch('/api/play_state.json');
+      if (!r.ok) return;
+      const s = await r.json();
+      renderParty(s.characters);
+      renderSidebarStats(s);
+    } catch (e) {
+      // best-effort: leave existing render in place
     }
   }
 
@@ -1580,17 +2504,55 @@ _PLAY_HTML = """
       form.requestSubmit();
     }
   });
-
   resetBtn.addEventListener('click', async () => {
     if (!confirm('Start a new DM session? The current conversation will no longer be resumed.')) return;
     await fetch('/play/reset', {method: 'POST'});
     sidEl.textContent = '(new)';
-    append('meta', '— new session started');
+    append('meta', 'new session started');
+  });
+
+  makePicBtn.addEventListener('click', async () => {
+    if (!lastDmText) {
+      statusEl.textContent = 'no DM text yet';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+      return;
+    }
+    if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
+    const placeholder = document.createElement('div');
+    placeholder.className = 'turn generating';
+    placeholder.textContent = 'illustrating the scene…';
+    log.appendChild(placeholder);
+    log.scrollTop = log.scrollHeight;
+    makePicBtn.disabled = true;
+    try {
+      const r = await fetch('/play/generate_scene', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt: lastDmText.slice(0, 1500)}),
+      });
+      const d = await r.json();
+      if (!r.ok || d.error) {
+        placeholder.className = 'turn error';
+        placeholder.textContent = 'image generation failed: ' + (d.error || ('HTTP ' + r.status));
+        return;
+      }
+      placeholder.className = 'turn scene';
+      placeholder.innerHTML = '<img src="' + esc(d.url) + '" alt="generated scene"><span class="caption">scene</span>';
+      log.scrollTop = log.scrollHeight;
+    } catch (err) {
+      placeholder.className = 'turn error';
+      placeholder.textContent = 'image generation failed: ' + String(err);
+    } finally {
+      makePicBtn.disabled = false;
+    }
   });
 
   fetch('/play/session').then(r => r.json()).then(d => {
     sidEl.textContent = d.session_id ? d.session_id.slice(0, 8) : '(new)';
   });
+  refreshState();
+  // Background refresh — picks up MCP-tool mutations made outside the turn flow.
+  setInterval(refreshState, 20000);
 
   input.focus();
 })();
@@ -1614,6 +2576,11 @@ def play_reset():
     return jsonify({"ok": True})
 
 
+@app.route("/api/play_state.json")
+def api_play_state():
+    return jsonify(_play_state())
+
+
 @app.route("/play/turn", methods=["POST"])
 def play_turn():
     data = request.get_json(silent=True) or {}
@@ -1630,6 +2597,50 @@ def play_turn():
     resp.headers["X-Accel-Buffering"] = "no"
     resp.headers["Cache-Control"] = "no-cache"
     return resp
+
+
+@app.route("/play/generate_scene", methods=["POST"])
+def play_generate_scene():
+    """Generate an illustration based on a free-form prompt (used by the
+    /play 'Make picture' button to render the previous DM reply as art).
+    Synchronous — returns once the image is downloaded. Slow (~10–30s)."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "empty prompt"}), 400
+    # Trim very long prompts — Replicate has its own limit and shorter often
+    # composes better.
+    prompt = prompt[:1500]
+
+    try:
+        replicate = _img._load_replicate()
+    except (ImportError, EnvironmentError) as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    tone = cfg.get("tone", "high fantasy")
+    tone_clause = _img.TONE_STYLES.get(tone, tone)
+    full_prompt = f"{_img.STYLE_BASE} {tone_clause}. {prompt}"
+
+    title = "Live play scene"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"{ts}_{_img._safe_slug(title)}.png"
+    images_dir = cfg["_data_dir"] / "images"
+
+    try:
+        _img._generate_image(replicate, full_prompt, images_dir, filename)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    _img._update_index(images_dir, {
+        "filename":    filename,
+        "scene":       title,
+        "description": prompt[:500],
+        "timestamp":   datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "type":        "scene",
+    })
+    return jsonify({"url": f"/images/{filename}", "filename": filename})
 
 
 
@@ -1770,10 +2781,15 @@ def character_sheet(slug: str):
     if portrait:
         fn   = html.escape(portrait["filename"])
         desc = html.escape(portrait.get("description", ""))
+        desc_block = (
+            f'<details class="portrait-desc"><summary>portrait notes</summary>'
+            f'<p>{desc}</p></details>'
+        ) if desc else ""
         portrait_html = (
             f'<div style="float:right;margin:0 0 16px 20px;max-width:200px;text-align:center">'
-            f'<img src="/images/{fn}" alt="{html.escape(name)}" style="width:100%;border-radius:4px;border:1px solid #4a3828">'
-            f'{"<p class=muted style=font-size:.85em;margin-top:6px>" + desc + "</p>" if desc else ""}'
+            f'<img src="/images/{fn}" alt="{html.escape(name)}" '
+            f'style="width:100%;border-radius:3px;border:1px solid var(--rule-hi);box-shadow:var(--shadow-card)">'
+            f'{desc_block}'
             f'</div>'
         )
 
