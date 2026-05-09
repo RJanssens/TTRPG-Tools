@@ -225,7 +225,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <title>{title}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=Cinzel:wght@400;500;600&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=JetBrains+Mono:wght@400;500&family=Lora:ital,wght@0,400;0,500;0,600;1,400;1,500&display=swap" rel="stylesheet">
 <style>
   :root {{
     --bg-base:        #14100b;
@@ -2391,9 +2391,10 @@ _PLAY_HTML = """
           <button class="turn-toggle icon" data-filter="tools"  type="button" title="Show tool calls"     aria-label="Show tool calls">⚙</button>
           <button class="turn-toggle icon" data-filter="meta"   type="button" title="Show meta lines"     aria-label="Show meta lines">✦</button>
         </span>
-        <span class="font-group" role="group" aria-label="Narrative text size">
-          <button id="play-font-dec" class="icon-btn" type="button" title="Smaller text" aria-label="Decrease narrative text size">A−</button>
-          <button id="play-font-inc" class="icon-btn" type="button" title="Larger text"  aria-label="Increase narrative text size">A+</button>
+        <span class="font-group" role="group" aria-label="Narrative font">
+          <button id="play-font-family" class="icon-btn" type="button" title="Cycle narrative font" aria-label="Cycle narrative font">Aa</button>
+          <button id="play-font-dec"    class="icon-btn" type="button" title="Smaller text" aria-label="Decrease narrative text size">A−</button>
+          <button id="play-font-inc"    class="icon-btn" type="button" title="Larger text"  aria-label="Increase narrative text size">A+</button>
         </span>
       </span>
       <span class="spacer"></span>
@@ -2742,6 +2743,33 @@ _PLAY_HTML = """
       makePicBtn.disabled = false;
     }
   });
+
+  // Narrative font-family cycle: three options, from thematic to maximally
+  // readable. The button itself renders in the active font as a preview.
+  const FONTS = [
+    {key: 'garamond', label: 'Garamond',  stack: "'EB Garamond', Georgia, 'Times New Roman', serif"},
+    {key: 'lora',     label: 'Lora',      stack: "'Lora', Georgia, 'Times New Roman', serif"},
+    {key: 'atkinson', label: 'Atkinson Hyperlegible', stack: "'Atkinson Hyperlegible', system-ui, sans-serif"},
+  ];
+  const FONT_FAMILY_KEY = 'play.font-family';
+  const fontFamilyBtn = document.getElementById('play-font-family');
+  function fontIdx() {
+    const stored = localStorage.getItem(FONT_FAMILY_KEY);
+    const i = FONTS.findIndex(f => f.key === stored);
+    return i >= 0 ? i : 0;
+  }
+  function applyFontFamily() {
+    const f = FONTS[fontIdx()];
+    log.style.fontFamily = f.stack;
+    fontFamilyBtn.style.fontFamily = f.stack;
+    fontFamilyBtn.title = 'Font: ' + f.label + ' — click to cycle';
+  }
+  fontFamilyBtn.addEventListener('click', () => {
+    const next = (fontIdx() + 1) % FONTS.length;
+    localStorage.setItem(FONT_FAMILY_KEY, FONTS[next].key);
+    applyFontFamily();
+  });
+  applyFontFamily();
 
   // Narrative font-size controls: persist scale in localStorage, clamp to a
    // sane range, refresh button-disabled state at the limits.
