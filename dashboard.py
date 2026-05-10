@@ -3345,11 +3345,16 @@ _PLAY_HTML = """
   const toolElements = new Map();
 
   // Auto-scroll only when the user is already near the bottom; otherwise
-  // surface a floating "↓ new" pill so they can jump down on demand
-  // without losing their reading position.
+  // leave their reading position alone. The "↓ new" pill is shown
+  // whenever the user is scrolled away from the bottom (regardless of
+  // whether new content has arrived) so they always have a one-click
+  // jump back — matches Slack/Discord behaviour.
   const NEAR_BOTTOM_PX = 120;
   function isNearBottom() {
     return log.scrollHeight - log.scrollTop - log.clientHeight < NEAR_BOTTOM_PX;
+  }
+  function refreshJumpBtn() {
+    jumpBtn.classList.toggle('visible', !isNearBottom());
   }
   function maybeScrollToBottom() {
     if (isNearBottom()) {
@@ -3362,9 +3367,11 @@ _PLAY_HTML = """
     log.scrollTop = log.scrollHeight;
     jumpBtn.classList.remove('visible');
   }
-  log.addEventListener('scroll', function(){
-    if (isNearBottom()) jumpBtn.classList.remove('visible');
-  });
+  log.addEventListener('scroll', refreshJumpBtn);
+  // Also re-check after layout changes that aren't a scroll event:
+  // window resize, or content height changing while the user holds
+  // their position (e.g. an image arriving in the background).
+  window.addEventListener('resize', refreshJumpBtn);
   jumpBtn.addEventListener('click', forceScrollToBottom);
 
   function esc(s) {
