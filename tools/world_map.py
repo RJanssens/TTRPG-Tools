@@ -753,6 +753,75 @@ def _polygon_ring(points: list[Coord]) -> list[list[float]]:
     return ring
 
 
+def _edge_seed(a: list, b: list) -> int:
+    """Order-independent integer seed for an edge endpoint pair.
+
+    Two polygons that share an edge will compute the same seed regardless
+    of which side they approach it from, so the perpendicular jitter
+    applied during roughening is identical and the polygons stay
+    connected (no gaps appearing along their shared boundary)."""
+    import hashlib
+    a, b = sorted([(round(a[0], 4), round(a[1], 4)),
+                   (round(b[0], 4), round(b[1], 4))])
+    return int(hashlib.md5(f"{a}|{b}".encode()).hexdigest()[:8], 16)
+
+
+def _roughen_ring(ring: list[list[float]], intensity: float,
+                  segments_per_edge: int = 4) -> list[list[float]]:
+    """Subdivide each polygon edge and jitter the inserted midpoints
+    perpendicular to the edge by ``intensity * edge_length``.
+
+    Original vertices are preserved (so adjacent polygons sharing those
+    vertices stay aligned). Each inserted midpoint is computed against
+    a canonical (sorted) edge orientation and seeded on the same
+    canonical edge, so two polygons that share an edge — even when they
+    traverse it in opposite directions — produce identical midpoint
+    coordinates and remain visually connected.
+
+    A natural-looking default for hand-drawn-feeling terrain is around
+    0.03–0.06; values above ~0.10 start looking cartoonish."""
+    import random
+    if intensity <= 0 or len(ring) < 4:
+        return ring
+    out: list[list[float]] = []
+    for i in range(len(ring) - 1):  # last == first (closed); iterate edges
+        a, b = ring[i], ring[i + 1]
+        out.append(list(a))
+
+        # Canonical edge — same regardless of polygon traversal direction.
+        ca, cb = sorted([(round(a[0], 4), round(a[1], 4)),
+                         (round(b[0], 4), round(b[1], 4))])
+        cdx, cdy = cb[0] - ca[0], cb[1] - ca[1]
+        edge_len = (cdx * cdx + cdy * cdy) ** 0.5
+        if edge_len < 1e-6:
+            continue
+        # Canonical perpendicular (rotated +90 from canonical direction).
+        cpx, cpy = -cdy / edge_len, cdx / edge_len
+        max_jitter = edge_len * intensity
+        rng = random.Random(_edge_seed(a, b))
+
+        # Compute midpoints along the canonical edge, then jitter.
+        midpoints = []
+        for s in range(1, segments_per_edge):
+            t = s / segments_per_edge
+            mx = ca[0] + cdx * t
+            my = ca[1] + cdy * t
+            j = (rng.random() * 2 - 1) * max_jitter
+            midpoints.append([mx + cpx * j, my + cpy * j])
+
+        # If this polygon traverses the edge in reverse-canonical order,
+        # the midpoints need to be inserted reversed so they appear in
+        # the polygon's own traversal direction. The COORDINATES are
+        # identical to the other polygon's — just listed back-to-front.
+        forward = ((round(a[0], 4), round(a[1], 4)) == ca)
+        if not forward:
+            midpoints.reverse()
+        out.extend(midpoints)
+
+    out.append(list(out[0]))   # close ring
+    return out
+
+
 def _rect_from_at_size(at: Coord, size: Coord) -> list[list[float]]:
     """Axis-aligned rectangle anchored at `at`, width=size.x, height=size.y."""
     x, y, w, h = at.x, at.y, size.x, size.y
@@ -822,7 +891,19 @@ def _feature_geometry(feat: Feature, ws: Workspace, scope_index: dict[str, Featu
     elif k in ("kingdom", "terrain", "lake"):
         pts = feat.get("polygon")
         if pts:
-            return {"type": "Polygon", "coordinates": [_polygon_ring(pts)]}
+            ring = _polygon_ring(pts)
+            # Roughen the polygon for natural-looking, hand-drawn-feeling
+            # outlines instead of crisp axis-aligned rectangles. Default
+            # intensity tuned to look cartographic without going noisy;
+            # override per-feature with `roughness 0.06` (or 0 to disable).
+            roughness = feat.get_one("roughness")
+            try:
+                intensity = float(roughness) if roughness is not None else 0.04
+            except (ValueError, TypeError):
+                intensity = 0.04
+            if intensity > 0:
+                ring = _roughen_ring(ring, intensity)
+            return {"type": "Polygon", "coordinates": [ring]}
     return None
 
 
