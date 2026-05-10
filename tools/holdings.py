@@ -272,6 +272,7 @@ def register(mcp):
     def update_house(
         slug: str,
         name: str = None,
+        owner: str = None,
         kind: str = None,
         location: str = None,
         value_gp: int = None,
@@ -282,7 +283,8 @@ def register(mcp):
     ) -> dict:
         """Patch-update a house. Pass only the fields you want to change.
         ``residents`` and ``inventory`` REPLACE the existing list (not append) —
-        read the current value with get_house first if you want to add."""
+        read the current value with get_house first if you want to add.
+        Changing ``owner`` re-validates against the PC roster."""
         cfg = _c.load_campaign()
         slug = _slugify(slug)
         houses = cfg.get("houses", {})
@@ -291,6 +293,11 @@ def register(mcp):
         h = houses[slug]
 
         if name is not None:        h["name"] = name
+        if owner is not None:
+            owner_key, err = _resolve_owner(cfg, owner)
+            if err:
+                return {"error": err}
+            h["owner"] = owner_key
         if kind is not None:
             h["kind"] = kind.strip().lower().replace(" ", "-") or "cottage"
         if location is not None:    h["location"] = location
@@ -383,17 +390,22 @@ def register(mcp):
             d_attacks = []
 
         # Use explicit values when non-zero/non-empty, else fall back to default.
+        # Note: AC=10 means "no armor" (valid) and MV=0 means "stationary"
+        # (valid for vehicles, treants in dormant pose, etc.) — both are
+        # legitimate values, not "missing". Only HP and THAC0 are validated
+        # as positive because HP<=0 is dead and THAC0<=0 is nonsensical.
         final_hp     = hp_max if hp_max > 0 else d_hp
         final_ac     = ac     if ac     != 0 else d_ac
-        final_mv     = mv     if mv     > 0 else d_mv
+        final_mv     = mv     if mv     != 0 else d_mv
         final_thac0  = thac0  if thac0  > 0 else d_thac0
         final_morale = morale if morale > 0 else d_morale
         final_attacks = list(attacks) if attacks else list(d_attacks)
 
-        if not defaults and (final_hp <= 0 or final_ac == 0 or final_mv <= 0 or final_thac0 <= 0):
+        if not defaults and (final_hp <= 0 or final_thac0 <= 0):
             return {
                 "error": f"Custom species '{species}' has no defaults. "
-                         f"Pass hp_max, ac, mv, thac0 explicitly."
+                         f"Pass hp_max and thac0 explicitly (AC and MV may "
+                         f"be any value including 0 for stationary objects)."
             }
 
         record = {
@@ -468,6 +480,7 @@ def register(mcp):
     def update_mount(
         slug: str,
         name: str = None,
+        owner: str = None,
         species: str = None,
         hp_max: int = None,
         hp: int = None,
@@ -480,7 +493,8 @@ def register(mcp):
         inventory: list = None,
     ) -> dict:
         """Patch-update a mount. Pass only the fields you want to change.
-        ``attacks`` and ``inventory`` REPLACE the existing list."""
+        ``attacks`` and ``inventory`` REPLACE the existing list. Changing
+        ``owner`` re-validates against the PC roster."""
         cfg = _c.load_campaign()
         slug = _slugify(slug)
         mounts = cfg.get("mounts", {})
@@ -489,6 +503,11 @@ def register(mcp):
         m = mounts[slug]
 
         if name is not None:        m["name"] = name
+        if owner is not None:
+            owner_key, err = _resolve_owner(cfg, owner)
+            if err:
+                return {"error": err}
+            m["owner"] = owner_key
         if species is not None:     m["species"] = species.strip().lower().replace(" ", "-")
         if hp_max is not None:      m["hp_max"] = int(hp_max)
         if hp is not None:          m["hp"] = int(hp)
