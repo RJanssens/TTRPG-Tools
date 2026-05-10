@@ -2286,18 +2286,18 @@ _PLAY_HTML = """
   .play-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
   .jump-btn {
     position: absolute;
-    right: 18px;
-    bottom: 86px;
+    right: 22px;
+    bottom: 130px;
     z-index: 5;
-    padding: 6px 14px;
+    width: 34px; height: 34px;
+    padding: 0;
+    display: inline-flex; align-items: center; justify-content: center;
     background: var(--bg-rec);
     border: 1px solid var(--accent-gold);
-    border-radius: 999px;
+    border-radius: 50%;
     color: var(--accent-gold);
-    font-family: var(--font-display);
-    font-size: 0.72em;
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
+    font-size: 1.05em;
+    line-height: 1;
     cursor: pointer;
     box-shadow: 0 4px 14px rgba(0,0,0,0.5);
     opacity: 0;
@@ -3298,7 +3298,7 @@ _PLAY_HTML = """
         <div class="empty-state-text">Begin when ready. Describe an action below to address the DM.</div>
       </div>
     </div>
-    <button id="jump-to-bottom" class="jump-btn" type="button" aria-label="Jump to latest">↓ new</button>
+    <button id="jump-to-bottom" class="jump-btn" type="button" aria-label="Jump to latest" title="Jump to latest">↓</button>
     <form class="play-form" id="play-form">
       <textarea id="play-input" placeholder="Describe your action…  (Ctrl+Enter to send)" autocomplete="off"></textarea>
       <button type="submit" id="play-send" title="Send (Ctrl+Enter)" aria-label="Send">
