@@ -2002,10 +2002,45 @@ def sessions_index():
             "  transform: scale(1.08);"
             "}"
             ".session-delete:disabled { opacity: 0.3; cursor: not-allowed; }"
+            ".session-search-bar {"
+            "  display: flex; align-items: baseline; gap: 12px;"
+            "  margin: 8px 0 14px;"
+            "}"
+            ".session-search-bar input[type=search] {"
+            "  flex: 1; max-width: 480px;"
+            "  background: var(--bg-rec); color: var(--ink-body);"
+            "  border: 1px solid var(--rule); border-radius: 3px;"
+            "  padding: 6px 10px; font-family: var(--font-body); font-size: 0.95em;"
+            "}"
+            ".session-search-bar input[type=search]:focus {"
+            "  outline: none; border-color: var(--accent-gold);"
+            "}"
+            "#session-search-status { font-size: 0.85em; }"
+            ".search-session { margin-bottom: 12px; padding: 10px 14px; }"
+            ".search-snippets { list-style: none; padding: 0; margin: 6px 0 0; }"
+            ".search-snippets li {"
+            "  padding: 4px 0; border-top: 1px solid var(--rule);"
+            "  font-size: 0.92em; line-height: 1.45;"
+            "}"
+            ".search-snippets li:first-child { border-top: none; }"
+            ".search-snippets .role-tag {"
+            "  display: inline-block; min-width: 52px;"
+            "  font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.1em;"
+            "  color: var(--ink-muted); margin-right: 6px;"
+            "}"
+            ".search-snippets mark {"
+            "  background: rgba(212,175,55,0.28); color: inherit;"
+            "  padding: 0 2px; border-radius: 2px;"
+            "}"
             "</style>"
             "<h1>Sessions</h1>"
             f"<p class='muted'>{len(rows)} session(s). Newest first.</p>"
-            '<div class="card"><table style="width:100%;border-collapse:collapse">'
+            '<div class="session-search-bar">'
+            '  <input type="search" id="session-search" placeholder="Search across all sessions…" autocomplete="off">'
+            '  <span id="session-search-status" class="muted"></span>'
+            '</div>'
+            '<div id="session-search-results" hidden></div>'
+            '<div id="session-table-wrap" class="card"><table style="width:100%;border-collapse:collapse">'
             "<thead><tr>"
             '<th style="text-align:left;padding:6px 8px">ID</th>'
             '<th style="text-align:left;padding:6px 8px">When</th>'
@@ -2038,6 +2073,67 @@ def sessions_index():
             "      btn.disabled = false;"
             "    }"
             "  });"
+            "});"
+            "function escapeHtml(s){"
+            "  return String(s).replace(/[&<>\"']/g, function(c){"
+            "    return ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'})[c];"
+            "  });"
+            "}"
+            "function highlight(text, terms){"
+            "  let out = escapeHtml(text);"
+            "  for (const t of terms) {"
+            "    if (!t) continue;"
+            "    const esc = t.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');"
+            "    out = out.replace(new RegExp('(' + esc + ')', 'gi'), '<mark>$1</mark>');"
+            "  }"
+            "  return out;"
+            "}"
+            "const search = document.getElementById('session-search');"
+            "const status = document.getElementById('session-search-status');"
+            "const results = document.getElementById('session-search-results');"
+            "const tableWrap = document.getElementById('session-table-wrap');"
+            "let timer = null, lastReq = 0;"
+            "function showTable(){ results.hidden = true; results.innerHTML = ''; tableWrap.hidden = false; status.textContent = ''; }"
+            "function render(data){"
+            "  if (!data.results || data.results.length === 0) {"
+            "    results.innerHTML = '<p class=\"muted\">No matches for <em>' + escapeHtml(data.query) + '</em>.</p>';"
+            "    results.hidden = false; return;"
+            "  }"
+            "  const terms = data.terms || [];"
+            "  const blocks = data.results.map(function(r){"
+            "    const items = r.matches.map(function(m){"
+            "      const label = m.role === 'dm' ? 'DM' : 'Player';"
+            "      return '<li><span class=\"role-tag\">' + label + '</span>' + highlight(m.snippet, terms) + '</li>';"
+            "    }).join('');"
+            "    const more = r.match_count > r.matches.length"
+            "      ? ' <span class=\"muted\">(+' + (r.match_count - r.matches.length) + ' more)</span>'"
+            "      : '';"
+            "    return '<div class=\"search-session card\">'"
+            "      + '<div><a href=\"/sessions/' + encodeURIComponent(r.sid) + '\"><code>'"
+            "      + escapeHtml(r.sid.slice(0, 8)) + '</code></a> '"
+            "      + '<span class=\"muted\">' + escapeHtml(r.when) + '</span>' + more + '</div>'"
+            "      + '<ul class=\"search-snippets\">' + items + '</ul></div>';"
+            "  }).join('');"
+            "  results.innerHTML = '<p class=\"muted\">' + data.results.length + ' session(s) match.</p>' + blocks;"
+            "  results.hidden = false;"
+            "}"
+            "search.addEventListener('input', function(){"
+            "  const q = search.value.trim();"
+            "  clearTimeout(timer);"
+            "  if (q.length < 2) { showTable(); return; }"
+            "  status.textContent = 'searching…';"
+            "  timer = setTimeout(async function(){"
+            "    const reqId = ++lastReq;"
+            "    try {"
+            "      const r = await fetch('/api/sessions/search?q=' + encodeURIComponent(q));"
+            "      if (reqId !== lastReq) return;"
+            "      if (!r.ok) { status.textContent = 'error'; return; }"
+            "      const data = await r.json();"
+            "      tableWrap.hidden = true;"
+            "      status.textContent = '';"
+            "      render(data);"
+            "    } catch (err) { status.textContent = 'error'; }"
+            "  }, 250);"
             "});"
             "})();</script>"
         )
@@ -5016,6 +5112,107 @@ def api_session_delete(sid: str):
             pass
 
     return jsonify({"ok": True, "deleted": sid, "log_removed": log_removed})
+
+
+def _session_line_matches(text: str, terms: list[str]) -> bool:
+    low = text.lower()
+    return all(t in low for t in terms)
+
+
+def _session_make_snippet(text: str, terms: list[str], length: int = 160) -> str:
+    text = text.replace("\n", " ").strip()
+    low = text.lower()
+    pos = -1
+    for t in terms:
+        i = low.find(t)
+        if i >= 0 and (pos < 0 or i < pos):
+            pos = i
+    if pos < 0:
+        return text[:length] + ("…" if len(text) > length else "")
+    half = length // 2
+    start = max(0, pos - half)
+    end = min(len(text), start + length)
+    snippet = text[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(text):
+        snippet = snippet + "…"
+    return snippet
+
+
+@app.route("/api/sessions/search")
+def api_sessions_search():
+    """Full-text search across every session JSONL file in the project.
+    AND-of-words: all whitespace-separated terms must appear (case-
+    insensitive) in the same line. Player text and DM text are searched;
+    tool calls and tool results are skipped to keep snippets meaningful."""
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify({"query": q, "results": []})
+    terms = [t.lower() for t in q.split() if t.strip()]
+    if not terms:
+        return jsonify({"query": q, "results": []})
+
+    sdir = _sessions_dir()
+    if not sdir.is_dir():
+        return jsonify({"query": q, "terms": terms, "results": []})
+
+    MAX_PER_SESSION = 5
+    MAX_RESULTS = 50
+
+    results = []
+    for path in _export.list_sessions(sdir):
+        matches = []
+        match_count = 0
+        try:
+            with path.open() as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    role = rec.get("type")
+                    if role == "user":
+                        content = rec.get("message", {}).get("content", "")
+                        if isinstance(content, str):
+                            text = _export.clean_user_text(content)
+                            if text and _session_line_matches(text, terms):
+                                match_count += 1
+                                if len(matches) < MAX_PER_SESSION:
+                                    matches.append({
+                                        "role": "player",
+                                        "snippet": _session_make_snippet(text, terms),
+                                    })
+                    elif role == "assistant":
+                        content = rec.get("message", {}).get("content", [])
+                        if not isinstance(content, list):
+                            continue
+                        for block in content:
+                            if block.get("type") != "text":
+                                continue
+                            text = (block.get("text") or "").strip()
+                            if text and _session_line_matches(text, terms):
+                                match_count += 1
+                                if len(matches) < MAX_PER_SESSION:
+                                    matches.append({
+                                        "role": "dm",
+                                        "snippet": _session_make_snippet(text, terms),
+                                    })
+        except OSError:
+            continue
+        if matches:
+            st = path.stat()
+            when = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            results.append({
+                "sid": path.stem,
+                "when": when,
+                "matches": matches,
+                "match_count": match_count,
+            })
+            if len(results) >= MAX_RESULTS:
+                break
+
+    return jsonify({"query": q, "terms": terms, "results": results})
 
 
 @app.route("/api/images/<filename>", methods=["DELETE"])
