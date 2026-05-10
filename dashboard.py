@@ -2768,6 +2768,11 @@ _PLAY_HTML = """
     padding: 18px 22px;
     width: min(960px, 90vw);
     max-height: 80vh;
+  }
+  /* Only become a flex column once the dialog is actually open — leaving
+     ``display`` unset on the closed state preserves the browser's default
+     ``display: none`` so the dialog isn't permanently superimposed. */
+  dialog.debug-dialog[open] {
     display: flex;
     flex-direction: column;
   }
