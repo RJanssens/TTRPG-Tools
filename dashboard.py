@@ -2556,6 +2556,17 @@ _PLAY_HTML = """
   }
   .turn.meta::before { left: 8%; }
   .turn.meta::after { right: 8%; transform: scaleX(-1); }
+  .meta-info {
+    display: inline-block;
+    margin-left: 0.5em;
+    opacity: 0.45;
+    cursor: help;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 1.05em;
+    transition: opacity 0.15s ease;
+  }
+  .meta-info:hover { opacity: 1; }
 
   .play-form {
     margin-top: 14px;
@@ -3626,6 +3637,26 @@ _PLAY_HTML = """
     log.scrollTop = log.scrollHeight;
   }
 
+  function appendMeta(text, tooltip) {
+    clearEmptyState();
+    const div = document.createElement('div');
+    div.className = 'turn meta';
+    div.textContent = text;
+    if (tooltip) {
+      const icon = document.createElement('span');
+      icon.className = 'meta-info';
+      icon.textContent = '\\u24D8';   // circled lowercase i
+      icon.title = tooltip;
+      div.appendChild(icon);
+    }
+    if (thinkingEl && thinkingEl.parentElement === log) {
+      log.insertBefore(div, thinkingEl);
+    } else {
+      log.appendChild(div);
+    }
+    log.scrollTop = log.scrollHeight;
+  }
+
   function handleEvent(evt) {
     if (evt.type === 'system' && evt.session_id) {
       sidEl.textContent = evt.session_id.slice(0, 8);
@@ -3652,9 +3683,23 @@ _PLAY_HTML = """
     } else if (evt.type === 'result') {
       const parts = ['turn complete'];
       if (typeof evt.duration_ms === 'number') parts.push((evt.duration_ms / 1000).toFixed(1) + 's');
-      // Cost intentionally hidden — claude -p reports API-equivalent dollars
-      // but the user is on Claude Code subscription, so the number is noise.
-      append('meta', parts.join(' · '));
+      // Cost + tokens hidden behind a hover icon: claude -p reports
+      // API-equivalent dollars even on subscription, so the number is
+      // informational only — but useful for sizing context growth.
+      const tip = [];
+      if (typeof evt.total_cost_usd === 'number') {
+        tip.push('Cost (API-equivalent): $' + evt.total_cost_usd.toFixed(4));
+      }
+      const u = evt.usage || {};
+      if (typeof u.input_tokens === 'number' || typeof u.output_tokens === 'number') {
+        tip.push('Tokens: ' + (u.input_tokens || 0).toLocaleString() + ' in / '
+                            + (u.output_tokens || 0).toLocaleString() + ' out');
+      }
+      if (typeof u.cache_read_input_tokens === 'number' || typeof u.cache_creation_input_tokens === 'number') {
+        tip.push('Cache: ' + (u.cache_read_input_tokens || 0).toLocaleString() + ' read / '
+                           + (u.cache_creation_input_tokens || 0).toLocaleString() + ' write');
+      }
+      appendMeta(parts.join(' · '), tip.join('\\n'));
       refreshState();
     } else if (evt.type === 'error') {
       append('error', 'rc=' + evt.returncode + '  ' + (evt.stderr || '').slice(0, 500));
