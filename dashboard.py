@@ -19,6 +19,7 @@ from tools import item_weights as _iw
 from tools import homebrew_classes as _hb
 from tools import dm_session as _dm
 from tools import images as _img
+from tools import tts as _tts
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -2455,6 +2456,69 @@ _PLAY_HTML = """
   }
   .turn.dm {
     color: var(--ink-body);
+    position: relative;
+  }
+  .dm-controls {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 8px;
+    font-size: 0.78em;
+    color: var(--ink-muted);
+    opacity: 0.4;
+    transition: opacity 0.15s ease;
+  }
+  .turn.dm:hover .dm-controls,
+  .dm-controls.active { opacity: 1; }
+  .narrate-btn {
+    width: 24px; height: 24px; padding: 0;
+    border: 1px solid var(--rule);
+    background: transparent;
+    color: var(--ink-muted);
+    border-radius: 50%;
+    font-size: 0.85em; line-height: 1;
+    cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+  }
+  .narrate-btn:hover {
+    color: var(--accent-gold);
+    border-color: var(--accent-gold);
+  }
+  .narrate-btn[disabled] { opacity: 0.5; cursor: progress; }
+  .narrate-btn.playing { color: var(--accent-gold); border-color: var(--accent-gold); }
+  .narrate-meta { font-style: italic; }
+  .narrate-meta .seg-tag {
+    display: inline-block;
+    padding: 0 4px;
+    margin: 0 2px;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    color: var(--ink-muted);
+    font-size: 0.92em;
+    font-style: normal;
+  }
+  .narrate-meta .seg-tag.seg-narration { border-color: var(--rule-hi); }
+  .narrate-meta .seg-tag.seg-speech    { border-color: var(--accent-gold); color: var(--accent-gold); }
+  dialog.voice-dialog {
+    background: var(--bg-rec); color: var(--ink-body);
+    border: 1px solid var(--rule); border-radius: 4px;
+    padding: 18px 22px; min-width: 360px; max-width: 520px;
+  }
+  dialog.voice-dialog::backdrop { background: rgba(0,0,0,0.55); }
+  dialog.voice-dialog h3 { margin: 0 0 12px; font-family: var(--font-display); }
+  dialog.voice-dialog table { width: 100%; border-collapse: collapse; }
+  dialog.voice-dialog td { padding: 4px 6px; vertical-align: middle; }
+  dialog.voice-dialog td.label { color: var(--ink-muted); font-size: 0.9em; }
+  dialog.voice-dialog select {
+    width: 100%;
+    background: var(--bg-rec); color: var(--ink-body);
+    border: 1px solid var(--rule); border-radius: 2px;
+    padding: 3px 6px; font-family: var(--font-body); font-size: 0.92em;
+  }
+  dialog.voice-dialog .row-divider td {
+    border-top: 1px solid var(--rule); padding-top: 8px;
+  }
+  dialog.voice-dialog .actions {
+    display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px;
   }
   /* Markdown rendered inside DM turns — scope headings/rules/etc so they
      don't carry their full-page sizing into the chat log. */
@@ -3175,6 +3239,7 @@ _PLAY_HTML = """
       <span id="play-status"></span>
       <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
       <button id="play-make-pic-hint" type="button" class="icon-btn" title="Make picture with a hint" aria-label="Make picture with a hint">…</button>
+      <button id="play-voices" type="button" class="icon-btn" title="Configure narration voices" aria-label="Configure narration voices">🎙</button>
       <button id="play-reset" type="button">New session</button>
     </div>
     <dialog id="hint-dialog" class="hint-dialog">
@@ -3185,6 +3250,17 @@ _PLAY_HTML = """
         <div class="hint-actions">
           <button type="button" id="hint-cancel">Cancel</button>
           <button type="submit" id="hint-submit">Generate</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="voice-dialog" class="voice-dialog">
+      <form id="voice-form" method="dialog">
+        <h3>Narration voices</h3>
+        <p class="muted">Each voice is sampled by gpt-4o-mini-tts. Speech is detected from markdown blockquotes; speaker is matched by name.</p>
+        <table id="voice-table"><tbody></tbody></table>
+        <div class="actions">
+          <button type="button" id="voice-cancel">Cancel</button>
+          <button type="submit" id="voice-save">Save</button>
         </div>
       </form>
     </dialog>
@@ -3704,6 +3780,7 @@ _PLAY_HTML = """
     div.className = 'turn ' + t.role;
     if (t.role === 'dm') {
       div.innerHTML = renderMarkdown(t.text);
+      attachDmControls(div, t.text);
     } else if (t.role === 'tool') {
       div.classList.add('history-tool');
       div.textContent = t.text;
@@ -3719,6 +3796,7 @@ _PLAY_HTML = """
     div.className = 'turn ' + role;
     if (role === 'dm') {
       div.innerHTML = renderMarkdown(text);
+      attachDmControls(div, text);
     } else {
       div.textContent = text;
     }
@@ -3732,6 +3810,103 @@ _PLAY_HTML = """
     }
     log.scrollTop = log.scrollHeight;
   }
+
+  function attachDmControls(turnEl, text) {
+    const controls = document.createElement('div');
+    controls.className = 'dm-controls';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'narrate-btn';
+    btn.title = 'Narrate this turn';
+    btn.setAttribute('aria-label', 'Narrate this turn');
+    btn.textContent = '\\u25B6';   // ▶
+    const meta = document.createElement('span');
+    meta.className = 'narrate-meta';
+    controls.appendChild(btn);
+    controls.appendChild(meta);
+    btn.addEventListener('click', function(){ narrate(btn, meta, text); });
+    turnEl.appendChild(controls);
+  }
+
+  // Single-instance narration: only one DM turn plays at a time. Starting
+  // a new narration stops any other in-flight playback so they don't
+  // overlap. Esc key stops the current one from anywhere on the page.
+  let activeNarration = null;   // { btn, audio }
+
+  function stopActiveNarration() {
+    if (!activeNarration) return;
+    const { btn, audio } = activeNarration;
+    try { audio.pause(); audio.currentTime = 0; } catch (e) { /* ignore */ }
+    btn.classList.remove('playing');
+    btn.textContent = '\\u25B6';
+    activeNarration = null;
+  }
+
+  async function narrate(btn, meta, text) {
+    // Same-button toggle: clicking the active button stops playback.
+    if (activeNarration && activeNarration.btn === btn) {
+      stopActiveNarration();
+      return;
+    }
+    // Different-button takeover: stop whatever's playing, then proceed.
+    if (activeNarration) stopActiveNarration();
+
+    if (btn.dataset.audioUrl) {
+      playAudio(btn, btn.dataset.audioUrl);
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = '\\u25CB';   // ○ pending
+    meta.textContent = ' synthesizing…';
+    try {
+      const r = await fetch('/api/tts/synthesize', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({text: text}),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      btn.dataset.audioUrl = d.audio_url;
+      // Render segment breakdown.
+      const tags = (d.segments || []).map(function(s){
+        const label = s.kind === 'speech' ? (s.speaker || 'NPC') : 'narrator';
+        const cls = 'seg-tag seg-' + s.kind;
+        return '<span class="' + cls + '" title="' + s.voice + ' · ' + s.char_count + ' chars">' + label + '</span>';
+      }).join('');
+      const cached = d.cached ? ' (cached)' : '';
+      meta.innerHTML = tags + ' <span class="muted">' + d.total_chars + ' chars' + cached + '</span>';
+      playAudio(btn, d.audio_url);
+    } catch (err) {
+      meta.textContent = ' error: ' + err.message;
+      btn.textContent = '\\u25B6';
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function playAudio(btn, url) {
+    const audio = new Audio(url);
+    activeNarration = { btn: btn, audio: audio };
+    btn.classList.add('playing');
+    btn.textContent = '\\u25A0';   // ■ stop
+    const cleanup = function(){
+      btn.classList.remove('playing');
+      btn.textContent = '\\u25B6';
+      if (activeNarration && activeNarration.audio === audio) activeNarration = null;
+    };
+    audio.addEventListener('ended', cleanup);
+    audio.addEventListener('error', cleanup);
+    audio.play().catch(cleanup);
+  }
+
+  // Global Esc stops narration. Don't intercept if the user is editing text.
+  document.addEventListener('keydown', function(e){
+    if (e.key !== 'Escape') return;
+    if (!activeNarration) return;
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+    stopActiveNarration();
+  });
 
   function appendMeta(text, tooltip) {
     clearEmptyState();
@@ -4015,6 +4190,102 @@ _PLAY_HTML = """
     const h = hintText.value.trim();
     hintDialog.close();
     runMakePicture(h);
+  });
+
+  // --- Voice mapping dialog ---
+  const voiceBtn = document.getElementById('play-voices');
+  const voiceDialog = document.getElementById('voice-dialog');
+  const voiceForm = document.getElementById('voice-form');
+  const voiceCancel = document.getElementById('voice-cancel');
+  const voiceTbody = document.querySelector('#voice-table tbody');
+
+  function buildVoiceSelect(name, current, options, allowEmpty) {
+    let html = '<select name="' + name + '">';
+    if (allowEmpty) {
+      html += '<option value="">— use default NPC voice —</option>';
+    }
+    for (const v of options) {
+      const sel = (v === current) ? ' selected' : '';
+      html += '<option value="' + v + '"' + sel + '>' + v + '</option>';
+    }
+    html += '</select>';
+    return html;
+  }
+
+  voiceBtn.addEventListener('click', async () => {
+    voiceTbody.innerHTML = '<tr><td colspan="2" class="muted">loading…</td></tr>';
+    if (typeof voiceDialog.showModal === 'function') voiceDialog.showModal();
+    try {
+      const r = await fetch('/api/tts/voices');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      const valid = d.valid_voices || [];
+      const m = d.mapping || {};
+      const chars = d.characters || [];
+      const charMap = m.characters || {};
+      let html = '';
+      html += '<tr><td class="label">Narrator</td><td>'
+            + buildVoiceSelect('narrator', m.narrator, valid, false) + '</td></tr>';
+      html += '<tr><td class="label">Default NPC</td><td>'
+            + buildVoiceSelect('default_npc', m.default_npc, valid, false) + '</td></tr>';
+      if (chars.length === 0) {
+        html += '<tr class="row-divider"><td colspan="2" class="muted">'
+              + 'No characters yet — voices will be assignable once NPCs are introduced.'
+              + '</td></tr>';
+      } else {
+        chars.forEach(function(slug, idx){
+          const cls = idx === 0 ? 'row-divider' : '';
+          html += '<tr class="' + cls + '"><td class="label">' + slug + '</td><td>'
+                + buildVoiceSelect('char__' + slug, charMap[slug] || '', valid, true)
+                + '</td></tr>';
+        });
+      }
+      voiceTbody.innerHTML = html;
+    } catch (err) {
+      voiceTbody.innerHTML = '<tr><td colspan="2" class="muted">load failed: '
+                           + err.message + '</td></tr>';
+    }
+  });
+
+  voiceCancel.addEventListener('click', () => voiceDialog.close());
+
+  voiceForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(voiceForm);
+    const payload = {
+      narrator: fd.get('narrator') || 'alloy',
+      default_npc: fd.get('default_npc') || 'fable',
+      characters: {},
+    };
+    for (const [k, v] of fd.entries()) {
+      if (k.startsWith('char__') && v) {
+        payload.characters[k.slice('char__'.length)] = v;
+      }
+    }
+    try {
+      const r = await fetch('/api/tts/voices', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        alert('Save failed: ' + (d.error || ('HTTP ' + r.status)));
+        return;
+      }
+      voiceDialog.close();
+      // Invalidate cached audio refs on the page so re-clicks resynthesize
+      // with the new voice mapping.
+      document.querySelectorAll('.narrate-btn').forEach(function(b){
+        delete b.dataset.audioUrl;
+        b.classList.remove('playing');
+        b.textContent = '\\u25B6';
+        b._audio = null;
+      });
+      document.querySelectorAll('.narrate-meta').forEach(function(m){ m.innerHTML = ''; });
+    } catch (err) {
+      alert('Save failed: ' + err.message);
+    }
   });
 
   // Narrative font-family cycle: three options, from thematic to maximally
@@ -5213,6 +5484,79 @@ def api_sessions_search():
                 break
 
     return jsonify({"query": q, "terms": terms, "results": results})
+
+
+# --- TTS narration endpoints --------------------------------------------
+
+@app.route("/api/tts/synthesize", methods=["POST"])
+def api_tts_synthesize():
+    """Render a DM-turn text to MP3 with per-character voice mapping.
+    Body: ``{"text": "..."}`` Returns the segment manifest plus the URL
+    to the cached audio file. Re-requests for the same text + voice
+    combination hit the on-disk cache and don't re-pay."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    payload = request.get_json(silent=True) or {}
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "empty text"}), 400
+    if len(text) > 20000:
+        return jsonify({"error": "text exceeds 20k chars"}), 413
+    try:
+        manifest = _tts.synthesize_turn(cfg["_dir"], text)
+    except EnvironmentError as exc:
+        return jsonify({"error": str(exc)}), 500
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001  — surface API failures
+        return jsonify({"error": f"TTS failed: {exc}"}), 502
+    manifest["audio_url"] = (
+        f"/api/tts/audio/{manifest['filename']}"
+    )
+    return jsonify(manifest)
+
+
+@app.route("/api/tts/audio/<filename>")
+def api_tts_audio(filename: str):
+    """Serve a cached MP3 from the active campaign's audio dir."""
+    if not cfg:
+        abort(404)
+    if not re.fullmatch(r"[a-zA-Z0-9_\-]+\.mp3", filename):
+        abort(400)
+    audio_dir = cfg["_dir"] / "audio"
+    target = audio_dir / filename
+    if not target.is_file():
+        abort(404)
+    return send_from_directory(str(audio_dir), filename, mimetype="audio/mpeg")
+
+
+@app.route("/api/tts/voices", methods=["GET"])
+def api_tts_voices_get():
+    """Read voice mapping + valid options + the list of character slugs
+    the UI can offer for assignment."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    return jsonify({
+        "mapping": _tts.load_voice_map(cfg["_dir"]),
+        "valid_voices": list(_tts.VALID_VOICES),
+        "characters": _tts.known_character_slugs(cfg["_dir"]),
+    })
+
+
+@app.route("/api/tts/voices", methods=["PUT"])
+def api_tts_voices_put():
+    """Replace the voice mapping. Body shape matches load_voice_map's
+    return value; unknown voice names are silently dropped by save."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "expected JSON object"}), 400
+    try:
+        _tts.save_voice_map(cfg["_dir"], payload)
+    except OSError as exc:
+        return jsonify({"error": f"save failed: {exc}"}), 500
+    return jsonify({"ok": True, "mapping": _tts.load_voice_map(cfg["_dir"])})
 
 
 @app.route("/api/images/<filename>", methods=["DELETE"])

@@ -28,3 +28,6 @@ global/reference/phb.txt
 campaigns/*/images/*.png
 campaigns/*/images/*.jpg
 campaigns/*/images/*.webp
+
+# Generated narration audio (regeneratable via TTS)
+campaigns/*/audio/
