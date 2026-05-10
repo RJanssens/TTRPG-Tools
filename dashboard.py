@@ -2283,7 +2283,34 @@ _PLAY_HTML = """
     flex: 1;
     min-height: 0;               /* allow inner overflow:auto to actually scroll */
   }
-  .play-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .play-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+  .jump-btn {
+    position: absolute;
+    right: 18px;
+    bottom: 86px;
+    z-index: 5;
+    padding: 6px 14px;
+    background: var(--bg-rec);
+    border: 1px solid var(--accent-gold);
+    border-radius: 999px;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.5);
+    opacity: 0;
+    transform: translateY(8px);
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+  .jump-btn.visible {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+  }
+  .jump-btn:hover { color: var(--accent-gold-hi); border-color: var(--accent-gold-hi); }
   .play-side { min-width: 0; min-height: 0; overflow-y: auto; }
 
   .play-toolbar {
@@ -3271,6 +3298,7 @@ _PLAY_HTML = """
         <div class="empty-state-text">Begin when ready. Describe an action below to address the DM.</div>
       </div>
     </div>
+    <button id="jump-to-bottom" class="jump-btn" type="button" aria-label="Jump to latest">↓ new</button>
     <form class="play-form" id="play-form">
       <textarea id="play-input" placeholder="Describe your action…  (Ctrl+Enter to send)" autocomplete="off"></textarea>
       <button type="submit" id="play-send" title="Send (Ctrl+Enter)" aria-label="Send">
@@ -3305,6 +3333,7 @@ _PLAY_HTML = """
   const sideCamp = document.getElementById('side-camp');
   const sideStats = document.getElementById('side-stats');
   const makePicBtn = document.getElementById('play-make-pic');
+  const jumpBtn = document.getElementById('jump-to-bottom');
   let firstAppend = true;
   let lastDmText = '';
   let thinkingEl = null;
@@ -3314,6 +3343,29 @@ _PLAY_HTML = """
   // Map tool_use.id → DOM element so tool_result events can fill in the
   // result section once it lands.
   const toolElements = new Map();
+
+  // Auto-scroll only when the user is already near the bottom; otherwise
+  // surface a floating "↓ new" pill so they can jump down on demand
+  // without losing their reading position.
+  const NEAR_BOTTOM_PX = 120;
+  function isNearBottom() {
+    return log.scrollHeight - log.scrollTop - log.clientHeight < NEAR_BOTTOM_PX;
+  }
+  function maybeScrollToBottom() {
+    if (isNearBottom()) {
+      log.scrollTop = log.scrollHeight;
+    } else {
+      jumpBtn.classList.add('visible');
+    }
+  }
+  function forceScrollToBottom() {
+    log.scrollTop = log.scrollHeight;
+    jumpBtn.classList.remove('visible');
+  }
+  log.addEventListener('scroll', function(){
+    if (isNearBottom()) jumpBtn.classList.remove('visible');
+  });
+  jumpBtn.addEventListener('click', forceScrollToBottom);
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -3703,7 +3755,7 @@ _PLAY_HTML = """
     } else {
       log.appendChild(det);
     }
-    log.scrollTop = log.scrollHeight;
+    maybeScrollToBottom();
     if (block.id) toolElements.set(block.id, {el: det, name: name, input: block.input || {}});
     return det;
   }
@@ -3746,7 +3798,7 @@ _PLAY_HTML = """
       + '<span class="thinking-text">DM is thinking…</span>'
       + '<span class="thinking-time">0.0s</span>';
     log.appendChild(thinkingEl);
-    log.scrollTop = log.scrollHeight;
+    maybeScrollToBottom();
     updateThinkingTime();
     thinkingTimer = setInterval(updateThinkingTime, 200);
   }
@@ -3808,7 +3860,7 @@ _PLAY_HTML = """
     } else {
       log.appendChild(div);
     }
-    log.scrollTop = log.scrollHeight;
+    maybeScrollToBottom();
   }
 
   function attachDmControls(turnEl, text) {
@@ -3925,7 +3977,7 @@ _PLAY_HTML = """
     } else {
       log.appendChild(div);
     }
-    log.scrollTop = log.scrollHeight;
+    maybeScrollToBottom();
   }
 
   function handleEvent(evt) {
@@ -4149,7 +4201,7 @@ _PLAY_HTML = """
           '<img src="' + esc(d.url) + '" alt="generated scene">'
         + '<span class="caption">' + esc(captionLabel) + '</span>'
         + promptDetails;
-      log.scrollTop = log.scrollHeight;
+      maybeScrollToBottom();
     } catch (err) {
       placeholder.className = 'turn error';
       placeholder.textContent = 'image generation failed: ' + String(err);
