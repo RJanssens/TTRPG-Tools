@@ -554,6 +554,23 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     font-size: 0.88em; line-height: 1.3;
   }}
   .holding-sub {{ font-size: 0.85em; }}
+  .holding-stowed {{
+    margin-top: 3px;
+    font-size: 0.78em;
+    color: var(--ink-muted);
+    font-style: italic;
+  }}
+  .stowed-chip {{
+    display: inline-block;
+    padding: 0 5px;
+    margin-right: 3px;
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    background: rgba(0,0,0,0.18);
+    color: var(--ink-body);
+    font-style: normal;
+    font-size: 0.92em;
+  }}
 
   /* ---- Spells ---- */
   .spell-ready {{ color: var(--ink-body); }}
@@ -1373,12 +1390,25 @@ def _render_holdings_panel(houses: list, mounts: list) -> str:
         bar = ""
         if hp_max_m and hp_cur < hp_max_m:
             bar = " " + _hp_bar(hp_cur, hp_max_m, width=8)
+        # Stowed-pool footer: vehicle-consumables held by this mount/cart.
+        stowed = m.get("stowed") or {}
+        stowed_html = ""
+        if stowed:
+            chips = " ".join(
+                f'<span class="stowed-chip">{html.escape(k)} ×{int(v)}</span>'
+                for k, v in sorted(stowed.items()) if int(v) > 0
+            )
+            if chips:
+                stowed_html = f'<span class="holding-stowed">stowed: {chips}</span>'
+        # Cart icon for stationary "vehicles" (mv 0); horse for everything else.
+        glyph = "🛒" if (m.get("mv") or 0) == 0 else "🐎"
         items.append(
             f'<div class="holding-card holding-mount">'
-            f'{_thumb(m.get("portrait", ""), m.get("name", ""), "🐎")}'
+            f'{_thumb(m.get("portrait", ""), m.get("name", ""), glyph)}'
             f'<div class="holding-body">'
             f'<strong>{html.escape(m.get("name", m["slug"]))}</strong>{bar}'
             f'<span class="holding-sub muted">{sub}</span>'
+            f'{stowed_html}'
             f'</div></div>'
         )
     return (
@@ -1530,6 +1560,7 @@ def party():
 
     # Holdings (houses + mounts) grouped by owner PC key, so each
     # character card can render its own panel without re-scanning.
+    vehicle_pools = state.get("vehicle_consumables") or {}
     houses_by_owner: dict[str, list] = {}
     for slug, h in (cfg.get("houses") or {}).items():
         houses_by_owner.setdefault(h.get("owner", ""), []).append({"slug": slug, **h})
@@ -1537,7 +1568,11 @@ def party():
         v.sort(key=lambda r: r.get("name", ""))
     mounts_by_owner: dict[str, list] = {}
     for slug, m in (cfg.get("mounts") or {}).items():
-        mounts_by_owner.setdefault(m.get("owner", ""), []).append({"slug": slug, **m})
+        rec = {"slug": slug, **m}
+        # Attach the stowed-pool counts so the Holdings panel can show them.
+        if slug in vehicle_pools:
+            rec["stowed"] = vehicle_pools[slug]
+        mounts_by_owner.setdefault(m.get("owner", ""), []).append(rec)
     for v in mounts_by_owner.values():
         v.sort(key=lambda r: r.get("name", ""))
 
