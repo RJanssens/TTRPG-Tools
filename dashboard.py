@@ -6581,6 +6581,26 @@ def maps_index():
     return render("World Maps", body)
 
 
+def _map_icon_overrides() -> dict:
+    """Scan static/map-icons/ for per-kind icon files. Returns ``{kind: url}``.
+    Files matching ``<kind>.{svg,png,jpg,jpeg,webp}`` provide overrides for
+    the inline SVG icons in static/world-map.js. SVG wins ties."""
+    icons_dir = Path(__file__).parent / "static" / "map-icons"
+    if not icons_dir.is_dir():
+        return {}
+    out: dict[str, str] = {}
+    rank = {".svg": 0, ".png": 1, ".webp": 2, ".jpg": 3, ".jpeg": 3}
+    for p in sorted(icons_dir.iterdir(), key=lambda x: rank.get(x.suffix.lower(), 9)):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext not in rank:
+            continue
+        kind = p.stem.lower()
+        out.setdefault(kind, f"/static/map-icons/{p.name}")
+    return out
+
+
 @app.route("/maps/<slug>/<view>")
 def map_view(slug, view):
     """Render a Leaflet view of a world map."""
@@ -6599,6 +6619,7 @@ def map_view(slug, view):
 
     data_url  = f"/api/maps/{slug}/{view}.geojson"
     party_url = f"/api/maps/{slug}/party.geojson"
+    icon_overrides = _map_icon_overrides()
     body = (
         '<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" '
         'integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">'
@@ -6616,6 +6637,13 @@ def map_view(slug, view):
         # Hover-brighten on every interactive feature (SVG paths from L.geoJSON).
         '  .leaflet-interactive { transition: filter 0.15s ease; }'
         '  .leaflet-interactive:hover { filter: brightness(1.2) saturate(1.1); cursor: pointer; }'
+        # Per-kind POI icons (inline SVG via L.divIcon, or stock images via L.icon).
+        '  .map-icon { display: flex; align-items: center; justify-content: center; '
+        '              filter: drop-shadow(0 1px 2px rgba(0,0,0,0.55)); transition: transform 0.15s ease; }'
+        '  .map-icon svg { width: 100%; height: 100%; display: block; }'
+        '  .map-icon:hover { transform: scale(1.18); cursor: pointer; z-index: 1000 !important; }'
+        '  .map-icon-img { filter: drop-shadow(0 1px 2px rgba(0,0,0,0.6)); transition: transform 0.15s ease; }'
+        '  .map-icon-img:hover { transform: scale(1.18); cursor: pointer; z-index: 1000 !important; }'
         # Tooltip readability — text shadow against busy backgrounds.
         '  .leaflet-tooltip { text-shadow: 0 0 3px #000, 0 0 1px #000; '
         '                     background: rgba(20,16,12,0.78); color: #f1e6cc; '
@@ -6661,6 +6689,7 @@ def map_view(slug, view):
         f'window.WORLD_MAP_VIEW  = {json.dumps(view)};'
         f'window.WORLD_MAP_DATA  = {json.dumps(data_url)};'
         f'window.WORLD_MAP_PARTY = {json.dumps(party_url)};'
+        f'window.MAP_ICON_OVERRIDES = {json.dumps(icon_overrides)};'
         f'</script>'
         '<script src="/static/world-map.js"></script>'
     )
