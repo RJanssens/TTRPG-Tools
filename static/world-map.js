@@ -73,6 +73,38 @@
         poi:      '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12 3 L14.4 9.5 L21 9.7 L15.7 13.7 L17.6 20 L12 16.3 L6.4 20 L8.3 13.7 L3 9.7 L9.6 9.5 Z" fill="#d4af37" stroke="#1a1510" stroke-width="1.3" stroke-linejoin="round"/></svg>',
     };
 
+    // Recognised icon kinds — used both as a fallback and as a tag whitelist
+    // so the DSL author can force a specific icon by tagging the feature.
+    var ICON_KINDS = [
+        'capital', 'city', 'town', 'village', 'fortress', 'keep', 'tower',
+        'ruin', 'dungeon', 'cave', 'shrine', 'temple', 'monument',
+        'bridge', 'port', 'ford', 'camp', 'farm', 'inn', 'poi',
+    ];
+
+    // Map the authored kind + properties to the icon kind we should render.
+    //   1. If any tag is the literal name of an icon kind, that wins.
+    //      Lets a DSL author tag a feature ``[village]`` and have it
+    //      rendered as a village even if its declared kind is ``city``.
+    //   2. Settlement kinds (city/town/village) get population-based
+    //      promotion or demotion: <1000 → village, <8000 → town, else city.
+    //      Picks reasonable AD&D breakpoints; bypassed entirely when no
+    //      population is set.
+    //   3. Otherwise the authored kind is used as-is.
+    function effectiveKind(p) {
+        var tags = p.tags || [];
+        for (var i = 0; i < tags.length; i++) {
+            if (ICON_KINDS.indexOf(tags[i]) >= 0) return tags[i];
+        }
+        var kind = p.kind || 'poi';
+        if (kind === 'city' || kind === 'town' || kind === 'village') {
+            var pop = parseInt(p.pop || 0, 10);
+            if (pop >= 8000) return 'city';
+            if (pop >= 1000) return 'town';
+            if (pop > 0)     return 'village';
+        }
+        return kind;
+    }
+
     function iconFor(kind, style) {
         var rawSize = (style && style['marker-size']) || 12;
         var px = Math.max(18, Math.round(rawSize * 2.0));
@@ -97,8 +129,10 @@
 
     function pointToLayer(feature, latlng) {
         var p = feature.properties || {};
-        var kind = p.kind || 'poi';
-        return L.marker(latlng, { icon: iconFor(kind, p._style || {}), riseOnHover: true });
+        return L.marker(latlng, {
+            icon: iconFor(effectiveKind(p), p._style || {}),
+            riseOnHover: true,
+        });
     }
 
     function describe(p) {
