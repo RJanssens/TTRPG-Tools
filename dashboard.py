@@ -2762,6 +2762,49 @@ _PLAY_HTML = """
   dialog.voice-dialog .actions {
     display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px;
   }
+  dialog.debug-dialog {
+    background: var(--bg-rec); color: var(--ink-body);
+    border: 1px solid var(--rule); border-radius: 4px;
+    padding: 18px 22px;
+    width: min(960px, 90vw);
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+  }
+  dialog.debug-dialog::backdrop { background: rgba(0,0,0,0.55); }
+  dialog.debug-dialog h3 { margin: 0 0 8px; font-family: var(--font-display); }
+  dialog.debug-dialog p.muted { font-size: 0.85em; margin-bottom: 10px; }
+  dialog.debug-dialog .debug-pre {
+    flex: 1 1 auto; min-height: 240px;
+    overflow: auto;
+    background: var(--bg-deep);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    padding: 10px 12px;
+    font-family: var(--font-mono);
+    font-size: 0.78em;
+    line-height: 1.45;
+    color: #c8b88a;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  dialog.debug-dialog .actions {
+    display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px;
+  }
+  dialog.debug-dialog button {
+    padding: 5px 12px;
+    background: transparent;
+    border: 1px solid var(--rule-hi);
+    color: var(--ink-body);
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--font-display);
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+  }
+  dialog.debug-dialog button:hover { border-color: var(--accent-gold); color: var(--accent-gold); }
+  #play-debug.debug-on { color: var(--accent-gold); border-color: var(--accent-gold); }
   /* Markdown rendered inside DM turns — scope headings/rules/etc so they
      don't carry their full-page sizing into the chat log. */
   .turn.dm > *:first-child { margin-top: 0; }
@@ -3482,6 +3525,7 @@ _PLAY_HTML = """
       <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
       <button id="play-make-pic-hint" type="button" class="icon-btn" title="Make picture with a hint" aria-label="Make picture with a hint">…</button>
       <button id="play-voices" type="button" class="icon-btn" title="Configure narration voices" aria-label="Configure narration voices">🎙</button>
+      <button id="play-debug" type="button" class="icon-btn" title="Inspect the raw stream-JSON events from claude -p (last 200)" aria-label="Open debug log">🐛</button>
       <button id="play-reset" type="button">New session</button>
     </div>
     <dialog id="hint-dialog" class="hint-dialog">
@@ -3505,6 +3549,16 @@ _PLAY_HTML = """
           <button type="submit" id="voice-save">Save</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="debug-dialog" class="debug-dialog">
+      <h3>Stream-JSON events <span class="muted" id="debug-count">(0)</span></h3>
+      <p class="muted">Last 200 events from <code>claude -p</code>. Per-turn token + cost are inside each <code>result</code> event's <code>usage</code> field.</p>
+      <pre id="debug-pre" class="debug-pre">(none captured yet)</pre>
+      <div class="actions">
+        <button type="button" id="debug-clear">Clear</button>
+        <button type="button" id="debug-copy">Copy JSON</button>
+        <button type="button" id="debug-close">Close</button>
+      </div>
     </dialog>
     <div class="play-log" id="play-log">
       <button id="load-more" class="load-more-btn" type="button" hidden>↑ Load earlier turns</button>
@@ -4207,7 +4261,20 @@ _PLAY_HTML = """
     maybeScrollToBottom();
   }
 
+  // Debug capture — keep the last 200 stream-json events in memory so the
+  // 🐛 dialog can show what claude -p actually sent (token usage lives in
+  // the result events' .usage field; tool calls are in assistant events;
+  // the user's own message round-trips back as a user event with the
+  // tool_result blocks). Capture is unconditional and cheap; the dialog
+  // is the only thing that exposes it.
+  const DEBUG_BUFFER_MAX = 200;
+  const debugEvents = [];
+
   function handleEvent(evt) {
+    debugEvents.push(evt);
+    if (debugEvents.length > DEBUG_BUFFER_MAX) {
+      debugEvents.splice(0, debugEvents.length - DEBUG_BUFFER_MAX);
+    }
     if (evt.type === 'system' && evt.session_id) {
       sidEl.textContent = evt.session_id.slice(0, 8);
     } else if (evt.type === 'assistant' && evt.message && Array.isArray(evt.message.content)) {
@@ -4565,6 +4632,57 @@ _PLAY_HTML = """
     } catch (err) {
       alert('Save failed: ' + err.message);
     }
+  });
+
+  // --- Debug dialog ---
+  const debugBtn    = document.getElementById('play-debug');
+  const debugDialog = document.getElementById('debug-dialog');
+  const debugPre    = document.getElementById('debug-pre');
+  const debugCount  = document.getElementById('debug-count');
+  const debugClear  = document.getElementById('debug-clear');
+  const debugCopy   = document.getElementById('debug-copy');
+  const debugClose  = document.getElementById('debug-close');
+
+  function renderDebug() {
+    debugCount.textContent = '(' + debugEvents.length + ')';
+    debugPre.textContent = debugEvents.length === 0
+      ? '(none captured yet)'
+      : JSON.stringify(debugEvents, null, 2);
+  }
+
+  debugBtn.addEventListener('click', () => {
+    renderDebug();
+    if (typeof debugDialog.showModal === 'function') {
+      debugDialog.showModal();
+      // Scroll to the bottom so the most recent events are visible.
+      requestAnimationFrame(() => { debugPre.scrollTop = debugPre.scrollHeight; });
+    }
+  });
+  debugClose.addEventListener('click', () => debugDialog.close());
+  debugClear.addEventListener('click', () => {
+    debugEvents.length = 0;
+    renderDebug();
+  });
+  debugCopy.addEventListener('click', async () => {
+    const text = JSON.stringify(debugEvents, null, 2);
+    const orig = debugCopy.textContent;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Fallback: select the pre and execCommand-copy.
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(debugPre);
+        sel.removeAllRanges(); sel.addRange(range);
+        document.execCommand('copy');
+        sel.removeAllRanges();
+      }
+      debugCopy.textContent = 'Copied ✓';
+    } catch (err) {
+      debugCopy.textContent = 'Copy failed';
+    }
+    setTimeout(() => { debugCopy.textContent = orig; }, 1400);
   });
 
   // Narrative font-family cycle: three options, from thematic to maximally
