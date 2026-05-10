@@ -531,7 +531,15 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     border: 1px solid var(--rule);
     border-radius: 3px;
     background: rgba(0,0,0,0.18);
+    color: var(--ink-body);
+    text-decoration: none;
+    transition: background 0.15s ease, border-color 0.15s ease;
   }}
+  a.holding-card:hover {{
+    background: rgba(200,169,110,0.10);
+    border-color: var(--accent-gold);
+  }}
+  a.holding-card:hover strong {{ color: var(--accent-gold-hi); }}
   .holding-card.holding-house {{ border-left: 3px solid var(--accent-gold); }}
   .holding-card.holding-mount {{ border-left: 3px solid #8aa66a; }}
   .holding-thumb {{
@@ -753,6 +761,54 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   }}
   .sheet-portrait-wrap {{ text-align: center; }}
   .sheet-portrait-wrap details.portrait-desc {{ margin-top: 6px; }}
+  .holding-portrait-wrap {{ position: relative; }}
+  .holding-portrait-wrap.empty {{
+    width: 200px; height: 200px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px dashed var(--rule-hi); border-radius: 3px;
+    background: rgba(0,0,0,0.18);
+  }}
+  .portrait-generate {{
+    background: transparent;
+    border: 1px solid var(--accent-gold);
+    color: var(--accent-gold);
+    padding: 8px 14px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: var(--font-display);
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    transition: background 0.15s ease, color 0.15s ease;
+  }}
+  .portrait-generate:hover {{ background: var(--accent-gold); color: var(--bg-deep); }}
+  .portrait-generate:disabled {{ opacity: 0.5; cursor: progress; }}
+  .portrait-regen {{
+    position: absolute; top: 6px; right: 6px;
+    width: 28px; height: 28px; padding: 0;
+    border: 1px solid var(--rule-hi);
+    background: rgba(0,0,0,0.7);
+    color: var(--accent-gold);
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 1em; line-height: 1;
+    opacity: 0.7;
+    transition: opacity 0.15s ease, transform 0.15s ease;
+  }}
+  .portrait-regen:hover {{ opacity: 1; transform: rotate(60deg); border-color: var(--accent-gold); }}
+  .portrait-regen:disabled {{ opacity: 0.4; cursor: progress; }}
+  .holding-stats {{
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 14px;
+    font-size: 0.95em;
+  }}
+  .holding-stats dt {{ color: var(--ink-muted); font-family: var(--font-display); font-size: 0.85em;
+                       text-transform: uppercase; letter-spacing: 0.12em; }}
+  .holding-stats dd {{ margin: 0; }}
+  .stowed-list {{ list-style: none; padding: 0; margin: 0; }}
+  .stowed-list li {{ padding: 3px 0; border-bottom: 1px dotted var(--rule); }}
+  .stowed-list li:last-child {{ border-bottom: none; }}
 
   .sheet-panel {{
     background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
@@ -1370,12 +1426,12 @@ def _render_holdings_panel(houses: list, mounts: list) -> str:
         elif residents:
             extra = f' <span class="muted">({len(residents)} resident{"s" if len(residents)!=1 else ""})</span>'
         items.append(
-            f'<div class="holding-card holding-house">'
+            f'<a class="holding-card holding-house" href="/houses/{html.escape(h["slug"])}">'
             f'{_thumb(h.get("portrait", ""), h.get("name", ""), "🏠")}'
             f'<div class="holding-body">'
             f'<strong>{html.escape(h.get("name", h["slug"]))}</strong>{extra}'
             f'<span class="holding-sub muted">{sub}</span>'
-            f'</div></div>'
+            f'</div></a>'
         )
     for m in mounts:
         species = (m.get("species") or "").replace("-", " ")
@@ -1403,13 +1459,13 @@ def _render_holdings_panel(houses: list, mounts: list) -> str:
         # Cart icon for stationary "vehicles" (mv 0); horse for everything else.
         glyph = "🛒" if (m.get("mv") or 0) == 0 else "🐎"
         items.append(
-            f'<div class="holding-card holding-mount">'
+            f'<a class="holding-card holding-mount" href="/mounts/{html.escape(m["slug"])}">'
             f'{_thumb(m.get("portrait", ""), m.get("name", ""), glyph)}'
             f'<div class="holding-body">'
             f'<strong>{html.escape(m.get("name", m["slug"]))}</strong>{bar}'
             f'<span class="holding-sub muted">{sub}</span>'
             f'{stowed_html}'
-            f'</div></div>'
+            f'</div></a>'
         )
     return (
         '<div class="holdings"><p class="holdings-label"><strong>Holdings</strong></p>'
@@ -5389,6 +5445,270 @@ def character_sheet(slug: str):
 
     body = '<div class="sheet">' + header + "".join(p for p in panels if p) + '</div>'
     return render(f"{html.escape(name)} — {html.escape(campaign_name)}", body)
+
+
+def _holding_portrait_html(kind: str, slug: str, current: str = "") -> str:
+    """Portrait widget for house/mount detail pages. Shows the portrait
+    when one exists (with a small regen button), or a "Generate portrait"
+    button when none does. Generation goes through /api/holdings/.../portrait.
+    ``kind`` must be "houses" or "mounts"."""
+    if current:
+        ipath = cfg["_data_dir"] / "images" / current
+        if ipath.exists():
+            return (
+                f'<div class="sheet-portrait-wrap holding-portrait-wrap">'
+                f'<img class="sheet-portrait" src="/images/{html.escape(current)}" alt="">'
+                f'<button class="portrait-regen" data-kind="{kind}" data-slug="{html.escape(slug)}" '
+                f'type="button" title="Regenerate portrait" aria-label="Regenerate portrait">↻</button>'
+                f'</div>'
+            )
+    return (
+        f'<div class="sheet-portrait-wrap empty holding-portrait-wrap">'
+        f'<button class="portrait-generate" data-kind="{kind}" data-slug="{html.escape(slug)}" '
+        f'type="button">🎨 Generate portrait</button>'
+        f'</div>'
+    )
+
+
+_HOLDING_DETAIL_JS = """<script>
+(function(){
+  function bind(btn) {
+    btn.addEventListener('click', async function(){
+      const orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'rendering…';
+      try {
+        const r = await fetch('/api/holdings/' + btn.dataset.kind + '/'
+                            + encodeURIComponent(btn.dataset.slug) + '/portrait',
+                            {method:'POST'});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        // Hard reload to pick up the new portrait + the index update.
+        location.reload();
+      } catch (err) {
+        alert('Portrait generation failed: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = orig;
+      }
+    });
+  }
+  document.querySelectorAll('.portrait-generate, .portrait-regen').forEach(bind);
+})();
+</script>"""
+
+
+@app.route("/mounts/<slug>")
+def mount_detail(slug: str):
+    """Detail page for a single mount. Click-through from the /party
+    Holdings panel. Shows structured stats, inventory, optional notes
+    from ``mounts/<slug>.md``, the stowed-pool counts when this mount
+    is a vehicle, and a portrait with generate/regenerate button."""
+    if not cfg:
+        abort(404)
+    slug_clean = re.sub(r"[^a-z0-9_-]", "", slug.lower())
+    mount = (cfg.get("mounts") or {}).get(slug_clean)
+    if not mount:
+        abort(404)
+
+    name = mount.get("name", slug_clean)
+    owner_key = mount.get("owner", "")
+    owner_label = (cfg.get("characters", {}).get(owner_key) or {}).get("label", owner_key)
+    species = (mount.get("species") or "").replace("-", " ")
+
+    # Header
+    sub_parts = []
+    if species:
+        sub_parts.append(html.escape(species))
+    if owner_key:
+        sub_parts.append(f"owned by <a href='/sheets/{html.escape(owner_key)}'>{html.escape(owner_label)}</a>")
+    sub = '<span class="sep">·</span>'.join(sub_parts)
+    portrait_html = _holding_portrait_html("mounts", slug_clean, mount.get("portrait", ""))
+    header = (
+        '<div class="sheet-header">'
+        '<div class="sheet-header-main">'
+        f'<h1>{html.escape(name)}</h1>'
+        f'<div class="sheet-id">{sub}</div>'
+        '</div>'
+        f'{portrait_html}'
+        '</div>'
+    )
+
+    panels = []
+
+    desc = (mount.get("description") or "").strip()
+    if desc:
+        panels.append(_sheet_panel("Description", f'<p>{html.escape(desc)}</p>'))
+
+    # Stat block (mirrors AD&D 2e MM blocks)
+    stats_rows = []
+    hp_max = int(mount.get("hp_max", 0))
+    hp_cur = int(mount.get("hp", hp_max))
+    stats_rows.append(f"<dt>HP</dt><dd>{hp_cur}/{hp_max}</dd>")
+    stats_rows.append(f"<dt>AC</dt><dd>{mount.get('ac', 10)}</dd>")
+    stats_rows.append(f"<dt>MV</dt><dd>{mount.get('mv', 0)}</dd>")
+    stats_rows.append(f"<dt>THAC0</dt><dd>{mount.get('thac0', 0)}</dd>")
+    stats_rows.append(f"<dt>Morale</dt><dd>{mount.get('morale', 0)}</dd>")
+    stats_html = '<dl class="holding-stats">' + "".join(stats_rows) + '</dl>'
+    attacks = mount.get("attacks") or []
+    if attacks:
+        stats_html += "<p><strong>Attacks:</strong> " + ", ".join(html.escape(str(a)) for a in attacks) + "</p>"
+    panels.append(_sheet_panel("Stats", stats_html))
+
+    inv = mount.get("inventory") or []
+    if inv:
+        panels.append(_sheet_panel("Gear", _diamond_list(inv)))
+
+    state = _c.load_state(cfg)
+    pool = (state.get("vehicle_consumables") or {}).get(slug_clean) or {}
+    if pool:
+        rows = "".join(
+            f"<li>{html.escape(k)} <strong>×{int(v)}</strong></li>"
+            for k, v in sorted(pool.items()) if int(v) > 0
+        )
+        if rows:
+            panels.append(_sheet_panel("Stowed (vehicle pool)", f'<ul class="stowed-list">{rows}</ul>'))
+
+    # Optional free-form notes from mounts/<slug>.md.
+    notes_path = cfg["_data_dir"] / "mounts" / f"{slug_clean}.md"
+    if notes_path.exists():
+        panels.append(_sheet_panel("Notes", _markdown_to_html(notes_path.read_text(encoding="utf-8"))))
+    else:
+        hint = (
+            f'<p class="muted">Drop a markdown file at '
+            f'<code>campaigns/{html.escape(cfg.get("name", ""))}/mounts/{html.escape(slug_clean)}.md</code> '
+            f'to add free-form notes (training, scars, history) below the stat block.</p>'
+        )
+        panels.append(_sheet_panel("Notes", hint))
+
+    body = '<div class="sheet">' + header + "".join(panels) + '</div>'
+    body += '<p class="muted" style="margin-top:18px"><a href="/party">← back to Party</a></p>'
+    body += _HOLDING_DETAIL_JS
+    return render(f"{html.escape(name)} — {html.escape(cfg.get('name','Campaign'))}", body)
+
+
+@app.route("/houses/<slug>")
+def house_detail(slug: str):
+    """Detail page for a single house. Same structure as mount_detail:
+    header + description + structured fields + optional ``houses/<slug>.md``
+    notes + portrait."""
+    if not cfg:
+        abort(404)
+    slug_clean = re.sub(r"[^a-z0-9_-]", "", slug.lower())
+    house = (cfg.get("houses") or {}).get(slug_clean)
+    if not house:
+        abort(404)
+
+    name = house.get("name", slug_clean)
+    owner_key = house.get("owner", "")
+    owner_label = (cfg.get("characters", {}).get(owner_key) or {}).get("label", owner_key)
+    kind = house.get("kind", "house")
+    location = house.get("location", "")
+    value_gp = int(house.get("value_gp", 0))
+
+    # Header
+    sub_parts = [html.escape(kind)]
+    if location:
+        sub_parts.append(f"in {html.escape(location)}")
+    if owner_key:
+        sub_parts.append(f"owned by <a href='/sheets/{html.escape(owner_key)}'>{html.escape(owner_label)}</a>")
+    sub = '<span class="sep">·</span>'.join(sub_parts)
+    portrait_html = _holding_portrait_html("houses", slug_clean, house.get("portrait", ""))
+    header = (
+        '<div class="sheet-header">'
+        '<div class="sheet-header-main">'
+        f'<h1>{html.escape(name)}</h1>'
+        f'<div class="sheet-id">{sub}</div>'
+        '</div>'
+        f'{portrait_html}'
+        '</div>'
+    )
+
+    panels = []
+
+    desc = (house.get("description") or "").strip()
+    if desc:
+        panels.append(_sheet_panel("Description", f'<p>{html.escape(desc)}</p>'))
+
+    # Structured fields
+    structured_rows = []
+    if value_gp:
+        structured_rows.append(f"<dt>Value</dt><dd>{value_gp:,} gp</dd>")
+    caretaker = (house.get("caretaker") or "").strip()
+    if caretaker:
+        ck = caretaker.lower()
+        npc = (cfg.get("characters", {}).get(ck) or cfg.get("npcs", {}).get(ck) or {})
+        ck_label = npc.get("label", caretaker)
+        if npc:
+            structured_rows.append(f"<dt>Caretaker</dt><dd><a href='/sheets/{html.escape(ck)}'>{html.escape(ck_label)}</a></dd>")
+        else:
+            structured_rows.append(f"<dt>Caretaker</dt><dd>{html.escape(caretaker)}</dd>")
+    residents = house.get("residents") or []
+    if residents:
+        chips = []
+        for r in residents:
+            rk = str(r).lower()
+            npc = (cfg.get("characters", {}).get(rk) or cfg.get("npcs", {}).get(rk) or {})
+            rl = npc.get("label", rk)
+            if npc:
+                chips.append(f"<a href='/sheets/{html.escape(rk)}'>{html.escape(rl)}</a>")
+            else:
+                chips.append(html.escape(str(r)))
+        structured_rows.append(f"<dt>Residents</dt><dd>{', '.join(chips)}</dd>")
+    if structured_rows:
+        panels.append(_sheet_panel("Details", '<dl class="holding-stats">' + "".join(structured_rows) + '</dl>'))
+
+    inv = house.get("inventory") or []
+    if inv:
+        panels.append(_sheet_panel("Inventory", _diamond_list(inv)))
+
+    notes_path = cfg["_data_dir"] / "houses" / f"{slug_clean}.md"
+    if notes_path.exists():
+        panels.append(_sheet_panel("Notes", _markdown_to_html(notes_path.read_text(encoding="utf-8"))))
+    else:
+        hint = (
+            f'<p class="muted">Drop a markdown file at '
+            f'<code>campaigns/{html.escape(cfg.get("name", ""))}/houses/{html.escape(slug_clean)}.md</code> '
+            f'to add layout sketches, room descriptions, history, hidden caches, or any other free-form detail.</p>'
+        )
+        panels.append(_sheet_panel("Notes", hint))
+
+    body = '<div class="sheet">' + header + "".join(panels) + '</div>'
+    body += '<p class="muted" style="margin-top:18px"><a href="/party">← back to Party</a></p>'
+    body += _HOLDING_DETAIL_JS
+    return render(f"{html.escape(name)} — {html.escape(cfg.get('name','Campaign'))}", body)
+
+
+@app.route("/api/holdings/<kind>/<slug>/portrait", methods=["POST"])
+def api_holding_portrait(kind: str, slug: str):
+    """Generate (or regenerate) a portrait for a house or mount. Reuses
+    the stored ``portrait_prompt`` if one exists; otherwise builds a
+    default from the record's structured fields. Returns the new
+    filename and URL on success."""
+    if not cfg:
+        return jsonify({"error": "no campaign loaded"}), 400
+    if kind not in ("houses", "mounts"):
+        return jsonify({"error": "kind must be 'houses' or 'mounts'"}), 400
+    slug_clean = re.sub(r"[^a-z0-9_-]", "", slug.lower())
+    bucket = cfg.get(kind, {}) or {}
+    if slug_clean not in bucket:
+        return jsonify({"error": f"no {kind[:-1]} '{slug_clean}'"}), 404
+    record = bucket[slug_clean]
+    prompt = (record.get("portrait_prompt") or "").strip()
+    if not prompt:
+        from tools.holdings import _portrait_prompt_for_house, _portrait_prompt_for_mount
+        builder = _portrait_prompt_for_house if kind == "houses" else _portrait_prompt_for_mount
+        prompt = builder(record)
+    pr = _img.generate_portrait_for(cfg, slug_clean, prompt)
+    if "error" in pr:
+        return jsonify(pr), 500
+    record["portrait"] = pr["filename"]
+    record["portrait_prompt"] = prompt
+    _c.save_campaign(cfg)
+    return jsonify({
+        "ok": True,
+        "filename": pr["filename"],
+        "url": f"/images/{pr['filename']}",
+    })
 
 
 @app.route("/characters")
