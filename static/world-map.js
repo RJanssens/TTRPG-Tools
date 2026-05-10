@@ -102,6 +102,12 @@
         layersByKind[kind].addLayer(layer);
     }
 
+    // The layers control is created once, after the main features load.
+    // The party overlay gets added to it later (if/when its fetch resolves)
+    // so users can uncheck it like any other layer.
+    var layersControl = null;
+    var partyLayer    = null;
+
     fetch(dataUrl)
         .then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -134,12 +140,15 @@
                 } catch (e) { /* point-only or empty */ }
             });
 
-            // Layer toggle control (one entry per kind).
+            // Layer toggle control (one entry per kind). Saved so the party
+            // overlay can register itself once it lands.
             var overlays = {};
             Object.keys(layersByKind).forEach(function (k) {
                 overlays[k] = layersByKind[k];
             });
-            L.control.layers(null, overlays, { collapsed: false, position: 'topright' }).addTo(map);
+            layersControl = L.control.layers(null, overlays, { collapsed: false, position: 'topright' }).addTo(map);
+            // If the party overlay arrived before us, register it now.
+            if (partyLayer) layersControl.addOverlay(partyLayer, 'party');
 
             if (allBounds && allBounds.isValid()) {
                 map.fitBounds(allBounds.pad(0.1));
@@ -163,29 +172,35 @@
                 + 'Failed to load map: ' + escapeHTML(String(err.message || err)) + '</p>';
         });
 
-    // ── Party overlay (separate, always on top) ─────────────────────────────
+    // ── Party overlay — toggleable via the layers control ───────────────────
     if (partyUrl) {
         fetch(partyUrl).then(function (r) {
             if (!r.ok) return null;
             return r.json();
         }).then(function (geo) {
             if (!geo) return;
-            L.geoJSON(geo, {
+            partyLayer = L.geoJSON(geo, {
                 pointToLayer: function (feature, latlng) {
-                    var s = (feature.properties && feature.properties._style) || {};
-                    var marker = L.circleMarker(latlng, {
-                        radius:      s['marker-size'] || 10,
-                        color:       s.stroke || '#000',
-                        fillColor:   s.color || '#ffcc00',
-                        weight:      s['stroke-width'] || 2,
-                        fillOpacity: 1,
+                    var p = feature.properties || {};
+                    var label = escapeHTML(p.label || 'Party');
+                    // Custom HTML icon so we can pulse around it via CSS.
+                    var icon = L.divIcon({
+                        className: 'party-marker',
+                        html: '<span class="party-pulse"></span>'
+                            + '<span class="party-dot"></span>'
+                            + '<span class="party-label">' + label + '</span>',
+                        iconSize:  [16, 16],
+                        iconAnchor:[8, 8],
                     });
-                    marker.bindTooltip(feature.properties.label || 'Party',
-                        { permanent: true, direction: 'right', offset: [10, 0] });
-                    return marker;
+                    return L.marker(latlng, { icon: icon, interactive: false });
                 },
                 coordsToLatLng: coordsToLatLng,
-            }).addTo(map);
+            });
+            partyLayer.addTo(map);
+            // Register on the layers control so users can uncheck it.
+            // If the control hasn't been created yet (main fetch slower),
+            // the .then() above will register us instead.
+            if (layersControl) layersControl.addOverlay(partyLayer, 'party');
         }).catch(function () { /* overlay missing is fine */ });
     }
 })();
