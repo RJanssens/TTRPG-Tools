@@ -511,6 +511,50 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   .party-body {{ flex: 1; min-width: 0; }}
   .party-body h2 {{ margin-top: 0; }}
 
+  /* ---- Holdings panel (per-PC houses + mounts on /party) ---- */
+  .holdings {{ margin-top: 14px; }}
+  .holdings-label {{
+    margin: 0 0 6px; font-size: 0.85em;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    text-transform: uppercase; letter-spacing: 0.16em;
+    border-bottom: 1px dotted var(--rule); padding-bottom: 4px;
+  }}
+  .holdings-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px;
+  }}
+  .holding-card {{
+    display: flex; gap: 10px; align-items: center;
+    padding: 6px 8px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    background: rgba(0,0,0,0.18);
+  }}
+  .holding-card.holding-house {{ border-left: 3px solid var(--accent-gold); }}
+  .holding-card.holding-mount {{ border-left: 3px solid #8aa66a; }}
+  .holding-thumb {{
+    width: 40px; height: 40px;
+    flex-shrink: 0;
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid var(--rule);
+    background: var(--bg-rec);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 1.4em;
+    color: var(--ink-muted);
+  }}
+  .holding-thumb img {{
+    width: 100%; height: 100%; object-fit: cover;
+  }}
+  .holding-thumb.empty {{ filter: grayscale(0.5); opacity: 0.85; }}
+  .holding-body {{
+    display: flex; flex-direction: column; min-width: 0; gap: 1px;
+    font-size: 0.88em; line-height: 1.3;
+  }}
+  .holding-sub {{ font-size: 0.85em; }}
+
   /* ---- Spells ---- */
   .spell-ready {{ color: var(--ink-body); }}
   .spell-cast  {{ color: #6a5a48; text-decoration: line-through; text-decoration-color: rgba(106,90,72,0.5); }}
@@ -1009,10 +1053,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/sessions">Sessions</a>
   <a href="/characters">Characters</a>
   <a href="/locations">Locations</a>
-  <a href="/monsters">Monsters</a>
-  <a href="/spells">Spells</a>
-  <a href="/classes">Classes</a>
-  <a href="/items">Items</a>
+  <a href="/reference">Reference</a>
   <a href="/combat">Combat</a>
   <a href="/maps">Maps</a>
 </nav>
@@ -1282,6 +1323,70 @@ def _hp_bar(current: int, maximum: int, width: int = 10) -> str:
     return bar
 
 
+def _render_holdings_panel(houses: list, mounts: list) -> str:
+    """Render a small "Holdings" panel for a party card. Empty list → empty
+    string so the card stays compact for PCs with no property."""
+    if not houses and not mounts:
+        return ""
+
+    def _thumb(filename: str, alt: str, glyph: str) -> str:
+        if filename:
+            return (
+                f'<div class="holding-thumb"><img src="/images/{html.escape(filename)}" '
+                f'alt="{html.escape(alt)}"></div>'
+            )
+        return f'<div class="holding-thumb empty">{glyph}</div>'
+
+    items = []
+    for h in houses:
+        kind = h.get("kind", "house")
+        location = h.get("location", "")
+        sub_parts = [html.escape(kind)]
+        if location:
+            sub_parts.append(html.escape(location))
+        sub = " · ".join(sub_parts)
+        residents = h.get("residents") or []
+        caretaker = h.get("caretaker", "")
+        extra = ""
+        if caretaker:
+            extra = f' <span class="muted">(kept by {html.escape(caretaker)})</span>'
+        elif residents:
+            extra = f' <span class="muted">({len(residents)} resident{"s" if len(residents)!=1 else ""})</span>'
+        items.append(
+            f'<div class="holding-card holding-house">'
+            f'{_thumb(h.get("portrait", ""), h.get("name", ""), "🏠")}'
+            f'<div class="holding-body">'
+            f'<strong>{html.escape(h.get("name", h["slug"]))}</strong>{extra}'
+            f'<span class="holding-sub muted">{sub}</span>'
+            f'</div></div>'
+        )
+    for m in mounts:
+        species = (m.get("species") or "").replace("-", " ")
+        hp_cur = m.get("hp", m.get("hp_max", 0))
+        hp_max_m = m.get("hp_max", hp_cur)
+        hp_str = f"{hp_cur}/{hp_max_m} HP" if hp_max_m else ""
+        sub_parts = [html.escape(species)] if species else []
+        if hp_str:
+            sub_parts.append(html.escape(hp_str))
+        sub = " · ".join(sub_parts)
+        # HP bar only when injured — keeps the layout quiet for healthy mounts.
+        bar = ""
+        if hp_max_m and hp_cur < hp_max_m:
+            bar = " " + _hp_bar(hp_cur, hp_max_m, width=8)
+        items.append(
+            f'<div class="holding-card holding-mount">'
+            f'{_thumb(m.get("portrait", ""), m.get("name", ""), "🐎")}'
+            f'<div class="holding-body">'
+            f'<strong>{html.escape(m.get("name", m["slug"]))}</strong>{bar}'
+            f'<span class="holding-sub muted">{sub}</span>'
+            f'</div></div>'
+        )
+    return (
+        '<div class="holdings"><p class="holdings-label"><strong>Holdings</strong></p>'
+        f'<div class="holdings-grid">{"".join(items)}</div></div>'
+    )
+
+
 def _read_first_heading(path: Path) -> str:
     if not path.exists():
         return path.stem
@@ -1422,6 +1527,19 @@ def party():
     combat_effects = _combat_effects_overrides()
     image_index = _load_image_index()
     light_sources = state.get("light_sources", []) or []
+
+    # Holdings (houses + mounts) grouped by owner PC key, so each
+    # character card can render its own panel without re-scanning.
+    houses_by_owner: dict[str, list] = {}
+    for slug, h in (cfg.get("houses") or {}).items():
+        houses_by_owner.setdefault(h.get("owner", ""), []).append({"slug": slug, **h})
+    for v in houses_by_owner.values():
+        v.sort(key=lambda r: r.get("name", ""))
+    mounts_by_owner: dict[str, list] = {}
+    for slug, m in (cfg.get("mounts") or {}).items():
+        mounts_by_owner.setdefault(m.get("owner", ""), []).append({"slug": slug, **m})
+    for v in mounts_by_owner.values():
+        v.sort(key=lambda r: r.get("name", ""))
 
     coin = state.get("coin", {})
     coin_parts = []
@@ -1614,6 +1732,11 @@ def party():
                 f'</div>'
             )
 
+        holdings_html = _render_holdings_panel(
+            houses_by_owner.get(key, []),
+            mounts_by_owner.get(key, []),
+        )
+
         cards.append(
             f'<div class="card party-card clearfix">'
             f'{portrait_html}'
@@ -1629,6 +1752,7 @@ def party():
             f"{slots_html}"
             f"{mem_html}"
             f'<p>{cond_tags}</p>'
+            f'{holdings_html}'
             f'</div>'
             f"</div>"
         )
@@ -3345,22 +3469,27 @@ _PLAY_HTML = """
   const toolElements = new Map();
 
   // Auto-scroll only when the user is already near the bottom; otherwise
-  // leave their reading position alone. The "↓ new" pill is shown
-  // whenever the user is scrolled away from the bottom (regardless of
-  // whether new content has arrived) so they always have a one-click
-  // jump back — matches Slack/Discord behaviour.
+  // leave their reading position alone. The jump button is only shown
+  // once the reader has scrolled away by at least a full screen — short
+  // scrolls (skim back a few lines) shouldn't summon the button.
   const NEAR_BOTTOM_PX = 120;
+  function distanceFromBottom() {
+    return log.scrollHeight - log.scrollTop - log.clientHeight;
+  }
   function isNearBottom() {
-    return log.scrollHeight - log.scrollTop - log.clientHeight < NEAR_BOTTOM_PX;
+    return distanceFromBottom() < NEAR_BOTTOM_PX;
+  }
+  function isFarFromBottom() {
+    return distanceFromBottom() >= log.clientHeight;
   }
   function refreshJumpBtn() {
-    jumpBtn.classList.toggle('visible', !isNearBottom());
+    jumpBtn.classList.toggle('visible', isFarFromBottom());
   }
   function maybeScrollToBottom() {
     if (isNearBottom()) {
       log.scrollTop = log.scrollHeight;
     } else {
-      jumpBtn.classList.add('visible');
+      refreshJumpBtn();
     }
   }
   function forceScrollToBottom() {
@@ -6349,6 +6478,45 @@ def combat_state():
         except Exception:
             pass
     return jsonify({"active": False})
+
+
+# ---------------------------------------------------------------------------
+# Reference index — hub for the lookup endpoints (monsters, spells, classes,
+# items). Folded into one nav slot so the header doesn't have four near-
+# identical reference links.
+# ---------------------------------------------------------------------------
+_REFERENCE_SECTIONS = [
+    ("/monsters", "Monsters",
+     "Monstrous Manual entries with stats, treasure types, morale, and XP values."),
+    ("/spells", "Spells",
+     "Wizard and priest spell catalogue: casting time, range, AOE, components, and full text."),
+    ("/classes", "Classes",
+     "Per-class progression: THAC0, saves, spell slots, XP requirements, and homebrew kits."),
+    ("/items", "Items",
+     "Equipment and magic items: cost, weight, weapon stats, armour values, and rarity."),
+]
+
+
+@app.route("/reference")
+def reference_index():
+    """Single hub linking to each lookup browser."""
+    cards = []
+    for href, title, blurb in _REFERENCE_SECTIONS:
+        cards.append(
+            f'<a class="card" href="{href}" '
+            f'style="display:block;text-decoration:none;color:inherit">'
+            f'<h2>{html.escape(title)}</h2>'
+            f'<p class="muted" style="margin-bottom:0">{html.escape(blurb)}</p>'
+            f'</a>'
+        )
+    body = (
+        '<h1>Reference</h1>'
+        '<p class="muted">Lookup browsers for the AD&amp;D 2e rules data.</p>'
+        '<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">'
+        + ''.join(cards) +
+        '</div>'
+    )
+    return render("Reference", body)
 
 
 # ---------------------------------------------------------------------------
