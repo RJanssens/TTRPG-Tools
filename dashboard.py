@@ -999,8 +999,8 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <nav>
-  <a href="/">Gallery</a>
   <a href="/play">Play</a>
+  <a href="/">Gallery</a>
   <a href="/party">Party</a>
   <a href="/world">World</a>
   <a href="/quests">Quests</a>
