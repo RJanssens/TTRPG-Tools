@@ -31,8 +31,13 @@ from typing import Iterator
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Module-level so tests can override.
-_SESSION_FILE: Path = _REPO_ROOT / ".dm_session"
+# Session ids are stored per-campaign under ``campaigns/<slug>/.dm_session``
+# so each campaign keeps its own /play conversation thread. Switching
+# campaigns transparently swaps which session resumes on the next turn.
+#
+# The legacy single file at the repo root is kept as a one-shot migration
+# source — see ``_migrate_legacy_session()`` at the bottom of this module.
+_LEGACY_SESSION_FILE: Path = _REPO_ROOT / ".dm_session"
 _CLAUDE_BIN: str = "claude"
 
 # Tools the headless DM may use without prompting. The MCP wildcard covers
@@ -45,6 +50,12 @@ _ALLOWED_TOOLS = "mcp__ttrpg__*,Read,Write,Edit,Bash"
 # concurrent ``--resume`` calls on the same session id would race. The
 # dashboard is single-player; one turn at a time is correct.
 _turn_lock = threading.Lock()
+
+# Tracks the currently-running claude subprocess so ``force_reset`` can
+# terminate it from a different request thread when the dashboard's GUI
+# escape hatch is invoked. ``None`` whenever no turn is in flight.
+_active_proc: subprocess.Popen | None = None
+_active_proc_lock = threading.Lock()
 
 # Live-state introspection so a reloaded /play page can discover that a
 # turn is still cooking server-side (browser dropped the SSE stream but
@@ -70,10 +81,38 @@ def _bump_tools_used() -> None:
         _turn_state["tools_used"] += 1
 
 
-def session_id() -> str | None:
-    """Return the persisted session id, or ``None`` for a fresh start."""
+def _active_campaign_slug() -> str | None:
+    """Read the slug of the currently-active campaign from ``.active``.
+    Returns ``None`` when no campaign is active (fresh checkout)."""
+    f = _REPO_ROOT / ".active"
     try:
-        sid = _SESSION_FILE.read_text().strip()
+        slug = f.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return slug or None
+
+
+def _session_file_for(slug: str) -> Path:
+    """Per-campaign session-id file path. Sibling to ``state.json``."""
+    return _REPO_ROOT / "campaigns" / slug / ".dm_session"
+
+
+def _active_session_file() -> Path | None:
+    """Resolve the session-id file for the currently-active campaign,
+    or ``None`` if no campaign is active. Tests override this function
+    to redirect reads/writes into a tmpdir."""
+    slug = _active_campaign_slug()
+    return _session_file_for(slug) if slug else None
+
+
+def session_id() -> str | None:
+    """Return the persisted session id for the active campaign, or
+    ``None`` for a fresh start (no campaign, no file, or empty file)."""
+    p = _active_session_file()
+    if p is None:
+        return None
+    try:
+        sid = p.read_text().strip()
     except FileNotFoundError:
         return None
     return sid or None
@@ -160,6 +199,77 @@ def rewrite_for_image(
     return out or None
 
 
+_SUGGEST_ACTIONS_SYSTEM = (
+    "You read the last DM reply from a tabletop RPG session and propose "
+    "2 to 4 plausible next actions a player might take.\n\n"
+    "Each action MUST:\n"
+    "  - be short (5 to 15 words)\n"
+    "  - be a concrete action the player can declare to the DM "
+    "(e.g. 'Search the body for a key', not 'consider searching')\n"
+    "  - be distinct from the others — different approaches, not "
+    "rephrasings of the same idea\n"
+    "  - rest only on what the DM has actually told the players; never "
+    "assume facts the player has not learned\n\n"
+    "If the DM is presenting explicit choices (e.g. 'left passage or "
+    "right?'), surface those choices verbatim. If the DM asks an "
+    "open-ended 'what do you do?', propose the most consequential or "
+    "obvious moves.\n\n"
+    "Output each action on its own line. No numbering, no bullets, no "
+    "markdown, no preamble, no commentary. Just the action lines."
+)
+
+
+def suggest_actions(
+    narrative: str,
+    timeout_seconds: int = 60,
+    limit: int = 4,
+) -> list[str]:
+    """One-shot Claude pre-pass that returns 2-4 plausible next player
+    actions for a given DM reply. Stateless — runs ``claude -p`` from a
+    temp directory so CLAUDE.md and MCP config don't bias the suggestions
+    and no session is resumed.
+
+    Returns an empty list on any failure or when the DM reply is empty;
+    the caller silently hides the chip row in that case."""
+    text = (narrative or "").strip()
+    if not text:
+        return []
+    args = [
+        _CLAUDE_BIN, "-p", text[:4000],
+        "--append-system-prompt", _SUGGEST_ACTIONS_SYSTEM,
+    ]
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=tempfile.gettempdir(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    out: list[str] = []
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Defensive stripping for the cases where the model slips in a
+        # bullet or a "1. " prefix despite the system prompt.
+        line = line.lstrip("-*•").lstrip()
+        while line[:2].isdigit() and len(line) > 2 and line[2] in ".)":
+            line = line[3:].lstrip()
+        if len(line) <= 1 and line[:1].isdigit():
+            line = line[1:].lstrip(".) ").lstrip()
+        if not line:
+            continue
+        out.append(line)
+        if len(out) >= limit:
+            break
+    return out if len(out) >= 2 else []
+
+
 def last_dm_text() -> str | None:
     """Return the most recent assistant text block from the persisted
     session's JSONL transcript, or ``None`` if there's no session yet, no
@@ -200,18 +310,59 @@ def last_dm_text() -> str | None:
 
 
 def reset_session() -> None:
-    """Forget the current session — the next turn starts a new one."""
-    _SESSION_FILE.unlink(missing_ok=True)
+    """Forget the active campaign's session — the next turn starts a
+    new one. Sessions in other campaigns are untouched."""
+    p = _active_session_file()
+    if p is not None:
+        p.unlink(missing_ok=True)
+
+
+def set_session(sid: str) -> None:
+    """Pin a specific session id as the active one for the current
+    campaign. Public counterpart to the implicit save inside ``stream_turn``;
+    used by the dashboard's 'resume this session' button."""
+    _save_session_id(sid)
 
 
 def _save_session_id(sid: str) -> None:
-    _SESSION_FILE.write_text(sid)
+    p = _active_session_file()
+    if p is None:
+        return
+    # Don't materialise a campaigns/<slug>/ directory that doesn't exist —
+    # if .active points at a missing campaign, silently drop the save
+    # rather than fabricating a phantom directory.
+    if not p.parent.is_dir():
+        return
+    p.write_text(sid)
+
+
+def _migrate_legacy_session() -> None:
+    """One-shot: fold the old repo-root ``.dm_session`` into the active
+    campaign's per-campaign file the first time this module loads after
+    the per-campaign change. Idempotent — once the legacy file is gone
+    nothing happens. Does nothing when no campaign is active."""
+    if not _LEGACY_SESSION_FILE.is_file():
+        return
+    p = _active_session_file()
+    if p is None or not p.parent.is_dir():
+        return  # No active campaign or its directory is missing — bail.
+    try:
+        sid = _LEGACY_SESSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if sid and not p.exists():
+        p.write_text(sid)
+    _LEGACY_SESSION_FILE.unlink(missing_ok=True)
+
+
+_migrate_legacy_session()
 
 
 def _build_args(message: str, sid: str | None) -> list[str]:
     args = [
         _CLAUDE_BIN, "-p", message,
         "--output-format", "stream-json",
+        "--include-partial-messages",
         "--verbose",
         "--allowedTools", _ALLOWED_TOOLS,
     ]
@@ -259,6 +410,9 @@ def stream_turn(message: str) -> Iterator[dict]:
             bufsize=1,
         )
         assert proc.stdout is not None
+        with _active_proc_lock:
+            global _active_proc
+            _active_proc = proc
         _set_turn_state(in_flight=True, started_at=time.time(), tools_used=0)
         try:
             for line in proc.stdout:
@@ -275,7 +429,36 @@ def stream_turn(message: str) -> Iterator[dict]:
                 yield evt
         finally:
             rc = proc.wait()
+            with _active_proc_lock:
+                if _active_proc is proc:
+                    _active_proc = None
             _set_turn_state(in_flight=False, started_at=None, tools_used=0)
             if rc != 0:
                 err = (proc.stderr.read() if proc.stderr else "").strip()
                 yield {"type": "error", "returncode": rc, "stderr": err[-2000:]}
+
+
+def force_reset() -> dict:
+    """GUI escape hatch for a wedged DM turn. Kills any in-flight claude
+    subprocess, clears the in-flight turn-state flag, and replaces the
+    module-level ``_turn_lock`` so a thread still wedged inside the old
+    lock can't keep blocking new requests. The wedged thread retains a
+    reference to the original lock and will release it on its own exit;
+    fresh ``stream_turn`` calls bind the new lock at entry.
+
+    Returns a small dict describing what happened, suitable for echoing
+    back to the dashboard."""
+    global _turn_lock, _active_proc
+    killed = False
+    with _active_proc_lock:
+        proc = _active_proc
+        _active_proc = None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.kill()
+            killed = True
+        except OSError:
+            pass
+    _turn_lock = threading.Lock()
+    _set_turn_state(in_flight=False, started_at=None, tools_used=0)
+    return {"killed_subprocess": killed}

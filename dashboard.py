@@ -11,9 +11,10 @@ from pathlib import Path
 
 from datetime import datetime, timezone
 
-from flask import Flask, Response, abort, jsonify, render_template_string, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file, send_from_directory
 
 import _campaign as _c
+from tools import campaign_archive as _arch
 from tools import export_session as _export
 from tools import item_weights as _iw
 from tools import homebrew_classes as _hb
@@ -24,6 +25,8 @@ from tools import tts as _tts
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
 _2E_DB        = Path(__file__).parent / "global" / "2e.db"
+_GREYHAWK_DB  = Path(__file__).parent / "settings" / "greyhawk" / "greyhawk.db"
+_GREYHAWK_IMG = Path(__file__).parent / "settings" / "greyhawk" / "images"
 
 # Cached read-only connections. The reference DBs (monsters/2e/rules) are
 # read-only at runtime, so a single connection per DB shared across Flask
@@ -78,7 +81,15 @@ def _reload_cfg() -> None:
 def _combat_hp_overrides() -> dict:
     """If a combat session is active, return a dict mapping party-character
     keys to live HP from combat_state.json so /party (and the status line)
-    show current HP during combat instead of stale state.json values."""
+    show current HP during combat instead of stale state.json values.
+
+    Guard against stale combat_state.json: if state.json has been written
+    more recently than combat_state.json, an out-of-combat tool (apply_damage,
+    apply_heal, etc.) has updated HP since the last combat write. Trust the
+    fresher state.json and skip the overrides — otherwise the sidebar would
+    keep showing pre-fight HP after combat ended without end_combat clearing
+    the active flag.
+    """
     if not cfg:
         return {}
     cs_path = cfg["_dir"] / "combat_state.json"
@@ -89,6 +100,9 @@ def _combat_hp_overrides() -> dict:
     except Exception:
         return {}
     if not cs.get("active"):
+        return {}
+    st_path = cfg["_dir"] / "state.json"
+    if st_path.exists() and st_path.stat().st_mtime > cs_path.stat().st_mtime:
         return {}
     out: dict = {}
     for c in cs.get("combatants", []):
@@ -1129,6 +1143,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/reference">Reference</a>
   <a href="/combat">Combat</a>
   <a href="/maps">Maps</a>
+  <a href="/campaigns">Campaigns</a>
 </nav>
 <div class="container">
 {body}
@@ -2167,6 +2182,664 @@ def _session_teaser(path: Path, max_chars: int = 140) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# /campaigns — list, switch, create, delete, import, export, banner
+# ---------------------------------------------------------------------------
+
+_BANNER_MAX_BYTES = 8 * 1024 * 1024
+_BANNER_EXT_BY_MIME = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _activate_and_reload(slug: str) -> None:
+    """Switch the active campaign and replace the shared ``cfg`` dict in
+    place so subsequent requests see the new campaign without restarting."""
+    _c.set_active(slug)
+    fresh = _c.load_campaign(slug)
+    cfg.clear()
+    cfg.update(fresh)
+    global _cfg_mtime
+    try:
+        _cfg_mtime = (cfg["_dir"] / "campaign.json").stat().st_mtime
+    except OSError:
+        _cfg_mtime = 0.0
+
+
+def _humansize(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n/1.0:.1f} {unit}" if n < 1024 else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+@app.route("/campaigns")
+def campaigns_index():
+    body = """
+<style>
+  .campaigns-toolbar { display: flex; gap: 10px; margin: 14px 0 18px; flex-wrap: wrap; }
+  .campaigns-toolbar button {
+    padding: 8px 14px; background: transparent; color: var(--ink-body);
+    border: 1px solid var(--rule-hi); border-radius: 3px; cursor: pointer;
+    font-family: var(--font-display); font-size: 0.82em;
+    text-transform: uppercase; letter-spacing: 0.12em;
+  }
+  .campaigns-toolbar button:hover { border-color: var(--accent-gold); color: var(--accent-gold); }
+  .camp-grid {
+    display: grid; gap: 18px;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  }
+  .camp-card {
+    background: var(--paper);
+    border: 1px solid var(--rule-hi); border-radius: 4px;
+    overflow: hidden; display: flex; flex-direction: column;
+    transition: transform .15s ease, border-color .15s ease;
+    position: relative;
+  }
+  .camp-card:hover { transform: translateY(-2px); border-color: var(--accent-gold); }
+  .camp-banner {
+    aspect-ratio: 16 / 9; background: #1a1a1a center/cover no-repeat;
+    border-bottom: 1px solid var(--rule-hi);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--ink-faint); font-family: var(--font-display);
+    font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.15em;
+  }
+  .camp-banner.has-image { color: transparent; }
+  .camp-body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 6px; }
+  .camp-name {
+    font-family: var(--font-display); font-size: 1.08em; line-height: 1.2;
+    color: var(--ink-body); margin: 0;
+  }
+  .camp-sub { font-size: 0.82em; color: var(--ink-faint); }
+  .camp-meta {
+    display: grid; grid-template-columns: auto 1fr; gap: 2px 10px;
+    font-size: 0.78em; color: var(--ink-faint); margin-top: 4px;
+  }
+  .camp-meta dt { font-family: var(--font-display); text-transform: uppercase; letter-spacing: 0.1em; }
+  .camp-badges { position: absolute; top: 8px; right: 8px; display: flex; gap: 4px; }
+  .camp-badge {
+    padding: 2px 8px; font-size: 0.7em; border-radius: 999px;
+    font-family: var(--font-display); text-transform: uppercase; letter-spacing: 0.1em;
+    background: rgba(0,0,0,0.55); color: var(--ink-body);
+    border: 1px solid rgba(255,255,255,0.15);
+  }
+  .camp-badge.active { background: var(--accent-gold); color: #2a1f00; border-color: var(--accent-gold); }
+  .camp-badge.closed { background: #5a2222; color: #f0d0d0; border-color: #5a2222; }
+  .camp-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .camp-actions button, .camp-actions a.btn {
+    padding: 5px 10px; background: transparent; border: 1px solid var(--rule-hi);
+    color: var(--ink-body); border-radius: 3px; cursor: pointer;
+    font-family: var(--font-display); font-size: 0.72em;
+    text-transform: uppercase; letter-spacing: 0.1em; text-decoration: none;
+  }
+  .camp-actions button:hover, .camp-actions a.btn:hover { border-color: var(--accent-gold); color: var(--accent-gold); }
+  .camp-actions .danger { border-color: #7a3a3a; color: #b88; }
+  .camp-actions .danger:hover { border-color: #c66; color: #ecc; }
+  .camp-empty { text-align: center; padding: 60px 20px; color: var(--ink-faint); }
+
+  dialog.camp-dialog {
+    border: 1px solid var(--rule-hi); background: var(--paper); color: var(--ink-body);
+    border-radius: 4px; padding: 22px 24px; max-width: 520px; width: 90vw;
+  }
+  dialog.camp-dialog::backdrop { background: rgba(0,0,0,0.55); }
+  dialog.camp-dialog h3 { margin: 0 0 8px; font-family: var(--font-display); }
+  dialog.camp-dialog p.muted { font-size: 0.85em; margin-bottom: 12px; }
+  dialog.camp-dialog label {
+    display: block; margin-top: 12px; font-family: var(--font-display);
+    font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--ink-faint);
+  }
+  dialog.camp-dialog input[type=text],
+  dialog.camp-dialog textarea,
+  dialog.camp-dialog input[type=number],
+  dialog.camp-dialog input[type=file] {
+    width: 100%; box-sizing: border-box; margin-top: 4px;
+    padding: 6px 8px; background: #1a1a1a; color: var(--ink-body);
+    border: 1px solid var(--rule-hi); border-radius: 3px;
+    font-family: inherit; font-size: 0.95em;
+  }
+  dialog.camp-dialog textarea { min-height: 70px; resize: vertical; }
+  dialog.camp-dialog .actions {
+    display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px;
+  }
+  dialog.camp-dialog button {
+    padding: 6px 14px; background: transparent; border: 1px solid var(--rule-hi);
+    color: var(--ink-body); border-radius: 3px; cursor: pointer;
+    font-family: var(--font-display); font-size: 0.78em;
+    text-transform: uppercase; letter-spacing: 0.12em;
+  }
+  dialog.camp-dialog button:hover:not(:disabled) { border-color: var(--accent-gold); color: var(--accent-gold); }
+  dialog.camp-dialog button:disabled { opacity: 0.5; cursor: not-allowed; }
+  dialog.camp-dialog .danger-btn { border-color: #7a3a3a; color: #b88; margin-right: auto; }
+  dialog.camp-dialog .danger-btn:hover:not(:disabled) { border-color: #c66; color: #ecc; }
+  dialog.camp-dialog .err { color: #d77; font-size: 0.82em; margin-top: 8px; min-height: 1em; }
+  dialog.camp-dialog .banner-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  dialog.camp-dialog .banner-tabs button { flex: 1; }
+  dialog.camp-dialog .banner-tabs button.on { border-color: var(--accent-gold); color: var(--accent-gold); }
+</style>
+
+<h1>Campaigns</h1>
+<div class="campaigns-toolbar">
+  <button id="camp-new-btn">+ New campaign</button>
+  <button id="camp-import-btn">Import…</button>
+</div>
+<div id="camp-grid" class="camp-grid"></div>
+
+<dialog id="camp-new-dialog" class="camp-dialog">
+  <form method="dialog" id="camp-new-form">
+    <h3>New campaign</h3>
+    <p class="muted">Scaffolds <code>campaigns/&lt;slug&gt;/</code> and switches to it.</p>
+    <label>Name<input type="text" name="name" required placeholder="e.g. The Iron Crown" autofocus></label>
+    <label>World<textarea name="world" required placeholder="One or two sentences setting the scene"></textarea></label>
+    <label>Tone<input type="text" name="tone" required value="high fantasy"></label>
+    <label>Starting gold per PC<input type="number" name="initial_gp" value="0" min="0"></label>
+    <div class="err" id="camp-new-err"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit">Create</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="camp-import-dialog" class="camp-dialog">
+  <form id="camp-import-form">
+    <h3>Import campaign</h3>
+    <p class="muted">Drop a <code>.tgz</code> produced by export below.</p>
+    <label>Archive<input type="file" name="archive" accept=".tgz,.tar.gz,application/gzip,application/x-tar" required></label>
+    <label>Rename slug (optional)<input type="text" name="rename" placeholder="leave blank to use the archive's own slug"></label>
+    <label style="display:flex; align-items:center; gap:8px; text-transform: none; letter-spacing: 0;">
+      <input type="checkbox" name="force" style="width:auto"> Overwrite if a campaign with that slug already exists
+    </label>
+    <div class="err" id="camp-import-err"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit">Import</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="camp-delete-dialog" class="camp-dialog">
+  <form id="camp-delete-form">
+    <h3>Delete campaign</h3>
+    <p class="muted">This removes <code id="camp-delete-target"></code> from disk. Files in <code>global/</code> are untouched. There is no undo.</p>
+    <label>Type the slug to confirm<input type="text" name="confirm" required autocomplete="off"></label>
+    <div class="err" id="camp-delete-err"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit" class="danger-btn">Delete</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="camp-banner-dialog" class="camp-dialog">
+  <form id="camp-banner-form">
+    <h3>Set banner — <span id="camp-banner-target"></span></h3>
+    <div class="banner-tabs">
+      <button type="button" data-mode="upload" class="on">Upload image</button>
+      <button type="button" data-mode="generate">Generate from world</button>
+    </div>
+    <div data-mode-panel="upload">
+      <label>Image (PNG/JPG/WebP, max 8 MB)<input type="file" name="image" accept="image/png,image/jpeg,image/webp,image/gif"></label>
+    </div>
+    <div data-mode-panel="generate" hidden>
+      <p class="muted">Generates a landscape banner from the campaign's world + tone via Flux. Takes 20–45 seconds.</p>
+      <label>Optional extra hint<input type="text" name="hint" placeholder="e.g. dawn light over the docks"></label>
+    </div>
+    <div class="err" id="camp-banner-err"></div>
+    <div class="actions">
+      <button type="button" data-close>Cancel</button>
+      <button type="submit" id="camp-banner-submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+(function(){
+  const grid = document.getElementById('camp-grid');
+  const newBtn = document.getElementById('camp-new-btn');
+  const importBtn = document.getElementById('camp-import-btn');
+
+  const newDlg = document.getElementById('camp-new-dialog');
+  const newForm = document.getElementById('camp-new-form');
+  const newErr = document.getElementById('camp-new-err');
+
+  const impDlg = document.getElementById('camp-import-dialog');
+  const impForm = document.getElementById('camp-import-form');
+  const impErr = document.getElementById('camp-import-err');
+
+  const delDlg = document.getElementById('camp-delete-dialog');
+  const delForm = document.getElementById('camp-delete-form');
+  const delTarget = document.getElementById('camp-delete-target');
+  const delErr = document.getElementById('camp-delete-err');
+  let delSlug = null;
+
+  const banDlg = document.getElementById('camp-banner-dialog');
+  const banForm = document.getElementById('camp-banner-form');
+  const banTarget = document.getElementById('camp-banner-target');
+  const banErr = document.getElementById('camp-banner-err');
+  const banSubmit = document.getElementById('camp-banner-submit');
+  let banSlug = null;
+  let banMode = 'upload';
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    try {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      return d.toLocaleDateString(undefined, {year:'numeric', month:'short', day:'numeric'}) +
+             ' · ' + d.toLocaleTimeString(undefined, {hour:'2-digit', minute:'2-digit'});
+    } catch (e) { return iso; }
+  }
+  function fmtSize(bytes) {
+    if (!bytes) return '—';
+    const units = ['B','KB','MB','GB'];
+    let i = 0, n = bytes;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i ? 1 : 0) + ' ' + units[i];
+  }
+
+  function renderCard(c) {
+    const wrap = document.createElement('article');
+    wrap.className = 'camp-card';
+    const banner = document.createElement('div');
+    banner.className = 'camp-banner' + (c.banner_url ? ' has-image' : '');
+    if (c.banner_url) {
+      banner.style.backgroundImage = "url('" + c.banner_url + "?t=" + Date.now() + "')";
+    } else {
+      banner.textContent = 'no banner';
+    }
+    wrap.appendChild(banner);
+
+    const badges = document.createElement('div');
+    badges.className = 'camp-badges';
+    if (c.active) {
+      const b = document.createElement('span'); b.className = 'camp-badge active'; b.textContent = 'Active'; badges.appendChild(b);
+    }
+    if (c.status === 'closed') {
+      const b = document.createElement('span'); b.className = 'camp-badge closed'; b.textContent = 'Closed'; badges.appendChild(b);
+    }
+    wrap.appendChild(badges);
+
+    const body = document.createElement('div');
+    body.className = 'camp-body';
+    body.innerHTML =
+      '<h2 class="camp-name">' + esc(c.name) + '</h2>' +
+      '<div class="camp-sub">' + esc(c.system || '') + (c.world ? ' · ' + esc((c.world || '').slice(0, 110)) + (c.world.length > 110 ? '…' : '') : '') + '</div>' +
+      '<dl class="camp-meta">' +
+        '<dt>Created</dt><dd>' + esc(fmtDate(c.created_at)) + '</dd>' +
+        '<dt>Last played</dt><dd>' + esc(fmtDate(c.last_played)) + '</dd>' +
+        '<dt>Size</dt><dd>' + esc(fmtSize(c.size_bytes)) + '</dd>' +
+      '</dl>';
+    const actions = document.createElement('div');
+    actions.className = 'camp-actions';
+    const open = document.createElement('button'); open.textContent = c.active ? 'Open' : 'Switch & open';
+    open.addEventListener('click', () => switchAndOpen(c.slug));
+    const banBtn = document.createElement('button'); banBtn.textContent = 'Banner';
+    banBtn.addEventListener('click', () => openBanner(c.slug, c.name));
+    const exp = document.createElement('a'); exp.className = 'btn'; exp.textContent = 'Export';
+    exp.href = '/campaigns/' + encodeURIComponent(c.slug) + '/export.tgz';
+    const del = document.createElement('button'); del.className = 'danger'; del.textContent = 'Delete';
+    del.addEventListener('click', () => openDelete(c.slug));
+    if (c.active) del.disabled = true, del.title = 'Switch to another campaign before deleting this one.';
+    actions.append(open, banBtn, exp, del);
+    body.appendChild(actions);
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  async function refresh() {
+    grid.textContent = '';
+    const r = await fetch('/api/campaigns.json');
+    if (!r.ok) { grid.innerHTML = '<div class="camp-empty">Failed to load campaigns.</div>'; return; }
+    const d = await r.json();
+    if (!d.campaigns || !d.campaigns.length) {
+      grid.innerHTML = '<div class="camp-empty">No campaigns yet. Create one to get started.</div>';
+      return;
+    }
+    for (const c of d.campaigns) grid.appendChild(renderCard(c));
+  }
+
+  async function switchAndOpen(slug) {
+    const r = await fetch('/campaigns/' + encodeURIComponent(slug) + '/switch', {method: 'POST'});
+    if (r.ok) window.location.href = '/play';
+  }
+  function openDelete(slug) {
+    delSlug = slug; delTarget.textContent = slug; delErr.textContent = '';
+    delForm.reset();
+    delDlg.showModal();
+  }
+  function openBanner(slug, name) {
+    banSlug = slug; banTarget.textContent = name; banErr.textContent = '';
+    banMode = 'upload'; setBannerMode('upload');
+    banForm.reset();
+    banDlg.showModal();
+  }
+  function setBannerMode(mode) {
+    banMode = mode;
+    banForm.querySelectorAll('.banner-tabs button').forEach(b => {
+      b.classList.toggle('on', b.dataset.mode === mode);
+    });
+    banForm.querySelectorAll('[data-mode-panel]').forEach(p => {
+      p.hidden = p.dataset.modePanel !== mode;
+    });
+  }
+  banForm.querySelectorAll('.banner-tabs button').forEach(b => {
+    b.addEventListener('click', () => setBannerMode(b.dataset.mode));
+  });
+
+  function wireClose(dlg) {
+    dlg.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => dlg.close()));
+    dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
+  }
+  [newDlg, impDlg, delDlg, banDlg].forEach(wireClose);
+
+  newBtn.addEventListener('click', () => {
+    newErr.textContent = ''; newForm.reset();
+    newForm.elements.tone.value = 'high fantasy';
+    newDlg.showModal();
+  });
+  importBtn.addEventListener('click', () => { impErr.textContent = ''; impForm.reset(); impDlg.showModal(); });
+
+  newForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    newErr.textContent = '';
+    const fd = new FormData(newForm);
+    const r = await fetch('/campaigns/create', {method: 'POST', body: fd});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { newErr.textContent = d.error || 'Failed.'; return; }
+    newDlg.close();
+    await refresh();
+  });
+  impForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    impErr.textContent = '';
+    const fd = new FormData(impForm);
+    if (!fd.get('force')) fd.delete('force');
+    const r = await fetch('/campaigns/import', {method: 'POST', body: fd});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { impErr.textContent = d.error || 'Failed.'; return; }
+    impDlg.close();
+    await refresh();
+  });
+  delForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    delErr.textContent = '';
+    if (!delSlug) return;
+    if (delForm.elements.confirm.value.trim() !== delSlug) {
+      delErr.textContent = 'Slug confirmation does not match.'; return;
+    }
+    const r = await fetch('/campaigns/' + encodeURIComponent(delSlug) + '/delete', {method: 'POST'});
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { delErr.textContent = d.error || 'Failed.'; return; }
+    delDlg.close();
+    await refresh();
+  });
+  banForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    banErr.textContent = '';
+    if (!banSlug) return;
+    banSubmit.disabled = true;
+    const origTxt = banSubmit.textContent;
+    banSubmit.textContent = banMode === 'generate' ? 'Generating…' : 'Uploading…';
+    try {
+      let resp;
+      if (banMode === 'upload') {
+        const file = banForm.elements.image.files[0];
+        if (!file) { banErr.textContent = 'Pick an image first.'; return; }
+        const fd = new FormData(); fd.append('image', file);
+        resp = await fetch('/campaigns/' + encodeURIComponent(banSlug) + '/banner', {method: 'POST', body: fd});
+      } else {
+        const hint = banForm.elements.hint.value.trim();
+        resp = await fetch('/campaigns/' + encodeURIComponent(banSlug) + '/banner', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({mode: 'generate', hint}),
+        });
+      }
+      const d = await resp.json().catch(() => ({}));
+      if (!resp.ok) { banErr.textContent = d.error || 'Failed.'; return; }
+      banDlg.close();
+      await refresh();
+    } finally {
+      banSubmit.disabled = false;
+      banSubmit.textContent = origTxt;
+    }
+  });
+
+  refresh();
+})();
+</script>
+"""
+    return render("Campaigns", body)
+
+
+@app.route("/api/campaigns.json")
+def api_campaigns():
+    return jsonify({"campaigns": _arch.list_summaries()})
+
+
+@app.route("/campaigns/<slug>/banner")
+def campaign_banner(slug: str):
+    if not re.match(r"^[a-z0-9][a-z0-9\-_]*$", slug):
+        abort(400)
+    p = _arch.banner_path(slug)
+    if not p:
+        abort(404)
+    return send_file(str(p))
+
+
+@app.route("/campaigns/<slug>/switch", methods=["POST"])
+def campaign_switch(slug: str):
+    if not re.match(r"^[a-z0-9][a-z0-9\-_]*$", slug):
+        return jsonify({"error": "invalid slug"}), 400
+    camp_dir = Path(__file__).parent / "campaigns" / slug
+    if not (camp_dir / "campaign.json").is_file():
+        return jsonify({"error": "campaign not found"}), 404
+    try:
+        _activate_and_reload(slug)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    # Session ids are stored per-campaign (campaigns/<slug>/.dm_session),
+    # so the next /play turn naturally resumes whatever conversation was
+    # last active for the destination campaign — no reset needed.
+    return jsonify({"ok": True, "slug": slug})
+
+
+@app.route("/campaigns/create", methods=["POST"])
+def campaign_create():
+    name = (request.form.get("name") or "").strip()
+    world = (request.form.get("world") or "").strip()
+    tone = (request.form.get("tone") or "high fantasy").strip()
+    try:
+        initial_gp = int(request.form.get("initial_gp") or 0)
+    except ValueError:
+        initial_gp = 0
+    if not name or not world:
+        return jsonify({"error": "name and world are required"}), 400
+
+    slug = re.sub(r"[^a-z0-9-]", "", name.lower().replace(" ", "-"))
+    if not slug:
+        return jsonify({"error": "name does not produce a valid slug"}), 400
+    camp_root = Path(__file__).parent / "campaigns"
+    camp_dir = camp_root / slug
+    if camp_dir.exists():
+        return jsonify({"error": f"campaign already exists: {slug}"}), 409
+
+    # Mirror the MCP create_campaign tool's scaffolding so the two paths
+    # produce identical campaign.json shapes.
+    from tools.campaign_mgmt import _CAMPAIGN_SCHEMA
+    for sub in ("", "characters", "locations", "images"):
+        (camp_dir / sub).mkdir(parents=True, exist_ok=True)
+    data = dict(_CAMPAIGN_SCHEMA)
+    data["name"] = name
+    data["world"] = world
+    data["tone"] = tone
+    data["initial_coin"] = {"gp": initial_gp, "ep": 0, "sp": 0, "cp": 0}
+    data["encounter_tables"] = {k: list(v) for k, v in _CAMPAIGN_SCHEMA["encounter_tables"].items()}
+    data["encounter_frequency"] = {k: dict(v) for k, v in _CAMPAIGN_SCHEMA["encounter_frequency"].items()}
+    data["characters"] = {}
+    data["created_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _c.atomic_write_text(
+        camp_dir / "campaign.json",
+        json.dumps(data, indent=2, ensure_ascii=False),
+    )
+    log_path = camp_dir / "adventure_log.md"
+    if not log_path.exists():
+        log_path.write_text(f"# {name} — Adventure Log\n\n", encoding="utf-8")
+    _activate_and_reload(slug)
+    # No session reset needed — the new campaign has no per-campaign
+    # .dm_session yet, so the first turn will start a fresh Claude
+    # session and persist its id under campaigns/<slug>/.dm_session.
+    return jsonify({"ok": True, "slug": slug})
+
+
+@app.route("/campaigns/<slug>/delete", methods=["POST"])
+def campaign_delete(slug: str):
+    if not re.match(r"^[a-z0-9][a-z0-9\-_]*$", slug):
+        return jsonify({"error": "invalid slug"}), 400
+    # Block deleting the active campaign — switching first prevents the
+    # dashboard from holding references to a deleted directory in ``cfg``.
+    try:
+        active = (Path(__file__).parent / ".active").read_text(encoding="utf-8").strip()
+    except OSError:
+        active = ""
+    if slug == active:
+        return jsonify({"error": "cannot delete the active campaign — switch first"}), 409
+    try:
+        _arch.delete_campaign(slug)
+    except FileNotFoundError:
+        return jsonify({"error": "campaign not found"}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/campaigns/<slug>/export.tgz")
+def campaign_export(slug: str):
+    if not re.match(r"^[a-z0-9][a-z0-9\-_]*$", slug):
+        abort(400)
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(prefix=f"{slug}-", suffix=".tgz", delete=False)
+    tmp.close()
+    try:
+        _arch.export_campaign(slug, Path(tmp.name))
+    except FileNotFoundError:
+        Path(tmp.name).unlink(missing_ok=True)
+        abort(404)
+    resp = send_file(
+        tmp.name,
+        mimetype="application/gzip",
+        as_attachment=True,
+        download_name=f"{slug}.tgz",
+    )
+    # Best-effort cleanup once the response is sent — Flask streams the file
+    # before we get a chance here, so schedule the unlink via call_on_close.
+    @resp.call_on_close
+    def _cleanup():
+        try:
+            Path(tmp.name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return resp
+
+
+@app.route("/campaigns/import", methods=["POST"])
+def campaign_import():
+    f = request.files.get("archive")
+    if not f or not f.filename:
+        return jsonify({"error": "archive file is required"}), 400
+    rename = (request.form.get("rename") or "").strip() or None
+    force = request.form.get("force") is not None
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".tgz", delete=False) as tmp:
+        f.save(tmp.name)
+        path = Path(tmp.name)
+    try:
+        slug = _arch.import_campaign(path, rename=rename, force=force)
+    except FileExistsError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except (ValueError, FileNotFoundError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    finally:
+        path.unlink(missing_ok=True)
+    return jsonify({"ok": True, "slug": slug})
+
+
+@app.route("/campaigns/<slug>/banner", methods=["POST"])
+def campaign_set_banner(slug: str):
+    if not re.match(r"^[a-z0-9][a-z0-9\-_]*$", slug):
+        return jsonify({"error": "invalid slug"}), 400
+    camp_root = Path(__file__).parent / "campaigns" / slug
+    if not (camp_root / "campaign.json").is_file():
+        return jsonify({"error": "campaign not found"}), 404
+
+    if request.is_json:
+        # AI-generated banner path: use the campaign's world+tone as the
+        # painter's brief, plus optional player-side hint. Reuses the same
+        # Flux pipeline as /play/generate_scene so the visual style stays
+        # consistent with scene illustrations.
+        data = request.get_json(silent=True) or {}
+        if data.get("mode") != "generate":
+            return jsonify({"error": "unsupported JSON mode"}), 400
+        camp_json = json.loads((camp_root / "campaign.json").read_text(encoding="utf-8"))
+        world = (camp_json.get("world") or "").strip()
+        tone = (camp_json.get("tone") or "high fantasy").strip()
+        hint = (data.get("hint") or "").strip()
+        if not world:
+            return jsonify({"error": "campaign has no world description to generate from"}), 400
+        try:
+            replicate = _img._load_replicate()
+        except (ImportError, EnvironmentError) as exc:
+            return jsonify({"error": str(exc)}), 500
+        tone_clause = _img.TONE_STYLES.get(tone, tone)
+        brief = (
+            f"Wide cinematic landscape banner, no characters in foreground. "
+            f"Setting: {world}"
+        )
+        if hint:
+            brief += f" Emphasis: {hint}"
+        full_prompt = f"{_img.STYLE_BASE} {tone_clause}. {brief}"[:1500]
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tmp_dir = Path(td)
+            tmp_name = "banner.png"
+            try:
+                _img._generate_image(replicate, full_prompt, tmp_dir, tmp_name)
+            except Exception as exc:
+                return jsonify({"error": str(exc)}), 500
+            try:
+                rel = _arch.set_banner(slug, (tmp_dir / tmp_name).read_bytes(), ".png")
+            except (FileNotFoundError, ValueError) as exc:
+                return jsonify({"error": str(exc)}), 400
+        return jsonify({"ok": True, "banner": rel, "prompt": brief})
+
+    # Multipart upload path.
+    f = request.files.get("image")
+    if not f or not f.filename:
+        return jsonify({"error": "image file is required"}), 400
+    mime = (f.mimetype or "").lower()
+    suffix = _BANNER_EXT_BY_MIME.get(mime)
+    if not suffix:
+        return jsonify({"error": f"unsupported image type: {mime}"}), 400
+    blob = f.read(_BANNER_MAX_BYTES + 1)
+    if len(blob) > _BANNER_MAX_BYTES:
+        return jsonify({"error": "image exceeds 8 MB limit"}), 413
+    try:
+        rel = _arch.set_banner(slug, blob, suffix)
+    except (FileNotFoundError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, "banner": rel})
+
+
 @app.route("/sessions")
 def sessions_index():
     sdir = _sessions_dir()
@@ -2388,11 +3061,46 @@ def session_view(sid: str):
         f'{"Show all turns" if dm_only else "DM only"}</a>'
     )
 
+    is_active = _dm.session_id() == sid
+    resume_label = "Already active in /play" if is_active else "Resume in /play"
+    resume_btn = (
+        f'<button id="resume-sess" data-sid="{html.escape(sid)}" '
+        f'style="padding:5px 12px; background:transparent; '
+        f'border:1px solid var(--rule-hi); color:var(--ink-body); '
+        f'border-radius:3px; cursor:pointer; font-family:var(--font-display); '
+        f'font-size:0.78em; text-transform:uppercase; letter-spacing:0.12em;"'
+        f'{"" if not is_active else " disabled"}>{resume_label}</button>'
+    )
+    resume_js = """
+<script>
+(function(){
+  const b = document.getElementById('resume-sess');
+  if (!b || b.disabled) return;
+  b.addEventListener('click', async () => {
+    const sid = b.dataset.sid;
+    const orig = b.textContent;
+    b.disabled = true; b.textContent = 'Activating…';
+    try {
+      const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/activate', {method: 'POST'});
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { b.textContent = d.error || 'Failed'; setTimeout(() => { b.textContent = orig; b.disabled = false; }, 1800); return; }
+      b.textContent = 'Active — opening /play…';
+      setTimeout(() => { window.location.href = '/play'; }, 400);
+    } catch (e) {
+      b.textContent = 'Failed'; setTimeout(() => { b.textContent = orig; b.disabled = false; }, 1800);
+    }
+  });
+})();
+</script>
+"""
+
     body = (
         f"<h1>Session <code>{html.escape(sid[:8])}</code></h1>"
         f"<p class='muted'>{when} · {toggle} · "
         f'<a href="/sessions">← back to index</a></p>'
+        f'<p>{resume_btn}</p>'
         f'<div class="card">{content_html}</div>'
+        f'{resume_js}'
     )
     return render(f"Session {sid[:8]}", body)
 
@@ -2437,15 +3145,27 @@ def _play_state() -> dict:
         hp_max = char.get("hp_max", 0)
         hp_cur = combat_hp.get(key, cstate.get("hp", hp_max))
         portrait = _find_portrait(char.get("label", key), image_index, key)
+        level = int(char.get("level", 1) or 1)
+        xp = int(cstate.get("xp", 0) or 0)
+        xp_table = _class_xp_table(char.get("cls", ""))
+        xp_floor = 0
+        xp_next = None
+        if xp_table and 1 <= level <= len(xp_table):
+            xp_floor = xp_table[level - 1]
+            if level < len(xp_table):
+                xp_next = xp_table[level]
         chars.append({
             "key": key,
             "label": char.get("label", key),
             "cls": char.get("cls", ""),
-            "level": int(char.get("level", 1) or 1),
+            "level": level,
             "hp": hp_cur,
             "hp_max": hp_max,
             "ac": char.get("ac"),
             "thac0": char.get("thac0"),
+            "xp": xp,
+            "xp_floor": xp_floor,
+            "xp_next": xp_next,
             "conditions": cstate.get("conditions", []),
             "portrait": f"/images/{portrait['filename']}" if portrait else None,
         })
@@ -2809,7 +3529,47 @@ _PLAY_HTML = """
     letter-spacing: 0.12em;
   }
   dialog.debug-dialog button:hover { border-color: var(--accent-gold); color: var(--accent-gold); }
+  dialog.debug-dialog .actions { align-items: center; }
+  dialog.debug-dialog #debug-force-reset {
+    margin-right: auto; border-color: #7a3a3a; color: #b88;
+  }
+  dialog.debug-dialog #debug-force-reset:hover { border-color: #c66; color: #ecc; }
   #play-debug.debug-on { color: var(--accent-gold); border-color: var(--accent-gold); }
+  #play-suggest.suggest-on { color: var(--accent-gold); border-color: var(--accent-gold); }
+  #play-bell.bell-on { color: var(--accent-gold); border-color: var(--accent-gold); }
+  /* Suggested-action chips appear under the last DM turn when the
+     'suggest' toggle is on. Clicking a chip fills the input and submits. */
+  .suggest-row {
+    display: flex; flex-wrap: wrap; gap: 6px;
+    margin: 6px 0 12px;
+    align-items: center;
+  }
+  .suggest-chip {
+    padding: 5px 12px;
+    background: transparent;
+    border: 1px solid var(--rule-hi);
+    color: var(--ink-body);
+    border-radius: 999px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.88em;
+    line-height: 1.3;
+    text-align: left;
+    max-width: 100%;
+  }
+  .suggest-chip::before {
+    content: '▸ ';
+    color: var(--accent-gold);
+    margin-right: 1px;
+  }
+  .suggest-chip:hover {
+    border-color: var(--accent-gold);
+    color: var(--accent-gold);
+  }
+  .suggest-chip:disabled { opacity: 0.5; cursor: progress; }
+  .suggest-loading {
+    font-size: 0.82em; color: var(--ink-faint); font-style: italic;
+  }
   /* Markdown rendered inside DM turns — scope headings/rules/etc so they
      don't carry their full-page sizing into the chat log. */
   .turn.dm > *:first-child { margin-top: 0; }
@@ -3481,6 +4241,36 @@ _PLAY_HTML = """
     text-align: right;
     letter-spacing: 0;
   }
+  .party-mini-xp {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 3px;
+    opacity: 0.75;
+  }
+  .party-mini-xp .xp-meter { flex: 1; }
+  .xp-meter {
+    display: block;
+    height: 3px;
+    background: var(--bg-rec);
+    border: 1px solid var(--rule);
+    border-radius: 1px;
+    overflow: hidden;
+  }
+  .xp-meter > i {
+    display: block;
+    height: 100%;
+    background: linear-gradient(to right, #5a4a26, var(--accent-gold));
+    transition: width 380ms ease;
+  }
+  .party-mini-xp-text {
+    font-family: var(--font-mono);
+    font-size: 0.62em;
+    color: var(--ink-muted);
+    min-width: 42px;
+    text-align: right;
+    letter-spacing: 0;
+  }
   .party-mini-conds {
     margin-top: 5px;
     display: flex;
@@ -3530,6 +4320,8 @@ _PLAY_HTML = """
       <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
       <button id="play-make-pic-hint" type="button" class="icon-btn" title="Make picture with a hint" aria-label="Make picture with a hint">…</button>
       <button id="play-voices" type="button" class="icon-btn" title="Configure narration voices" aria-label="Configure narration voices">🎙</button>
+      <button id="play-suggest" type="button" class="icon-btn" title="Suggest 2-4 next actions after each DM reply" aria-label="Toggle suggested actions">💡</button>
+      <button id="play-bell" type="button" class="icon-btn" title="Play a chime when the DM finishes a response" aria-label="Toggle response chime">🔔</button>
       <button id="play-debug" type="button" class="icon-btn" title="Inspect the raw stream-JSON events from claude -p (last 200)" aria-label="Open debug log">🐛</button>
       <button id="play-reset" type="button">New session</button>
     </div>
@@ -3560,6 +4352,7 @@ _PLAY_HTML = """
       <p class="muted">Last 200 events from <code>claude -p</code>. Per-turn token + cost are inside each <code>result</code> event's <code>usage</code> field.</p>
       <pre id="debug-pre" class="debug-pre">(none captured yet)</pre>
       <div class="actions">
+        <button type="button" id="debug-force-reset" title="Kill any wedged claude -p and clear the in-flight lock. Use only if the DM is stuck.">Force-reset turn</button>
         <button type="button" id="debug-clear">Clear</button>
         <button type="button" id="debug-copy">Copy JSON</button>
         <button type="button" id="debug-close">Close</button>
@@ -3610,6 +4403,36 @@ _PLAY_HTML = """
   const jumpBtn = document.getElementById('jump-to-bottom');
   let firstAppend = true;
   let lastDmText = '';
+  let lastDmTurnEl = null;     // last live DM turn DOM node — anchor for the chip row
+  let suggestEl = null;        // current chip-row element, or null
+  let suggestController = null; // AbortController for the in-flight suggestion fetch
+  let suggestEnabled = localStorage.getItem('play.suggest-actions') === '1';
+  let bellEnabled = localStorage.getItem('play.bell') === '1';
+  let bellAudioCtx = null;
+
+  // Two-note chime via WebAudio — no asset dependency. Lazily creates
+  // the AudioContext on first use (browser autoplay policies require a
+  // user gesture; toggling the button counts).
+  function playBell() {
+    try {
+      if (!bellAudioCtx) bellAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = bellAudioCtx;
+      const now = ctx.currentTime;
+      const tones = [{ f: 988, t: 0 }, { f: 1319, t: 0.12 }]; // B5 → E6
+      for (const { f, t } of tones) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = f;
+        gain.gain.setValueAtTime(0.0001, now + t);
+        gain.gain.exponentialRampToValueAtTime(0.15, now + t + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + t + 0.35);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(now + t);
+        osc.stop(now + t + 0.4);
+      }
+    } catch (e) { /* silent — audio is non-essential */ }
+  }
   let thinkingEl = null;
   let thinkingStart = 0;
   let thinkingTimer = null;
@@ -4128,6 +4951,14 @@ _PLAY_HTML = """
     return div;
   }
 
+  function rebindLastDmTurnFromLog() {
+    // After history replay, find the bottom-most DM turn so the suggest
+    // toggle has an anchor for its chip row even when the user hasn't
+    // sent a turn yet this page-load.
+    const turns = log.querySelectorAll('.turn.dm');
+    lastDmTurnEl = turns.length ? turns[turns.length - 1] : null;
+  }
+
   function append(role, text) {
     clearEmptyState();
     const div = document.createElement('div');
@@ -4135,7 +4966,10 @@ _PLAY_HTML = """
     if (role === 'dm') {
       div.innerHTML = renderMarkdown(text);
       attachDmControls(div, text);
-    } else {
+      lastDmTurnEl = div;
+      clearSuggestions();
+    }
+    else {
       div.textContent = text;
     }
     // Insert before the thinking indicator (if it's still up) so the new
@@ -4147,6 +4981,90 @@ _PLAY_HTML = """
       log.appendChild(div);
     }
     maybeScrollToBottom();
+  }
+
+  function clearSuggestions() {
+    if (suggestController) {
+      try { suggestController.abort(); } catch (e) {}
+      suggestController = null;
+    }
+    if (suggestEl && suggestEl.parentElement) suggestEl.remove();
+    suggestEl = null;
+  }
+
+  function ensureSuggestRow() {
+    if (!lastDmTurnEl) return null;
+    if (suggestEl && suggestEl.parentElement === lastDmTurnEl.parentElement) return suggestEl;
+    if (suggestEl && suggestEl.parentElement) suggestEl.remove();
+    suggestEl = document.createElement('div');
+    suggestEl.className = 'suggest-row';
+    lastDmTurnEl.after(suggestEl);
+    return suggestEl;
+  }
+
+  function renderSuggestLoading() {
+    const row = ensureSuggestRow();
+    if (!row) return;
+    row.textContent = '';
+    const s = document.createElement('span');
+    s.className = 'suggest-loading';
+    s.textContent = 'Thinking of options…';
+    row.appendChild(s);
+  }
+
+  function renderSuggestions(actions) {
+    if (!suggestEnabled) return;
+    if (!Array.isArray(actions) || actions.length < 2) {
+      clearSuggestions();
+      return;
+    }
+    const row = ensureSuggestRow();
+    if (!row) return;
+    row.textContent = '';
+    for (const a of actions) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'suggest-chip';
+      btn.textContent = a;
+      btn.addEventListener('click', () => {
+        const text = a;
+        clearSuggestions();
+        input.value = '';
+        submitTurn(text);
+      });
+      row.appendChild(btn);
+    }
+    maybeScrollToBottom();
+  }
+
+  async function fetchSuggestions(narrative) {
+    if (!suggestEnabled) return;
+    if (!narrative || !lastDmTurnEl) return;
+    if (suggestController) {
+      try { suggestController.abort(); } catch (e) {}
+    }
+    suggestController = new AbortController();
+    const sig = suggestController.signal;
+    renderSuggestLoading();
+    try {
+      const r = await fetch('/play/suggest_actions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({narrative: narrative.slice(0, 4000)}),
+        signal: sig,
+      });
+      if (!r.ok) { clearSuggestions(); return; }
+      const d = await r.json();
+      if (sig.aborted) return;
+      renderSuggestions(d.actions || []);
+    } catch (err) {
+      // AbortError or network failure — silently drop the chip row.
+      clearSuggestions();
+    } finally {
+      if (suggestController && suggestController.signal === sig) {
+        suggestController = null;
+      }
+    }
   }
 
   function attachDmControls(turnEl, text) {
@@ -4272,8 +5190,73 @@ _PLAY_HTML = """
   // the user's own message round-trips back as a user event with the
   // tool_result blocks). Capture is unconditional and cheap; the dialog
   // is the only thing that exposes it.
-  const DEBUG_BUFFER_MAX = 200;
+  const DEBUG_BUFFER_MAX = 1000;
   const debugEvents = [];
+  // Token-streaming state. When --include-partial-messages is on, assistant
+  // text arrives as stream_event/content_block_delta records; we accumulate
+  // them into a single live DM bubble and skip the matching text block on
+  // the final assistant event so it doesn't render twice. streamedText is a
+  // per-turn flag so a missing partial stream falls back to block render.
+  let currentDmEl = null;
+  let currentDmText = '';     // text already revealed in the DOM
+  let pendingDmText = '';     // text buffered from deltas, waiting to reveal
+  let dmRafId = null;
+  let dmLastTickTime = 0;
+  // Typewriter pacing for streamed text. Deltas arrive in chunky bursts of
+  // several words; rendering each one immediately reads as "blocks appearing".
+  // We buffer into pendingDmText and drain it character-by-character on a
+  // requestAnimationFrame tick, scaling speed with backlog so long responses
+  // don't lag behind generation.
+  const REVEAL_BASE_CPS = 80;      // baseline chars/sec on a near-empty buffer
+  const REVEAL_MAX_BOOST = 4;      // multiplier ceiling when backlog is large
+  let streamedText = false;
+  // Tracks whether THIS tab is the one driving the current turn. Used by
+  // the recovery poller so it doesn't misread "local turn streaming, but
+  // spinner already dropped because text started arriving" as a reload-
+  // mid-stream scenario and re-append the narrative at result time.
+  let localTurnActive = false;
+
+  function scheduleDmReveal() {
+    if (dmRafId !== null) return;
+    dmLastTickTime = performance.now();
+    dmRafId = requestAnimationFrame(dmRevealTick);
+  }
+
+  function dmRevealTick(now) {
+    dmRafId = null;
+    if (!currentDmEl) {
+      pendingDmText = '';
+      return;
+    }
+    if (!pendingDmText.length) return;
+    const dt = Math.max(0, (now - dmLastTickTime) / 1000);
+    dmLastTickTime = now;
+    // Backlog boost: when many chars are queued (slow client / fast model)
+    // we speed up so the reveal doesn't run minutes behind the actual reply.
+    const boost = Math.min(REVEAL_MAX_BOOST, 1 + pendingDmText.length / 60);
+    const n = Math.max(1, Math.floor(REVEAL_BASE_CPS * boost * dt));
+    const take = pendingDmText.slice(0, n);
+    pendingDmText = pendingDmText.slice(n);
+    currentDmText += take;
+    currentDmEl.innerHTML = renderMarkdown(currentDmText);
+    maybeScrollToBottom();
+    if (pendingDmText.length > 0) {
+      dmRafId = requestAnimationFrame(dmRevealTick);
+    }
+  }
+
+  function flushDmReveal() {
+    if (dmRafId !== null) {
+      cancelAnimationFrame(dmRafId);
+      dmRafId = null;
+    }
+    if (pendingDmText && currentDmEl) {
+      currentDmText += pendingDmText;
+      currentDmEl.innerHTML = renderMarkdown(currentDmText);
+      maybeScrollToBottom();
+    }
+    pendingDmText = '';
+  }
 
   function handleEvent(evt) {
     debugEvents.push(evt);
@@ -4282,12 +5265,55 @@ _PLAY_HTML = """
     }
     if (evt.type === 'system' && evt.session_id) {
       sidEl.textContent = evt.session_id.slice(0, 8);
+    } else if (evt.type === 'stream_event' && evt.event) {
+      const ev = evt.event;
+      if (ev.type === 'content_block_start' && ev.content_block && ev.content_block.type === 'text') {
+        stopThinking();
+        currentDmText = '';
+        clearEmptyState();
+        currentDmEl = document.createElement('div');
+        currentDmEl.className = 'turn dm';
+        if (thinkingEl && thinkingEl.parentElement === log) {
+          log.insertBefore(currentDmEl, thinkingEl);
+        } else {
+          log.appendChild(currentDmEl);
+        }
+        maybeScrollToBottom();
+      } else if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta') {
+        streamedText = true;
+        if (!currentDmEl) {
+          stopThinking();
+          clearEmptyState();
+          currentDmEl = document.createElement('div');
+          currentDmEl.className = 'turn dm';
+          if (thinkingEl && thinkingEl.parentElement === log) {
+            log.insertBefore(currentDmEl, thinkingEl);
+          } else {
+            log.appendChild(currentDmEl);
+          }
+        }
+        pendingDmText += ev.delta.text || '';
+        scheduleDmReveal();
+      } else if (ev.type === 'content_block_stop' && currentDmEl) {
+        flushDmReveal();
+        if (currentDmText) {
+          attachDmControls(currentDmEl, currentDmText);
+          lastDmTurnEl = currentDmEl;
+          lastDmText += currentDmText;
+          clearSuggestions();
+        }
+        currentDmEl = null;
+        currentDmText = '';
+      }
     } else if (evt.type === 'assistant' && evt.message && Array.isArray(evt.message.content)) {
       for (const block of evt.message.content) {
         if (block.type === 'text' && block.text) {
+          // If --include-partial-messages already streamed this turn's text
+          // via stream_event deltas, skip — otherwise it would render twice.
+          if (streamedText) continue;
           stopThinking();          // first prose arrives — drop the indicator
           append('dm', block.text);
-          lastDmText = block.text;
+          lastDmText += block.text;
         } else if (block.type === 'tool_use') {
           thinkingTools++;
           updateThinkingTime();
@@ -4323,15 +5349,25 @@ _PLAY_HTML = """
       }
       appendMeta(parts.join(' · '), tip.join('\\n'));
       refreshState();
+      if (bellEnabled) playBell();
+      if (suggestEnabled) fetchSuggestions(lastDmText);
     } else if (evt.type === 'error') {
       append('error', 'rc=' + evt.returncode + '  ' + (evt.stderr || '').slice(0, 500));
     }
   }
 
   async function submitTurn(text) {
+    clearSuggestions();
     append('player', text);
     startThinking();
     send.disabled = true;
+    lastDmText = '';
+    streamedText = false;
+    currentDmEl = null;
+    currentDmText = '';
+    pendingDmText = '';
+    if (dmRafId !== null) { cancelAnimationFrame(dmRafId); dmRafId = null; }
+    localTurnActive = true;
     try {
       const resp = await fetch('/play/turn', {
         method: 'POST',
@@ -4361,7 +5397,9 @@ _PLAY_HTML = """
     } catch (err) {
       append('error', String(err));
     } finally {
+      flushDmReveal();          // make sure anything queued is shown before we exit
       stopThinking();
+      localTurnActive = false;
       send.disabled = false;
       statusEl.textContent = '';
       input.focus();
@@ -4392,6 +5430,23 @@ _PLAY_HTML = """
       const acStr = (c.ac !== undefined && c.ac !== null) ? 'AC ' + c.ac : '';
       const sub = [cls, acStr].filter(Boolean).join('  \\u00b7  ');
       const sheetUrl = '/sheets/' + encodeURIComponent(c.key || '');
+
+      // XP bar: only when the class has a level table AND the character
+      // isn't at max level (xp_next === null means max). Progress is
+      // measured *within* the current level: (xp - floor) / (next - floor).
+      let xpHtml = '';
+      if (c.xp_next != null && c.xp_next > c.xp_floor) {
+        const span = c.xp_next - c.xp_floor;
+        const into = Math.max(0, c.xp - c.xp_floor);
+        const xpPct = Math.max(0, Math.min(100, (into / span) * 100));
+        const xpFmt = (n) => Number(n || 0).toLocaleString();
+        xpHtml = ''
+          + '<div class="party-mini-xp" title="XP ' + xpFmt(c.xp) + ' / ' + xpFmt(c.xp_next) + ' (next level)">'
+          +   '<span class="xp-meter"><i style="width:' + xpPct.toFixed(1) + '%"></i></span>'
+          +   '<span class="party-mini-xp-text">' + xpFmt(c.xp) + '/' + xpFmt(c.xp_next) + '</span>'
+          + '</div>';
+      }
+
       return ''
         + '<article class="party-mini">'
         +   '<a class="portrait-frame ' + (ko ? 'kod ' : '') + (c.portrait ? '' : 'empty') + '" href="' + sheetUrl + '" title="Open ' + esc(c.label) + '\\u2019s sheet">' + portrait + '</a>'
@@ -4402,6 +5457,7 @@ _PLAY_HTML = """
         +       '<span class="hp-meter"><i style="width:' + pct.toFixed(1) + '%"></i></span>'
         +       '<span class="party-mini-hp-text">' + esc(c.hp) + '/' + esc(c.hp_max) + '</span>'
         +     '</div>'
+        +     xpHtml
         +     (conds ? '<div class="party-mini-conds">' + conds + '</div>' : '')
         +   '</div>'
         + '</article>';
@@ -4647,6 +5703,7 @@ _PLAY_HTML = """
   const debugClear  = document.getElementById('debug-clear');
   const debugCopy   = document.getElementById('debug-copy');
   const debugClose  = document.getElementById('debug-close');
+  const debugReset  = document.getElementById('debug-force-reset');
 
   function renderDebug() {
     debugCount.textContent = '(' + debugEvents.length + ')';
@@ -4688,6 +5745,61 @@ _PLAY_HTML = """
       debugCopy.textContent = 'Copy failed';
     }
     setTimeout(() => { debugCopy.textContent = orig; }, 1400);
+  });
+  debugReset.addEventListener('click', async () => {
+    if (!confirm('Force-reset the in-flight DM turn? This kills any running claude -p subprocess and clears the server-side lock. Use only if a turn appears wedged.')) return;
+    const orig = debugReset.textContent;
+    debugReset.disabled = true;
+    debugReset.textContent = 'Resetting…';
+    try {
+      const r = await fetch('/play/force_reset', {method: 'POST'});
+      const d = await r.json().catch(() => ({}));
+      stopThinking();
+      stopRecovery();
+      send.disabled = false;
+      lockedBySrv = false;
+      debugReset.textContent = d.killed_subprocess ? 'Killed ✓' : 'Cleared ✓';
+    } catch (e) {
+      debugReset.textContent = 'Failed';
+    }
+    setTimeout(() => { debugReset.textContent = orig; debugReset.disabled = false; }, 1600);
+  });
+
+  // ----- Suggested-actions toggle -----
+  const suggestBtn = document.getElementById('play-suggest');
+  function applySuggestVisual() {
+    suggestBtn.classList.toggle('suggest-on', suggestEnabled);
+    suggestBtn.title = suggestEnabled
+      ? 'Suggested next actions: ON — click to disable'
+      : 'Suggested next actions: OFF — click to enable';
+  }
+  applySuggestVisual();
+  suggestBtn.addEventListener('click', () => {
+    suggestEnabled = !suggestEnabled;
+    localStorage.setItem('play.suggest-actions', suggestEnabled ? '1' : '0');
+    applySuggestVisual();
+    if (!suggestEnabled) {
+      clearSuggestions();
+    } else if (lastDmText) {
+      if (!lastDmTurnEl) rebindLastDmTurnFromLog();
+      fetchSuggestions(lastDmText);
+    }
+  });
+
+  // ----- Response-chime toggle -----
+  const bellBtn = document.getElementById('play-bell');
+  function applyBellVisual() {
+    bellBtn.classList.toggle('bell-on', bellEnabled);
+    bellBtn.title = bellEnabled
+      ? 'Response chime: ON — click to disable'
+      : 'Response chime: OFF — click to enable';
+  }
+  applyBellVisual();
+  bellBtn.addEventListener('click', () => {
+    bellEnabled = !bellEnabled;
+    localStorage.setItem('play.bell', bellEnabled ? '1' : '0');
+    applyBellVisual();
+    if (bellEnabled) playBell(); // immediate preview + unlocks the AudioContext
   });
 
   // Narrative font-family cycle: three options, from thematic to maximally
@@ -4786,6 +5898,7 @@ _PLAY_HTML = """
       for (let i = d.turns.length - 1; i >= 0; i--) {
         if (d.turns[i].role === 'dm') { lastDmText = d.turns[i].text; break; }
       }
+      rebindLastDmTurnFromLog();
       log.scrollTop = log.scrollHeight;
     } catch (e) { /* ignore */ }
   }
@@ -4881,11 +5994,13 @@ _PLAY_HTML = """
       if (s.in_flight !== lockedBySrv) {
         lockedBySrv = s.in_flight;
         // Don't fight the local submit's own disable.
-        if (!thinkingEl) send.disabled = lockedBySrv;
+        if (!localTurnActive) send.disabled = lockedBySrv;
       }
       // Recovery indicator: show only when the server is busy AND we're
-      // not the ones running it (no local thinkingEl).
-      if (s.in_flight && !thinkingEl) {
+      // not the ones running it. Checking localTurnActive (not thinkingEl)
+      // matters because the spinner is dropped early once streaming text
+      // arrives — the local turn is still in flight long after.
+      if (s.in_flight && !localTurnActive) {
         if (!recoveryEl) startRecovery();
         updateRecovery(s);
       } else if (recoveryEl && !s.in_flight) {
@@ -4921,6 +6036,15 @@ def play_session_id():
 def play_reset():
     _dm.reset_session()
     return jsonify({"ok": True})
+
+
+@app.route("/play/force_reset", methods=["POST"])
+def play_force_reset():
+    """Hard-clear in-flight DM state from the GUI escape hatch. Kills any
+    running claude subprocess, replaces the turn lock so a wedged thread
+    can no longer block new turns, and resets the in-flight flag."""
+    info = _dm.force_reset()
+    return jsonify({"ok": True, **info})
 
 
 @app.route("/api/play_state.json")
@@ -5003,6 +6127,20 @@ def play_turn():
     resp.headers["X-Accel-Buffering"] = "no"
     resp.headers["Cache-Control"] = "no-cache"
     return resp
+
+
+@app.route("/play/suggest_actions", methods=["POST"])
+def play_suggest_actions():
+    """Return 2-4 plausible next player actions for a given DM reply.
+    Used by the /play 'suggest actions' toggle to populate chips under
+    the last DM turn. Returns ``{"actions": []}`` if the pass fails or
+    the narrative is empty so the frontend can silently hide the row."""
+    data = request.get_json(silent=True) or {}
+    narrative = (data.get("narrative") or "").strip()
+    if not narrative:
+        return jsonify({"actions": []})
+    actions = _dm.suggest_actions(narrative)
+    return jsonify({"actions": actions})
 
 
 @app.route("/play/generate_scene", methods=["POST"])
@@ -6018,6 +7156,20 @@ def serve_image(filename: str):
     return send_from_directory(str(images_dir), filename)
 
 
+@app.route("/api/sessions/<sid>/activate", methods=["POST"])
+def api_session_activate(sid: str):
+    """Pin a past Claude Code session as the one /play resumes on its next
+    turn. Validates the session id charset and that a matching JSONL
+    transcript exists before writing ``.dm_session``."""
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
+        return jsonify({"error": "invalid session id"}), 400
+    transcript = _dm._project_jsonl_dir() / f"{sid}.jsonl"
+    if not transcript.is_file():
+        return jsonify({"error": "no transcript found for that session"}), 404
+    _dm.set_session(sid)
+    return jsonify({"ok": True, "session_id": sid})
+
+
 @app.route("/api/sessions/<sid>", methods=["DELETE"])
 def api_session_delete(sid: str):
     """Delete a Claude Code session JSONL transcript and the matching
@@ -6972,6 +8124,8 @@ _REFERENCE_SECTIONS = [
      "Per-class progression: THAC0, saves, spell slots, XP requirements, and homebrew kits."),
     ("/items", "Items",
      "Equipment and magic items: cost, weight, weapon stats, armour values, and rarity."),
+    ("/greyhawk", "Greyhawk Setting",
+     "Greyhawk wiki: deities, realms, characters, settlements, and full-text search."),
 ]
 
 
@@ -6995,6 +8149,872 @@ def reference_index():
         '</div>'
     )
     return render("Reference", body)
+
+
+# ---------------------------------------------------------------------------
+# Greyhawk setting browser — reads settings/greyhawk/greyhawk.db (the same
+# DB the MCP `greyhawk_*` tools wrap). The DB ships read-only, so a cached
+# connection via `_db()` is safe.
+# ---------------------------------------------------------------------------
+from tools import greyhawk as _greyhawk
+
+
+# MediaWiki File: refs use spaces or underscores interchangeably; on disk
+# the images use underscores. We also accept an exact filename match as a
+# fallback in case future imports preserve the original spacing.
+def _greyhawk_image_path(name: str) -> Path | None:
+    """Resolve a `[[File:...]]` reference to an on-disk path, or None."""
+    if not name:
+        return None
+    # Strip any leading File:/Image: prefix and surrounding whitespace.
+    name = re.sub(r"^\s*(?:File|Image):\s*", "", name, flags=re.IGNORECASE)
+    name = name.strip().lstrip("/")
+    if not name or "/" in name or "\\" in name or name.startswith(".."):
+        return None
+    # Try the literal name and the spaces->underscores variant.
+    for cand in (name, name.replace(" ", "_")):
+        p = _GREYHAWK_IMG / cand
+        try:
+            # resolve() to defeat any sneaky relative-path escapes.
+            rp = p.resolve()
+        except OSError:
+            continue
+        try:
+            rp.relative_to(_GREYHAWK_IMG.resolve())
+        except ValueError:
+            continue
+        if rp.is_file():
+            return rp
+    return None
+
+
+def _greyhawk_iter_file_refs(text: str):
+    """Yield (start, end, inner) for each top-level `[[File:...]]` span.
+
+    MediaWiki File refs can nest wiki links inside their caption — e.g.
+    `[[File:Foo.jpg|thumb|see also [[Bar]]]]`. A flat regex over
+    `[[...]]` would mis-pair the brackets, so we walk the string with a
+    depth counter and yield only outermost spans.
+    """
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("[[", i) and re.match(
+            r"\[\[(File|Image):", text[i:i+10], flags=re.IGNORECASE
+        ):
+            depth = 0
+            j = i
+            while j < n:
+                if text.startswith("[[", j):
+                    depth += 1
+                    j += 2
+                elif text.startswith("]]", j):
+                    depth -= 1
+                    j += 2
+                    if depth == 0:
+                        yield (i, j, text[i+2:j-2])
+                        i = j
+                        break
+                else:
+                    j += 1
+            else:
+                # Unbalanced; bail out so we don't loop forever.
+                return
+        else:
+            i += 1
+
+
+_FILE_ALIGN = {"left", "right", "center", "none"}
+_FILE_FRAME = {"thumb", "thumbnail", "frame", "frameless", "border"}
+
+
+def _greyhawk_render_file_ref(inner: str) -> str:
+    """Render the contents between the outer `[[` and `]]` of a File ref.
+
+    `inner` is e.g. `File:Acererak DMG5e 2014.png|thumb|right|235px|A caption`.
+    We escape attribute values; the caption is left raw so the downstream
+    `[[link]]` regex still gets a chance to turn nested wiki links into
+    anchors.
+    """
+    parts = inner.split("|")
+    name = parts[0]
+    options = parts[1:]
+
+    width = None
+    align = None
+    is_thumb = False
+    caption_bits: list[str] = []
+
+    for opt in options:
+        token = opt.strip()
+        low = token.lower()
+        if low in _FILE_ALIGN:
+            align = low
+        elif low in _FILE_FRAME:
+            if low.startswith("thumb"):
+                is_thumb = True
+        elif re.fullmatch(r"\d+\s*px", low):
+            width = re.sub(r"\s*px$", "", low)
+        elif re.fullmatch(r"x\d+\s*px", low):
+            # height-only; we don't support it, ignore
+            pass
+        elif re.fullmatch(r"\d+x\d+\s*px", low):
+            width = low.split("x", 1)[0]
+        elif low in {"upright", "link=", "alt="}:
+            pass
+        elif low.startswith(("link=", "alt=", "page=", "lang=", "class=")):
+            pass
+        else:
+            caption_bits.append(token)
+
+    caption = " | ".join(b for b in caption_bits if b).strip()
+
+    path = _greyhawk_image_path(name)
+    clean_name = re.sub(r"^\s*(?:File|Image):\s*", "", name,
+                        flags=re.IGNORECASE).strip()
+    on_disk = clean_name.replace(" ", "_")
+
+    if path is None:
+        # Still missing — keep a quiet placeholder so the page reads cleanly
+        # while the image set is being copied in.
+        return (f'<span class="muted" style="font-size:0.9em">'
+                f'[image: {html.escape(clean_name)}]</span>')
+
+    url = "/greyhawk/image/" + html.escape(on_disk, quote=True)
+    style_parts = ["cursor:zoom-in"]
+    if width:
+        style_parts.append(f"width:{width}px")
+    if align in {"left", "right"}:
+        style_parts.append(f"float:{align}")
+        style_parts.append("margin:4px 12px 4px 12px")
+    elif align == "center":
+        style_parts.append("display:block;margin:8px auto")
+    img_style = ";".join(style_parts)
+
+    # No anchor wrapper — the global lightbox handler in BASE_TEMPLATE
+    # picks up any bare <img> click and opens it in the overlay.
+    img_html = (f'<img src="{url}" alt="{html.escape(clean_name)}"'
+                f' style="{img_style}" loading="lazy">')
+
+    if is_thumb or caption:
+        fig_style = "max-width:280px"
+        if align in {"left", "right"}:
+            fig_style += f";float:{align};margin:4px 12px"
+        elif align == "center":
+            fig_style += ";margin:8px auto"
+        # Caption is left raw so later regex passes can resolve [[links]].
+        cap_html = (f'<figcaption class="muted" '
+                    f'style="font-size:0.9em;margin-top:4px">{caption}</figcaption>'
+                    if caption else "")
+        return (f'<figure class="greyhawk-figure" style="{fig_style}">'
+                f'<img src="{url}" alt="{html.escape(clean_name)}" '
+                f'style="width:100%;height:auto;cursor:zoom-in" '
+                f'loading="lazy">'
+                f'{cap_html}</figure>')
+    return img_html
+
+
+_GREYHAWK_INFOBOX_TEMPLATES = {
+    # First-line {{Name|...}} templates we treat as page-level infoboxes
+    # (the source of the right-floated sidebar). Matched case-insensitively
+    # against the leading template at the top of raw_text.
+    "character", "settlement", "deity", "creature", "realm", "archfiend",
+    "location", "organization", "organisation", "creator", "item", "plane",
+    "holiday", "building", "race",
+}
+
+# Map ENTRY_TABLES → singular display label for the infobox header. Used
+# when raw_text has no leading template but a typed record exists.
+_GREYHAWK_ENTRY_SINGULAR = {
+    "characters": "Character", "settlements": "Settlement",
+    "deities": "Deity", "creatures": "Creature", "realms": "Realm",
+    "archfiends": "Archfiend", "locations": "Location",
+    "organizations": "Organization", "creators": "Creator",
+    "items": "Item", "planes": "Plane", "holidays": "Holiday",
+    "buildings": "Building",
+}
+
+
+def _greyhawk_split_template_args(body: str) -> list[str]:
+    """Split a wiki template body on top-level `|`.
+
+    Respects `[[...]]` and `{{...}}` nesting so a pipe inside a wiki
+    link or sub-template doesn't terminate an argument prematurely.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(body)
+    sq = cu = 0
+    while i < n:
+        if body[i:i+2] == '[[':
+            sq += 1; buf.append('[['); i += 2
+        elif body[i:i+2] == ']]':
+            sq -= 1; buf.append(']]'); i += 2
+        elif body[i:i+2] == '{{':
+            cu += 1; buf.append('{{'); i += 2
+        elif body[i:i+2] == '}}':
+            cu -= 1; buf.append('}}'); i += 2
+        elif body[i] == '|' and sq == 0 and cu == 0:
+            parts.append(''.join(buf)); buf = []; i += 1
+        else:
+            buf.append(body[i]); i += 1
+    if buf:
+        parts.append(''.join(buf))
+    return parts
+
+
+def _greyhawk_strip_templates(text: str) -> str:
+    """Remove all `{{...}}` templates with bracket-depth tracking.
+
+    Citations (`{{cite ...}}`, `{{csb|...}}`) and infoboxes otherwise leak
+    into the rendered body as raw source. We can't render arbitrary
+    MediaWiki templates without a full engine, so we drop them — the
+    infobox sidebar covers what we lose from the page-level template.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i:i+2] == '{{':
+            depth = 1
+            j = i + 2
+            while j < n and depth > 0:
+                if text[j:j+2] == '{{':
+                    depth += 1; j += 2
+                elif text[j:j+2] == '}}':
+                    depth -= 1; j += 2
+                else:
+                    j += 1
+            i = j
+        else:
+            out.append(text[i]); i += 1
+    return ''.join(out)
+
+
+def _greyhawk_extract_leading_infobox(text: str):
+    """Find the first `{{Name|...}}` infobox at the top of `text`.
+
+    Returns `(template_name_lower, {field_key_lower: raw_value, ...})` or
+    `None`. Tolerates leading whitespace. Only fires when the template
+    name matches `_GREYHAWK_INFOBOX_TEMPLATES` — citation templates that
+    happen to come first are ignored.
+    """
+    m = re.match(r"\s*\{\{\s*([A-Za-z][A-Za-z0-9_\- ]*?)\s*(\||\})", text)
+    if not m:
+        return None
+    name = m.group(1).strip().lower()
+    if name not in _GREYHAWK_INFOBOX_TEMPLATES:
+        return None
+    if m.group(2) == '}':
+        return name, {}
+    i = m.end()  # right after the '|' that ends the name
+    depth = 1
+    body_start = i
+    while i < len(text):
+        if text[i:i+2] == '{{':
+            depth += 1; i += 2
+        elif text[i:i+2] == '}}':
+            depth -= 1
+            if depth == 0:
+                body = text[body_start:i]
+                break
+            i += 2
+        else:
+            i += 1
+    else:
+        return None
+    fields: dict[str, str] = {}
+    for arg in _greyhawk_split_template_args(body):
+        if '=' in arg:
+            k, v = arg.split('=', 1)
+            fields[k.strip().lower()] = v.strip()
+    return name, fields
+
+
+def _greyhawk_parse_image_value(v: str) -> str | None:
+    """Return a portrait filename from an infobox `image=` value.
+
+    Handles `[[File:Foo.jpg|235px]]`, `[[File:Foo.jpg]]`, `File:Foo.jpg`,
+    and a bare `Foo.jpg`. The `File:`/`Image:` prefix is dropped.
+    """
+    if not v:
+        return None
+    v = v.strip()
+    m = re.match(r"\[\[(?:File|Image):([^|\]]+)", v, re.I)
+    if m:
+        return m.group(1).strip()
+    v = re.sub(r"^(?:File|Image):\s*", "", v, flags=re.I)
+    return v or None
+
+
+def _greyhawk_infobox_row(key: str, value: str) -> str:
+    label = key.replace('_', ' ').replace('-', ' ')
+    label = label[:1].upper() + label[1:]
+    return (
+        f'<tr><th style="text-align:left;font-weight:normal;'
+        f'color:#bcae8f;padding:3px 8px 3px 0;vertical-align:top;'
+        f'white-space:nowrap">{html.escape(label)}</th>'
+        f'<td style="padding:3px 0;vertical-align:top">'
+        f'{html.escape(value)}</td></tr>'
+    )
+
+
+def _greyhawk_render_infobox(template_name: str | None,
+                             template_fields: dict,
+                             typed_table: str | None,
+                             typed_row) -> str:
+    """Build the right-floated infobox card.
+
+    Header is the template type (e.g. 'Character') — the entity name is
+    surfaced as a regular `Name: ...` row, matching the user's spec. We
+    prefer values from the typed DB record over re-parsing the template
+    because the importer already resolved `[[wiki links]]` and stripped
+    citation templates in those columns; falling back to the raw
+    template only when no typed record exists.
+    """
+    # Title — template type takes precedence; fall back to the typed
+    # table's singular when raw_text has no recognised template head.
+    title = None
+    if template_name:
+        title = template_name.capitalize()
+    elif typed_table:
+        title = _GREYHAWK_ENTRY_SINGULAR.get(typed_table, typed_table.title())
+
+    # Portrait
+    image_html = ""
+    img_name = _greyhawk_parse_image_value(
+        (template_fields or {}).get('image', '')
+    )
+    if img_name:
+        path = _greyhawk_image_path(img_name)
+        if path:
+            url = "/greyhawk/image/" + html.escape(path.name, quote=True)
+            cap = _greyhawk_strip_templates(
+                (template_fields or {}).get('caption', '')
+            ).strip()
+            cap_html = (
+                f'<div style="text-align:center;font-size:0.82em;'
+                f'color:#bcae8f;margin:6px 0 4px 0">{html.escape(cap)}'
+                f'</div>' if cap else ''
+            )
+            image_html = (
+                f'<img src="{url}" alt="{html.escape(img_name)}" '
+                f'style="width:100%;cursor:zoom-in;display:block;'
+                f'margin-top:6px" loading="lazy">' + cap_html
+            )
+
+    # Field rows — typed record first (importer-cleaned values), fall
+    # back to raw template fields if there is no DB-side record.
+    rows_html: list[str] = []
+    seen: set[str] = set()
+    if typed_row is not None:
+        for col in typed_row.keys():
+            if col in ('page', 'extra'):
+                continue
+            v = typed_row[col]
+            if v in (None, ''):
+                continue
+            cleaned = _greyhawk_strip_templates(str(v)).strip()
+            if not cleaned:
+                continue
+            seen.add(col.lower())
+            rows_html.append(_greyhawk_infobox_row(col, cleaned))
+    else:
+        for k, v in (template_fields or {}).items():
+            if k in ('image', 'caption'):
+                continue
+            cleaned = _greyhawk_strip_templates(v).strip()
+            if not cleaned:
+                continue
+            seen.add(k.lower())
+            rows_html.append(_greyhawk_infobox_row(k, cleaned))
+
+    # `extra` JSON blob may carry infobox keys the schema didn't pre-allocate
+    # (formerhome, raised, alignment3e, …). Skip extra.image / extra.caption
+    # since extra.image is corrupted (often a pixel size, not a filename).
+    if typed_row is not None and 'extra' in typed_row.keys() and typed_row['extra']:
+        try:
+            extra = json.loads(typed_row['extra'])
+        except (json.JSONDecodeError, TypeError):
+            extra = {}
+        for k, v in extra.items():
+            kl = k.lower()
+            if kl in seen or kl in ('image', 'caption'):
+                continue
+            if not v:
+                continue
+            cleaned = _greyhawk_strip_templates(str(v)).strip()
+            if not cleaned:
+                continue
+            rows_html.append(_greyhawk_infobox_row(k, cleaned))
+
+    if not (title or image_html or rows_html):
+        return ""
+
+    title_html = (
+        f'<div style="text-align:center;font-weight:bold;'
+        f'font-size:1.02em;padding:4px 8px;border-bottom:1px solid '
+        f'rgba(212,197,169,0.25);margin:-6px -8px 0">'
+        f'{html.escape(title or "")}</div>' if title else ''
+    )
+    table_html = (
+        f'<table style="font-size:0.88em;width:100%;border-collapse:collapse;'
+        f'margin-top:6px">{"".join(rows_html)}</table>' if rows_html else ''
+    )
+
+    return (
+        f'<aside class="card greyhawk-infobox" '
+        f'style="float:right;width:260px;margin:0 0 16px 16px;'
+        f'padding:6px 8px;clear:right">'
+        f'{title_html}{image_html}{table_html}</aside>'
+    )
+
+
+def _greyhawk_render_wiki(text: str) -> str:
+    """Minimal wiki-markup renderer for raw_text.
+
+    The Greyhawk DB stores MediaWiki-flavoured source. We don't try to be a
+    full parser — we just turn [[link]] / [[link|label]] into dashboard
+    anchors, headings into <h2>/<h3>, and preserve paragraph breaks. Anything
+    we don't recognise (tables, refs) falls through as escaped text so the
+    page is still readable even if ugly.
+    """
+    if not text:
+        return ""
+
+    # Drop all {{...}} templates first. The page's infobox is rendered
+    # separately as a sidebar, and citation templates would otherwise
+    # appear as raw source in the middle of paragraphs.
+    text = _greyhawk_strip_templates(text)
+
+    # Expand [[File:...]] refs next so the generic [[link]] regex below
+    # doesn't try to turn the filename into a wiki page anchor. We walk
+    # from the end so the indices we collected stay valid as we splice.
+    spans = list(_greyhawk_iter_file_refs(text))
+    for start, end, inner in reversed(spans):
+        text = text[:start] + _greyhawk_render_file_ref(inner) + text[end:]
+
+    out_lines = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if re.match(r"^==+\s*[^=]+\s*==+\s*$", line):
+            depth = len(line) - len(line.lstrip("="))
+            heading = line.strip("= ").strip()
+            tag = "h2" if depth <= 2 else "h3"
+            out_lines.append(f"<{tag}>{html.escape(heading)}</{tag}>")
+        else:
+            out_lines.append(line)
+    body = "\n".join(out_lines)
+
+    def _link(m):
+        target = m.group(1).strip()
+        label = (m.group(2) or target).strip()
+        anchor = target.split("#", 1)[0]
+        return (f'<a href="/greyhawk/page/{html.escape(anchor)}">'
+                f'{html.escape(label)}</a>')
+
+    body = re.sub(r"\[\[([^\[\]|#]+)(?:#[^\[\]|]+)?(?:\|([^\[\]]+))?\]\]",
+                  _link, body)
+    body = re.sub(r"'''([^']+)'''", r"<b>\1</b>", body)
+    body = re.sub(r"''([^']+)''", r"<i>\1</i>", body)
+
+    paragraphs = []
+    for chunk in re.split(r"\n{2,}", body):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if chunk.startswith(("<h2>", "<h3>", "<figure")):
+            paragraphs.append(chunk)
+        else:
+            paragraphs.append(f"<p>{chunk}</p>")
+    return "\n".join(paragraphs)
+
+
+@app.route("/greyhawk/image/<path:filename>")
+def greyhawk_image(filename: str):
+    """Serve a Greyhawk image. Path-safe: only basenames are accepted."""
+    if not _GREYHAWK_IMG.exists():
+        abort(404)
+    # Reject anything that looks like a traversal; send_from_directory also
+    # enforces this, but bail early with a clearer 404.
+    if "/" in filename or "\\" in filename or filename.startswith("."):
+        abort(404)
+    return send_from_directory(str(_GREYHAWK_IMG), filename)
+
+
+def _greyhawk_db_or_error():
+    """Return (conn, None) or (None, html_error_block)."""
+    if not _GREYHAWK_DB.exists():
+        return None, ('<h1>Greyhawk Setting</h1>'
+                      f'<p style="color:#c66">Database not found at '
+                      f'<code>{html.escape(str(_GREYHAWK_DB))}</code>.</p>')
+    return _db(_GREYHAWK_DB), None
+
+
+@app.route("/greyhawk")
+def greyhawk_index():
+    """Greyhawk hub: search bar + entry-table tiles + top wiki categories."""
+    conn, err = _greyhawk_db_or_error()
+    if err:
+        return render("Greyhawk", err)
+
+    q = (request.args.get("q") or "").strip()
+    if q:
+        return _greyhawk_search_results(conn, q)
+
+    table_cards = []
+    for t in _greyhawk.ENTRY_TABLES:
+        try:
+            n = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        except sqlite3.OperationalError:
+            continue
+        table_cards.append(
+            f'<a class="card" href="/greyhawk/category/{html.escape(t)}" '
+            f'style="display:block;text-decoration:none;color:inherit">'
+            f'<h3 style="margin:0 0 4px 0;text-transform:capitalize">'
+            f'{html.escape(t)}</h3>'
+            f'<p class="muted" style="margin:0">{n} entries</p>'
+            f'</a>'
+        )
+
+    top = conn.execute(
+        "SELECT category, COUNT(*) AS n FROM categories "
+        "GROUP BY category ORDER BY n DESC LIMIT 20"
+    ).fetchall()
+    cat_items = "".join(
+        f'<li><a href="/greyhawk/category/{html.escape(r["category"])}">'
+        f'{html.escape(r["category"])}</a> '
+        f'<span class="muted">({r["n"]})</span></li>'
+        for r in top
+    )
+    total_pages = conn.execute(
+        "SELECT COUNT(*) FROM pages WHERE is_redirect = 0"
+    ).fetchone()[0]
+    total_cats = conn.execute(
+        "SELECT COUNT(DISTINCT category) FROM categories"
+    ).fetchone()[0]
+
+    image_count = 0
+    if _GREYHAWK_IMG.exists():
+        image_count = sum(
+            1 for p in _GREYHAWK_IMG.iterdir()
+            if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg",
+                                                     ".gif", ".webp", ".svg"}
+        )
+    image_link = ""
+    if image_count:
+        image_link = (
+            f' · <a href="/greyhawk/images">{image_count} images</a>'
+        )
+
+    body = (
+        '<h1>Greyhawk Setting</h1>'
+        f'<p class="muted">{total_pages} pages, {total_cats} wiki categories'
+        f'{image_link}. Drawn from the Greyhawk wiki.</p>'
+        '<form method="get" action="/greyhawk" style="margin:18px 0">'
+        '<input name="q" placeholder="Search pages (FTS5 — e.g. Mordenkainen, '
+        '&quot;Circle of Eight&quot;, Morden*)" '
+        f'style="{INPUT_STYLE};width:100%;max-width:600px">'
+        '</form>'
+        '<h2>Entry tables</h2>'
+        '<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(200px,1fr))">'
+        + "".join(table_cards) +
+        '</div>'
+        '<h2 style="margin-top:24px">Top wiki categories</h2>'
+        f'<ul style="columns:2;max-width:700px">{cat_items}</ul>'
+    )
+    return render("Greyhawk", body)
+
+
+@app.route("/greyhawk/images")
+def greyhawk_images():
+    """Thumbnail gallery of all images shipped in settings/greyhawk/images/.
+
+    Cheap directory walk + lazy-loaded thumbnails. With a few hundred files
+    this is fine; if the set grows much larger we'd want pagination.
+    """
+    if not _GREYHAWK_IMG.exists():
+        return render(
+            "Greyhawk · images",
+            '<p><a href="/greyhawk">&larr; Greyhawk</a></p>'
+            '<h1>Greyhawk images</h1>'
+            f'<p style="color:#c66">Image directory not found at '
+            f'<code>{html.escape(str(_GREYHAWK_IMG))}</code>.</p>',
+        )
+
+    q = (request.args.get("q") or "").strip().lower()
+    exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+    files = sorted(
+        (p for p in _GREYHAWK_IMG.iterdir()
+         if p.is_file() and p.suffix.lower() in exts),
+        key=lambda p: p.name.lower(),
+    )
+    if q:
+        files = [p for p in files if q in p.name.lower()]
+
+    tiles = []
+    for p in files:
+        url = "/greyhawk/image/" + html.escape(p.name, quote=True)
+        label = html.escape(p.stem.replace("_", " "))
+        # Bare <img> so the global lightbox in BASE_TEMPLATE catches the
+        # click — no anchor needed when the only action is "view large".
+        tiles.append(
+            f'<div class="card" style="display:flex;flex-direction:column;'
+            f'gap:6px;padding:8px">'
+            f'<img src="{url}" alt="{html.escape(p.name)}" '
+            f'loading="lazy" style="width:100%;height:140px;'
+            f'object-fit:cover;border-radius:4px;background:#222;'
+            f'cursor:zoom-in"/>'
+            f'<span style="font-size:0.85em;line-height:1.2;'
+            f'word-break:break-word">{label}</span></div>'
+        )
+
+    body = (
+        '<p><a href="/greyhawk">&larr; Greyhawk</a></p>'
+        '<h1>Greyhawk images</h1>'
+        f'<p class="muted">{len(files)} files in '
+        f'<code>settings/greyhawk/images/</code>.</p>'
+        '<form method="get" action="/greyhawk/images" style="margin:12px 0">'
+        f'<input name="q" value="{html.escape(q)}" '
+        f'placeholder="Filter by filename…" '
+        f'style="{INPUT_STYLE};width:100%;max-width:480px">'
+        + (' <a href="/greyhawk/images" class="muted">clear</a>' if q else '')
+        + '</form>'
+        + (f'<div class="grid" style="grid-template-columns:'
+           f'repeat(auto-fill,minmax(160px,1fr));gap:10px">'
+           f'{"".join(tiles)}</div>'
+           if tiles else '<p class="muted">No images match.</p>')
+    )
+    return render("Greyhawk · images", body)
+
+
+def _greyhawk_search_results(conn, q: str) -> str:
+    """Render FTS results inline on the index page."""
+    escaped = q.replace('"', '""')
+    try:
+        rows = conn.execute(
+            "SELECT p.title, p.type, "
+            "snippet(pages_fts, 1, '<<', '>>', ' … ', 16) AS excerpt "
+            "FROM pages_fts JOIN pages p ON p.title = pages_fts.title "
+            "WHERE pages_fts MATCH ? AND p.is_redirect = 0 "
+            "ORDER BY rank LIMIT 50",
+            (escaped,),
+        ).fetchall()
+        err_html = ""
+    except sqlite3.OperationalError as exc:
+        rows = []
+        err_html = (f'<p style="color:#c66">FTS query failed: '
+                    f'{html.escape(str(exc))}</p>')
+
+    items = []
+    for r in rows:
+        excerpt = (html.escape(r["excerpt"] or "")
+                   .replace("&lt;&lt;", '<mark>')
+                   .replace("&gt;&gt;", '</mark>'))
+        items.append(
+            f'<li style="margin:10px 0">'
+            f'<a href="/greyhawk/page/{html.escape(r["title"])}">'
+            f'<b>{html.escape(r["title"])}</b></a> '
+            f'<span class="muted">({html.escape(r["type"] or "page")})</span>'
+            f'<div style="margin-left:1em;color:#bcae8f">{excerpt}</div>'
+            f'</li>'
+        )
+
+    body = (
+        '<h1>Greyhawk Setting</h1>'
+        '<form method="get" action="/greyhawk" style="margin:18px 0">'
+        f'<input name="q" value="{html.escape(q)}" '
+        f'style="{INPUT_STYLE};width:100%;max-width:600px">'
+        ' <a href="/greyhawk" class="muted">clear</a>'
+        '</form>'
+        f'<h2>Search: <code>{html.escape(q)}</code> '
+        f'<span class="muted">— {len(rows)} hits</span></h2>'
+        + err_html
+        + (f'<ul style="list-style:none;padding:0">{"".join(items)}</ul>'
+           if items else
+           '<p class="muted">No matches.</p>')
+    )
+    return render("Greyhawk · search", body)
+
+
+@app.route("/greyhawk/category/<path:name>")
+def greyhawk_category(name):
+    """Browse a typed entry table or a wiki tag-category."""
+    conn, err = _greyhawk_db_or_error()
+    if err:
+        return render("Greyhawk", err)
+
+    key = name.strip()
+    if key.lower() in _greyhawk.ENTRY_TABLES:
+        table = key.lower()
+        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})")]
+        rows = conn.execute(
+            f"SELECT * FROM {table} ORDER BY page"
+        ).fetchall()
+
+        display_cols = [c for c in cols if c != "extra"][:6]
+        thead = "".join(f"<th>{html.escape(c)}</th>" for c in display_cols)
+        body_rows = []
+        for r in rows:
+            cells = []
+            for c in display_cols:
+                v = r[c]
+                if c == "page" or c == "name":
+                    page = r["page"]
+                    label = v or page or ""
+                    cells.append(
+                        f'<td><a href="/greyhawk/page/{html.escape(page or "")}">'
+                        f'{html.escape(str(label))}</a></td>'
+                    )
+                else:
+                    cells.append(f'<td>{html.escape(str(v)) if v else ""}</td>')
+            body_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+        body = (
+            f'<p><a href="/greyhawk">&larr; Greyhawk</a></p>'
+            f'<h1 style="text-transform:capitalize">{html.escape(table)}</h1>'
+            f'<p class="muted">{len(rows)} entries. '
+            f'Fields: <code>{html.escape(", ".join(cols))}</code></p>'
+            f'<table><thead><tr>{thead}</tr></thead>'
+            f'<tbody>{"".join(body_rows)}</tbody></table>'
+        )
+        return render(f"Greyhawk · {table}", body)
+
+    cat_row = conn.execute(
+        "SELECT category FROM categories WHERE category = ? COLLATE NOCASE LIMIT 1",
+        (key,),
+    ).fetchone()
+    if cat_row is None:
+        like = conn.execute(
+            "SELECT category, COUNT(*) AS n FROM categories "
+            "WHERE category LIKE ? COLLATE NOCASE "
+            "GROUP BY category ORDER BY n DESC LIMIT 20",
+            (f"%{key}%",),
+        ).fetchall()
+        candidates = "".join(
+            f'<li><a href="/greyhawk/category/{html.escape(r["category"])}">'
+            f'{html.escape(r["category"])}</a> '
+            f'<span class="muted">({r["n"]})</span></li>'
+            for r in like
+        )
+        body = (
+            f'<p><a href="/greyhawk">&larr; Greyhawk</a></p>'
+            f'<h1>No category &ldquo;{html.escape(key)}&rdquo;</h1>'
+            + (f'<p>Did you mean:</p><ul>{candidates}</ul>'
+               if candidates else '<p class="muted">No similar categories.</p>')
+        )
+        return render("Greyhawk · category", body)
+
+    cat = cat_row["category"]
+    pages = conn.execute(
+        "SELECT page FROM categories WHERE category = ? ORDER BY page",
+        (cat,),
+    ).fetchall()
+    items = "".join(
+        f'<li><a href="/greyhawk/page/{html.escape(r["page"])}">'
+        f'{html.escape(r["page"])}</a></li>'
+        for r in pages
+    )
+    body = (
+        f'<p><a href="/greyhawk">&larr; Greyhawk</a></p>'
+        f'<h1>{html.escape(cat)}</h1>'
+        f'<p class="muted">{len(pages)} pages</p>'
+        f'<ul style="columns:2;max-width:800px">{items}</ul>'
+    )
+    return render(f"Greyhawk · {cat}", body)
+
+
+@app.route("/greyhawk/page/<path:title>")
+def greyhawk_page(title):
+    """Render a single Greyhawk wiki page with categories + typed fields."""
+    conn, err = _greyhawk_db_or_error()
+    if err:
+        return render("Greyhawk", err)
+
+    key = title.strip()
+    row = conn.execute(
+        "SELECT title FROM pages WHERE title = ? COLLATE NOCASE LIMIT 1",
+        (key,),
+    ).fetchone()
+    if row is None:
+        like = conn.execute(
+            "SELECT title FROM pages WHERE title LIKE ? COLLATE NOCASE "
+            "AND is_redirect = 0 ORDER BY length(title) LIMIT 20",
+            (f"%{key}%",),
+        ).fetchall()
+        cands = "".join(
+            f'<li><a href="/greyhawk/page/{html.escape(r["title"])}">'
+            f'{html.escape(r["title"])}</a></li>'
+            for r in like
+        )
+        body = (
+            f'<p><a href="/greyhawk">&larr; Greyhawk</a></p>'
+            f'<h1>No page &ldquo;{html.escape(key)}&rdquo;</h1>'
+            + (f'<p>Did you mean:</p><ul>{cands}</ul>'
+               if cands else '<p class="muted">No similar pages.</p>')
+        )
+        return render("Greyhawk · page", body)
+
+    original = row["title"]
+    canonical = _greyhawk._resolve_redirect(conn, original)
+    page_row = conn.execute(
+        "SELECT title, type, raw_text FROM pages WHERE title = ?",
+        (canonical,),
+    ).fetchone()
+    if page_row is None:
+        return render("Greyhawk · page",
+                      f'<p style="color:#c66">Redirect target '
+                      f'<code>{html.escape(canonical)}</code> not found.</p>')
+
+    cats = conn.execute(
+        "SELECT category FROM categories WHERE page = ? ORDER BY category",
+        (canonical,),
+    ).fetchall()
+
+    # Pick the page's primary typed record (first ENTRY_TABLE hit). Pages
+    # are usually classified by exactly one type — characters OR realms OR …
+    # — so taking the first match is sufficient in practice.
+    typed_table = None
+    typed_row = None
+    for t in _greyhawk.ENTRY_TABLES:
+        tr = conn.execute(f"SELECT * FROM {t} WHERE page = ?",
+                          (canonical,)).fetchone()
+        if tr:
+            typed_table, typed_row = t, tr
+            break
+
+    raw_text = page_row["raw_text"] or ""
+    leading = _greyhawk_extract_leading_infobox(raw_text)
+    template_name = leading[0] if leading else None
+    template_fields = leading[1] if leading else {}
+    infobox_html = _greyhawk_render_infobox(
+        template_name, template_fields, typed_table, typed_row
+    )
+
+    cat_links = " · ".join(
+        f'<a href="/greyhawk/category/{html.escape(r["category"])}">'
+        f'{html.escape(r["category"])}</a>'
+        for r in cats
+    ) or '<span class="muted">none</span>'
+
+    redirect_note = ""
+    if canonical != original:
+        redirect_note = (f'<p class="muted">Redirected from '
+                         f'<i>{html.escape(original)}</i></p>')
+
+    wiki_html = _greyhawk_render_wiki(raw_text)
+
+    # `display:flow-root` contains the floated infobox so subsequent
+    # content (footer/nav) doesn't slide up alongside it.
+    body = (
+        f'<p><a href="/greyhawk">&larr; Greyhawk</a></p>'
+        f'<h1>{html.escape(page_row["title"])}</h1>'
+        + redirect_note
+        + f'<p class="muted">Categories: {cat_links}</p>'
+        + '<div style="display:flow-root">'
+        + infobox_html
+        + f'<div class="greyhawk-body">{wiki_html}</div>'
+        + '</div>'
+    )
+    return render(f"Greyhawk · {page_row['title']}", body)
 
 
 # ---------------------------------------------------------------------------
