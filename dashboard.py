@@ -8111,6 +8111,296 @@ def combat_state():
 
 
 # ---------------------------------------------------------------------------
+# Ability scores reference — numeric mechanical tables (bend bars %, system
+# shock %, missile attack adjustment, etc.) sourced from the AD&D 2e ability
+# tables. Tables live in 2e.db (ability_columns, ability_scores, ability_notes).
+# ---------------------------------------------------------------------------
+_ABILITY_ORDER = ["strength", "dexterity", "constitution",
+                  "intelligence", "wisdom", "charisma"]
+
+
+def _ability_load(ability: str | None = None) -> dict:
+    """Return {ability: {note, columns, rows}} for one ability or all six."""
+    if not _2E_DB.exists():
+        return {}
+    conn = _db(_2E_DB)
+    targets = [ability] if ability else _ability_load_all_targets()
+    out: dict = {}
+    for a in targets:
+        note_row = conn.execute(
+            "SELECT headline, xp_bonus, extra FROM ability_notes WHERE ability=?",
+            (a,),
+        ).fetchone()
+        if note_row is None:
+            continue
+        col_rows = conn.execute(
+            "SELECT name, short_name, note FROM ability_columns "
+            "WHERE ability=? ORDER BY sort_order", (a,),
+        ).fetchall()
+        score_rows = conn.execute(
+            "SELECT score, data FROM ability_scores "
+            "WHERE ability=? ORDER BY sort_order", (a,),
+        ).fetchall()
+        out[a] = {
+            "headline":  note_row["headline"],
+            "xp_bonus":  note_row["xp_bonus"],
+            "extra":     note_row["extra"],
+            "columns":   [(r["name"], r["short_name"], r["note"]) for r in col_rows],
+            "rows":      [(r["score"], json.loads(r["data"])) for r in score_rows],
+        }
+    return out
+
+
+def _ability_load_all_targets() -> list[str]:
+    return list(_ABILITY_ORDER)
+
+
+def _render_ability_section(ability: str, payload: dict) -> str:
+    cols = payload["columns"]
+    header_cells = (
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Score</th>'
+        + "".join(
+            f'<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828" '
+            f'title="{html.escape(note or "")}">{html.escape(name)}</th>'
+            for name, _short, note in cols
+        )
+    )
+    body_rows = []
+    for score, data in payload["rows"]:
+        cells = (
+            f'<td style="padding:3px 10px;border-bottom:1px solid #2a2018;'
+            f'white-space:nowrap;font-variant-numeric:tabular-nums">'
+            f'<strong>{html.escape(score)}</strong></td>'
+        )
+        for _name, short, _note in cols:
+            v = data.get(short, "")
+            cells += (
+                f'<td style="padding:3px 10px;border-bottom:1px solid #2a2018;'
+                f'font-variant-numeric:tabular-nums">{html.escape(str(v))}</td>'
+            )
+        body_rows.append(f'<tr>{cells}</tr>')
+
+    legend = '<ul class="muted" style="margin:6px 0 0;padding-left:18px;font-size:.88em">'
+    for name, _short, note in cols:
+        if note:
+            legend += (
+                f'<li><strong>{html.escape(name)}:</strong> {html.escape(note)}</li>'
+            )
+    legend += '</ul>'
+
+    xp = (f'<p class="muted" style="margin:6px 0 0;font-size:.9em">'
+          f'{html.escape(payload["xp_bonus"])}</p>') if payload["xp_bonus"] else ""
+    extra = (f'<p class="muted" style="margin:6px 0 0;font-size:.9em">'
+             f'{html.escape(payload["extra"])}</p>') if payload["extra"] else ""
+
+    return (
+        f'<section id="{ability}" style="margin:24px 0">'
+        f'<h2 style="margin:0 0 4px;text-transform:capitalize">{ability}</h2>'
+        f'<p style="margin:0 0 6px">{html.escape(payload["headline"])}</p>'
+        f'{xp}{extra}'
+        f'<div style="overflow-x:auto;margin-top:10px">'
+        f'<table style="border-collapse:collapse;font-size:.92em;min-width:100%">'
+        f'<thead><tr>{header_cells}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table></div>'
+        f'{legend}</section>'
+    )
+
+
+@app.route("/abilities")
+@app.route("/abilities/<ability>")
+def abilities_view(ability: str | None = None):
+    if ability:
+        ability = ability.lower()
+        if ability not in _ABILITY_ORDER:
+            abort(404)
+    data = _ability_load(ability)
+    if not data:
+        return render(
+            "Ability Scores",
+            "<h1>Ability Scores</h1><p class='muted'>2e.db not found or empty. "
+            "Run <code>tools/build_phb_ref.py</code>.</p>",
+        )
+
+    if ability:
+        body = (
+            f'<p style="margin:0 0 8px"><a href="/abilities">&larr; All abilities</a></p>'
+            f'<h1 style="margin:0 0 12px;text-transform:capitalize">{html.escape(ability)}</h1>'
+            + _render_ability_section(ability, data[ability])
+        )
+        return render(f"{ability.capitalize()} — Ability Scores", body)
+
+    toc = ' · '.join(
+        f'<a href="#{a}" style="text-transform:capitalize">{a}</a>'
+        for a in _ABILITY_ORDER if a in data
+    )
+    sections = "".join(
+        _render_ability_section(a, data[a])
+        for a in _ABILITY_ORDER if a in data
+    )
+    body = (
+        '<h1>Ability Scores</h1>'
+        '<p class="muted">Numeric derived attributes for each ability score, '
+        '0–25. Hover a column header for its mechanical meaning.</p>'
+        f'<p style="margin:8px 0 16px">Jump to: {toc}</p>'
+        + sections
+    )
+    return render("Ability Scores", body)
+
+
+# ---------------------------------------------------------------------------
+# Proficiencies reference — Table 37 (nonweapon proficiency groups) plus the
+# class-to-group crossover from Table 38. Data lives in 2e.db
+# (proficiencies, proficiency_class_crossover).
+# ---------------------------------------------------------------------------
+_PROF_GROUPS = ["general", "priest", "rogue", "warrior", "wizard"]
+
+
+def _proficiency_rows(group: str | None = None) -> list[sqlite3.Row]:
+    if not _2E_DB.exists():
+        return []
+    conn = _db(_2E_DB)
+    if group:
+        return list(conn.execute(
+            "SELECT * FROM proficiencies WHERE group_name=? "
+            "ORDER BY name COLLATE NOCASE", (group,),
+        ).fetchall())
+    return list(conn.execute(
+        "SELECT * FROM proficiencies "
+        "ORDER BY group_name, name COLLATE NOCASE",
+    ).fetchall())
+
+
+def _proficiency_class_crossover() -> list[tuple[str, list[str]]]:
+    if not _2E_DB.exists():
+        return []
+    conn = _db(_2E_DB)
+    rows = conn.execute(
+        "SELECT class_name, groups FROM proficiency_class_crossover "
+        "ORDER BY class_name",
+    ).fetchall()
+    return [(r["class_name"], json.loads(r["groups"])) for r in rows]
+
+
+def _fmt_modifier(m: int | None) -> str:
+    if m is None:
+        return "—"
+    return f"+{m}" if m > 0 else str(m)
+
+
+def _render_proficiency_table(group: str, rows: list[sqlite3.Row]) -> str:
+    body_rows = []
+    for r in rows:
+        body_rows.append(
+            '<tr>'
+            f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018">'
+            f'{html.escape(r["name"])}</td>'
+            f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018;'
+            f'text-align:center;font-variant-numeric:tabular-nums">'
+            f'{r["slots"]}</td>'
+            f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018">'
+            f'{html.escape(r["ability"] or "—")}</td>'
+            f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018;'
+            f'text-align:center;font-variant-numeric:tabular-nums">'
+            f'{html.escape(_fmt_modifier(r["check_modifier"]))}</td>'
+            '</tr>'
+        )
+    header = (
+        '<tr>'
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Proficiency</th>'
+        '<th style="text-align:center;padding:4px 10px;border-bottom:1px solid #4a3828">Slots</th>'
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Relevant Ability</th>'
+        '<th style="text-align:center;padding:4px 10px;border-bottom:1px solid #4a3828">Check Modifier</th>'
+        '</tr>'
+    )
+    return (
+        f'<section id="{group}" style="margin:20px 0">'
+        f'<h2 style="margin:0 0 8px;text-transform:capitalize">{group}</h2>'
+        f'<div style="overflow-x:auto">'
+        f'<table style="border-collapse:collapse;font-size:.93em;min-width:520px">'
+        f'<thead>{header}</thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table></div>'
+        f'</section>'
+    )
+
+
+def _render_crossover_table(rows: list[tuple[str, list[str]]]) -> str:
+    body_rows = []
+    for cls, groups in rows:
+        body_rows.append(
+            '<tr>'
+            f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018">'
+            f'<strong>{html.escape(cls)}</strong></td>'
+            f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018">'
+            + ", ".join(
+                f'<a href="#{html.escape(g)}" style="text-transform:capitalize">'
+                f'{html.escape(g)}</a>' for g in groups
+            )
+            + '</td></tr>'
+        )
+    return (
+        '<section style="margin:18px 0">'
+        '<h2 style="margin:0 0 8px">Class crossover</h2>'
+        '<p class="muted" style="margin:0 0 8px;font-size:.9em">'
+        'Which proficiency groups each class can spend nonweapon slots from. '
+        'A class may always pick from its own groups plus General.'
+        '</p>'
+        '<div style="overflow-x:auto">'
+        '<table style="border-collapse:collapse;font-size:.93em;min-width:420px">'
+        '<thead><tr>'
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Class</th>'
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Proficiency Groups</th>'
+        '</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table></div>'
+        '</section>'
+    )
+
+
+@app.route("/proficiencies")
+@app.route("/proficiencies/<group>")
+def proficiencies_view(group: str | None = None):
+    if group:
+        group = group.lower()
+        if group not in _PROF_GROUPS:
+            abort(404)
+    if not _2E_DB.exists():
+        return render(
+            "Proficiencies",
+            "<h1>Proficiencies</h1><p class='muted'>2e.db not found. "
+            "Run <code>tools/build_phb_ref.py</code>.</p>",
+        )
+
+    if group:
+        rows = _proficiency_rows(group)
+        body = (
+            f'<p style="margin:0 0 8px"><a href="/proficiencies">&larr; All groups</a></p>'
+            f'<h1 style="margin:0 0 12px;text-transform:capitalize">'
+            f'{html.escape(group)} Proficiencies</h1>'
+            + _render_proficiency_table(group, rows)
+        )
+        return render(f"{group.capitalize()} Proficiencies", body)
+
+    crossover = _proficiency_class_crossover()
+    toc = ' · '.join(
+        f'<a href="#{g}" style="text-transform:capitalize">{g}</a>'
+        for g in _PROF_GROUPS
+    )
+    sections = "".join(
+        _render_proficiency_table(g, _proficiency_rows(g))
+        for g in _PROF_GROUPS
+    )
+    body = (
+        '<h1>Nonweapon Proficiencies</h1>'
+        '<p class="muted">Slots required, relevant ability, and check modifier '
+        'per proficiency. To make a proficiency check, roll d20 ≤ '
+        '(ability score + check modifier).</p>'
+        f'<p style="margin:8px 0 16px">Jump to: {toc}</p>'
+        + (_render_crossover_table(crossover) if crossover else "")
+        + sections
+    )
+    return render("Proficiencies", body)
+
+
+# ---------------------------------------------------------------------------
 # Reference index — hub for the lookup endpoints (monsters, spells, classes,
 # items). Folded into one nav slot so the header doesn't have four near-
 # identical reference links.
@@ -8124,6 +8414,10 @@ _REFERENCE_SECTIONS = [
      "Per-class progression: THAC0, saves, spell slots, XP requirements, and homebrew kits."),
     ("/items", "Items",
      "Equipment and magic items: cost, weight, weapon stats, armour values, and rarity."),
+    ("/abilities", "Ability Scores",
+     "Derived attributes per ability score: bend bars %, system shock, missile adjustments, bonus spells, henchmen caps."),
+    ("/proficiencies", "Proficiencies",
+     "Nonweapon proficiencies by group: slots required, relevant ability, check modifier, and class crossover."),
     ("/greyhawk", "Greyhawk Setting",
      "Greyhawk wiki: deities, realms, characters, settlements, and full-text search."),
 ]

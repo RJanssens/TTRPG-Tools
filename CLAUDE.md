@@ -112,6 +112,19 @@ Monsters and enemies act according to their actual intelligence and instincts �
 
 ---
 
+## Play AI-Controlled Characters Within Their Stats
+
+Every NPC, hireling, henchman, prisoner, and bystander has ability scores, and those scores are not just dice modifiers — they constrain how the character looks, talks, thinks, and acts. Play to the sheet. If a line, gesture, or appearance would contradict the score, change it or give it to someone else.
+
+- **CHA** governs presence, bearing, and physical appeal. **This applies to portrait generation:** when you call `generate_portrait` (or write a portrait/scene prompt), the visual description must reflect actual CHA. CHA 3–8: plain, weathered, awkward, off-putting, or outright unattractive. 9–12: ordinary, unremarkable. 13–15: notably attractive or commanding. 16+: striking. A CHA 6 character does not get a supermodel portrait. CHA also governs social grace — low CHA NPCs are blunt, abrasive, or socially clumsy regardless of intent.
+- **INT** governs vocabulary, abstraction, planning, and self-awareness. An INT 5 character does **not** deliver witty asides, ironic observations, layered remarks, or insightful deductions. They use simple words, get confused by indirection, and miss subtext. An INT 7 tavern brawler does not unravel a mystery. Reserve clever dialogue for characters whose INT can plausibly produce it.
+- **WIS** governs perception, judgment, and common sense. Low-WIS characters take obvious bait, misread social cues, trust the wrong people, and miss things a sharper mind would catch.
+- **STR / DEX / CON** show up in body type, grace, and resilience — a STR 17 farmhand is built; a DEX 6 scholar is visibly clumsy; a CON 7 noble is sickly-looking.
+
+When in doubt, lean toward the score's implication, not toward what would be entertaining. Stat-contradicting behaviour breaks immersion fast.
+
+---
+
 ## Combat Procedure
 
 1. Call `start_combat()` — loads party, resets session
@@ -199,6 +212,12 @@ After rest:
 
 ---
 
+## Dice
+
+Use `roll(notation, times=1)` for any ad-hoc dice. Notation supports `NdX`, `dl` (drop lowest), and `+/-` modifiers — e.g. `2d6`, `1d20+3`, `4d6dl`. Pass `times=N` to repeat the same notation N times (e.g. `roll("4d6dl", times=6)` for ability-score generation). Single-roll returns `{rolls, dropped, modifier, total}`; multi-roll returns `{results: [...], totals, sum, min, max}`.
+
+---
+
 ## Saving Throws and Skills
 
 Use `saving_throw(character, type)` for all saves. Types: `paralysis`, `rsw`, `polymorph`, `breath`, `spell`.
@@ -216,6 +235,35 @@ Award at natural break points — end of encounter, objective completed, session
 
 ---
 
+## Batching Tool Calls
+
+When you need several **independent reads** to resolve a turn, emit them as parallel `tool_use` blocks in a single assistant message rather than one at a time. This is the biggest available per-turn speedup — N round trips collapse to one.
+
+**Rule of thumb:** if you can predict every call's inputs before running any of them, and none of them write state, batch them.
+
+**Parallel-safe — do this:**
+- `monster_lookup` for each enemy type in an encounter
+- `spell_lookup` for every option a caster is weighing
+- `item_lookup` across a list of treasure
+- `class_lookup` for several PCs at level-up
+- `ability_lookup` for several PCs at once (e.g. open-doors checks across the party)
+- `proficiency_lookup` for every proficiency the party is weighing in one scene
+- `rules_lookup` / `rules_section` for competing rule questions
+- `greyhawk_lookup` / `greyhawk_search` for several entities named in one scene
+- Context refresh combos: `active_quests` + `search_lore` + `npc_history` + `quest_status`
+- Bulk fetches: `get_character` / `get_location` / `get_house` / `get_mount` across multiple IDs
+- `list_*` and `*_status` reads, `dm_secrets` filters, `world_map_distance_*` / `world_map_nearest` queries
+
+**Sequential only — never parallelize:**
+- Anything that **mutates state**: `advance_time`, `advance_calendar`, `apply_damage`, `apply_heal`, `apply_combat_damage`, `apply_combat_heal`, `consume`, `light_torch`, `award_xp`, `update_character`, `update_location`, `set_disposition`, `apply_effect`, `remove_effect`, `add_combatant`, `start_combat`, `end_combat`, `next_turn`, `rest`, `memorize_spells`, `tick_world`, `place_party_on_map`.
+- Anything that **logs an event** as a side effect — most `_check` / `_roll` tools: `reaction`, `morale_check`, `surprise_check`, `check_encounter`, `determine_encounter`, `weather_check`. Each one writes to the chronicle, so order matters.
+- Calls whose **inputs depend on a prior call's output**: `monster_lookup` → `add_combatant`; `determine_encounter` → `reaction`; `attack` → `apply_combat_damage`; `roll_initiative` → `next_turn`.
+- The whole combat-procedure flow (initiative → attacks → damage → turn) — strictly sequential.
+
+When in doubt about a tool, treat it as sequential. The cost of a missed parallelisation is one extra round trip; the cost of a wrongly-parallelised mutation is corrupted state.
+
+---
+
 ## Reference Lookups
 
 - `rules_lookup(query, source?, limit?)` — FTS5 search over PHB / DMG / Monstrous Manual text. Use this BEFORE narrating a rule the player might dispute, instead of recalling from training data. `source`: `'phb'`, `'dmg'`, `'mm'`, or blank. `query` supports phrase quoting (`'"saving throw vs spell"'`), wildcards (`turn*`), boolean (`OR`).
@@ -225,6 +273,22 @@ Award at natural break points — end of encounter, objective completed, session
 - `monster_lookup(name)` — stats, treasure type, morale, XP value.
 - `item_lookup(name, item_type?, max_rarity?)` — equipment and magic item details: cost, weight, AC (armor), combat stats (weapons), XP value (magic items). `item_type` filter e.g. `"ring"`, `"scroll"`, `"weapon_melee"`. `max_rarity` 0–100 (0=common only, default 100=all).
 - `item_update(item_id, rarity?)` — set rarity on an item (0=common … 100=artifact). Use when stocking stores or seeding encounter treasure.
+- `ability_lookup(ability, score?)` — derived attributes for an ability score (bend bars %, system shock %, bonus priest spells, henchmen cap, missile/defensive adjustments, etc.). `ability` accepts full names or short forms (`str`, `dex`, `con`, `int`, `wis`, `cha`). `score` accepts exact labels (`"18/76-90"`, `"10-14"`), bare integers that fall inside a range (`"11"` resolves to `"10-14"` on Dex), and percentile bands (`"18/85"` resolves to `"18/76-90"`). Omit `score` to dump the full ability table. Use before any ruling driven by an ability score — open doors, languages known, save vs poison, max henchmen, illusion immunity, regeneration rate, priest bonus spells.
+- `proficiency_lookup(name?, group?, ability?)` — search PHB Table 37 nonweapon proficiencies. At least one filter is required. Returns slots required, relevant ability, and check modifier. A proficiency check is d20 ≤ (ability score + check modifier).
+- `proficiency_groups(class_name?)` — PHB Table 38 crossover: which proficiency groups each class draws from. Pass a class name for a single class, or omit for the whole table. Every class can additionally pick from General.
+
+Browsable in the dashboard at `/abilities` and `/proficiencies` (linked from `/reference`).
+
+### Greyhawk setting
+
+Wraps `settings/greyhawk/greyhawk.db` — a structured snapshot of the Greyhawk wiki (3,222 pages, 524 tag-categories, plus typed entry tables for characters, settlements, deities, creatures, realms, archfiends, locations, organizations, creators, items, planes, holidays, buildings). Use these any time the player asks about Greyhawk-specific lore (a deity's portfolio, a realm's ruler, who founded the Circle of Eight, etc.) instead of recalling from training data.
+
+- `greyhawk_metadata()` — what's in the DB: row counts and fields for each typed entry table, plus the top wiki tag-categories. Start here when you don't know what to ask for.
+- `greyhawk_category(name, limit?)` — list entries in a category. `name` accepts either a typed table (`'deities'`, `'realms'`, …) or a wiki tag (`'Human characters'`, `'Wizards'` — case-insensitive). Typed tables return full structured rows; wiki tags return page titles. Fuzzy candidates returned on miss.
+- `greyhawk_lookup(page)` — fetch one page by title (case-insensitive, resolves redirects). Returns raw wiki text, categories, and any typed record(s) attached to that page. Fuzzy candidates returned on miss.
+- `greyhawk_search(query, limit?)` — FTS5 over page text. Plain words = AND. Phrase: `'"Circle of Eight"'`. Wildcards: `'Morden*'`. Boolean: `'a OR b'`. Use to find which entries mention a person/place/concept; follow up with `greyhawk_lookup()` on the best hit.
+
+Browsable in the dashboard at `/reference` → Greyhawk Setting.
 
 ---
 

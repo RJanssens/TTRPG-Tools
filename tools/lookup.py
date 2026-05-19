@@ -506,3 +506,227 @@ def register(mcp):
             return {"updated": item_id, "fields": {k.split(" =")[0]: v for k, v in zip(sets, params[:-1])}}
         finally:
             conn.close()
+
+    _ABILITY_NAMES = {"strength", "dexterity", "constitution",
+                      "intelligence", "wisdom", "charisma"}
+
+    def _ability_canonical(s: str) -> str | None:
+        s = (s or "").strip().lower()
+        if s in _ABILITY_NAMES:
+            return s
+        # Accept common short forms: str, dex, con, int, wis, cha
+        short = {"str": "strength", "dex": "dexterity", "con": "constitution",
+                 "int": "intelligence", "wis": "wisdom", "cha": "charisma"}
+        return short.get(s)
+
+    @mcp.tool()
+    def ability_lookup(ability: str, score: str = "") -> dict:
+        """Look up AD&D 2e derived attributes for an ability score.
+
+        ability: 'strength'|'dexterity'|'constitution'|'intelligence'|'wisdom'|
+                 'charisma' (or 3-letter shortcut: str, dex, con, int, wis, cha).
+        score:   '15', '18/76-90', '4-5', etc. Optional. If omitted, returns
+                 the column definitions plus every row for that ability.
+
+        Returns derived values such as hit probability, bend bars/lift gates %,
+        system shock %, bonus spells, henchmen cap, etc., along with brief
+        column descriptions."""
+        canon = _ability_canonical(ability)
+        if canon is None:
+            return {"error": f"Unknown ability '{ability}'. Use one of: "
+                              f"{', '.join(sorted(_ABILITY_NAMES))}."}
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            note = conn.execute(
+                "SELECT headline, xp_bonus, extra FROM ability_notes "
+                "WHERE ability=?", (canon,),
+            ).fetchone()
+            if note is None:
+                return {"error": f"No ability data for '{canon}'. Rebuild with "
+                                  f"tools/build_phb_ref.py."}
+            cols = list(conn.execute(
+                "SELECT name, short_name, note FROM ability_columns "
+                "WHERE ability=? ORDER BY sort_order", (canon,),
+            ).fetchall())
+            score_rows = list(conn.execute(
+                "SELECT score, data FROM ability_scores "
+                "WHERE ability=? ORDER BY sort_order", (canon,),
+            ).fetchall())
+        finally:
+            conn.close()
+
+        columns = [{
+            "name":       r["name"],
+            "short_name": r["short_name"],
+            "note":       r["note"],
+        } for r in cols]
+
+        base = {
+            "ability":  canon,
+            "headline": note["headline"],
+            "xp_bonus": note["xp_bonus"],
+            "extra":    note["extra"],
+            "columns":  columns,
+        }
+
+        if not score:
+            base["rows"] = [
+                {"score": r["score"], **json.loads(r["data"])}
+                for r in score_rows
+            ]
+            return base
+
+        # Match the requested score against the stored row labels. Accept
+        # exact matches, dash-range membership (e.g. '12' → '12-13'), and
+        # 18/xx percentile bands.
+        score = score.strip()
+        match = None
+        for r in score_rows:
+            label = r["score"]
+            if label == score:
+                match = r
+                break
+        if match is None and score.isdigit():
+            n = int(score)
+            for r in score_rows:
+                label = r["score"]
+                if "-" in label and "/" not in label:
+                    try:
+                        lo, hi = label.split("-")
+                        if int(lo) <= n <= int(hi):
+                            match = r
+                            break
+                    except ValueError:
+                        continue
+        if match is None and score.startswith("18/") and score[3:].isdigit():
+            pct = int(score[3:])
+            if pct == 0 or pct == 100:
+                match = next((r for r in score_rows if r["score"] == "18/00"), None)
+            else:
+                for r in score_rows:
+                    lbl = r["score"]
+                    if not lbl.startswith("18/") or lbl == "18/00":
+                        continue
+                    rest = lbl[3:]
+                    if "-" in rest:
+                        lo, hi = rest.split("-")
+                        if int(lo) <= pct <= int(hi):
+                            match = r
+                            break
+
+        if match is None:
+            return {**base, "error": f"No row for score '{score}'.",
+                    "available": [r["score"] for r in score_rows]}
+
+        return {**base,
+                "score": match["score"],
+                "values": json.loads(match["data"])}
+
+    _PROF_GROUPS = {"general", "priest", "rogue", "warrior", "wizard"}
+
+    @mcp.tool()
+    def proficiency_lookup(name: str = "", group: str = "",
+                           ability: str = "") -> dict:
+        """Look up AD&D 2e nonweapon proficiencies (PHB Table 37).
+
+        name:    proficiency name (partial, case-insensitive). Returns matching
+                 entries across all groups.
+        group:   'general'|'priest'|'rogue'|'warrior'|'wizard'. Filter results.
+        ability: 'Strength'|'Dexterity'|… Filter by relevant ability.
+
+        At least one of name/group/ability must be supplied. With no filters
+        the result would be the entire table; use the dashboard /proficiencies
+        page for that.
+
+        Each entry: name, group, slots required, relevant ability, check
+        modifier. A proficiency check is d20 ≤ (ability score + check
+        modifier)."""
+        if not (name or group or ability):
+            return {"error": "Provide at least one of name, group, or ability."}
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+
+        group_norm = group.strip().lower() if group else ""
+        if group_norm and group_norm not in _PROF_GROUPS:
+            return {"error": f"Unknown group '{group}'. Use one of: "
+                              f"{', '.join(sorted(_PROF_GROUPS))}."}
+
+        where, params = [], []
+        if name:
+            where.append("name LIKE ? COLLATE NOCASE")
+            params.append(f"%{name}%")
+        if group_norm:
+            where.append("group_name = ?")
+            params.append(group_norm)
+        if ability:
+            where.append("ability LIKE ? COLLATE NOCASE")
+            params.append(ability)
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = list(conn.execute(
+                f"SELECT name, group_name, slots, ability, check_modifier "
+                f"FROM proficiencies WHERE {' AND '.join(where)} "
+                f"ORDER BY name COLLATE NOCASE, group_name",
+                params,
+            ).fetchall())
+        finally:
+            conn.close()
+
+        if not rows:
+            return {"error": "No matching proficiencies.",
+                    "filters": {"name": name or None, "group": group or None,
+                                "ability": ability or None}}
+
+        return {
+            "count": len(rows),
+            "results": [{
+                "name":           r["name"],
+                "group":          r["group_name"],
+                "slots":          r["slots"],
+                "ability":        r["ability"],
+                "check_modifier": r["check_modifier"],
+            } for r in rows],
+        }
+
+    @mcp.tool()
+    def proficiency_groups(class_name: str = "") -> dict:
+        """Return PHB Table 38 — which proficiency groups each class draws from.
+
+        class_name: optional. If supplied, returns just that class's groups.
+        Otherwise returns the whole crossover table. A class can spend
+        nonweapon proficiency slots on any proficiency in its listed groups.
+        Every class can additionally pick from General."""
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            if class_name:
+                row = conn.execute(
+                    "SELECT class_name, groups FROM proficiency_class_crossover "
+                    "WHERE class_name LIKE ? COLLATE NOCASE LIMIT 1",
+                    (f"%{class_name}%",),
+                ).fetchone()
+                if row is None:
+                    return {"error": f"No class matching '{class_name}'."}
+                return {"class": row["class_name"],
+                        "groups": json.loads(row["groups"])}
+            rows = list(conn.execute(
+                "SELECT class_name, groups FROM proficiency_class_crossover "
+                "ORDER BY class_name"
+            ).fetchall())
+            return {"crossover": [
+                {"class": r["class_name"], "groups": json.loads(r["groups"])}
+                for r in rows
+            ]}
+        finally:
+            conn.close()
