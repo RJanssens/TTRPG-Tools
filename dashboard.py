@@ -8401,6 +8401,105 @@ def proficiencies_view(group: str | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Turning Undead reference — DMG Table 47 cross-indexed by undead type vs
+# priest level. Paladins use a column two levels lower than their actual level.
+# ---------------------------------------------------------------------------
+_TURNING_LEVEL_COLUMNS = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10-11", "12-13", "14+",
+]
+
+
+def _turning_cell_style(v: str) -> str:
+    if v == "T":
+        return "background:#1f3a1f;color:#9adb9a;font-weight:bold"
+    if v.startswith("D"):
+        return "background:#3a1f1f;color:#e08a8a;font-weight:bold"
+    if v == "—":
+        return "color:#5a4838"
+    return "color:#d4c5a9;font-variant-numeric:tabular-nums"
+
+
+@app.route("/turning")
+def turning_view():
+    if not _2E_DB.exists():
+        return render(
+            "Turning Undead",
+            "<h1>Turning Undead</h1><p class='muted'>2e.db not found. "
+            "Run <code>tools/build_phb_ref.py</code>.</p>",
+        )
+
+    conn = _db(_2E_DB)
+    rows = list(conn.execute(
+        "SELECT undead_type, results FROM turning_undead ORDER BY sort_order"
+    ).fetchall())
+    if not rows:
+        return render(
+            "Turning Undead",
+            "<h1>Turning Undead</h1><p class='muted'>turning_undead table is "
+            "empty. Run <code>tools/build_phb_ref.py</code>.</p>",
+        )
+
+    # Header
+    header = (
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828;'
+        'border-right:1px solid #4a3828">Undead type / HD</th>'
+        + "".join(
+            f'<th style="text-align:center;padding:4px 8px;border-bottom:1px solid #4a3828">'
+            f'{html.escape(c)}</th>'
+            for c in _TURNING_LEVEL_COLUMNS
+        )
+    )
+
+    body_rows = []
+    for r in rows:
+        cells = json.loads(r["results"])
+        tds = (
+            f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018;'
+            f'border-right:1px solid #2a2018;white-space:nowrap">'
+            f'<strong>{html.escape(r["undead_type"])}</strong></td>'
+        )
+        for v in cells:
+            style = _turning_cell_style(v)
+            tds += (
+                f'<td style="padding:4px 8px;border-bottom:1px solid #2a2018;'
+                f'text-align:center;{style}">{html.escape(v)}</td>'
+            )
+        body_rows.append(f'<tr>{tds}</tr>')
+
+    legend = (
+        '<ul class="muted" style="margin:10px 0 0;padding-left:18px;font-size:.9em">'
+        '<li><strong>Number</strong>: roll 1d20; result ≥ this turns the undead.</li>'
+        '<li><strong>T</strong>: automatically turned, no roll needed.</li>'
+        '<li><strong>D</strong>: turning destroys the undead outright.</li>'
+        '<li><strong>D*</strong>: as D, plus an additional 2d4 creatures of that type are turned.</li>'
+        '<li><strong>—</strong>: priest of that level cannot turn this type.</li>'
+        '</ul>'
+    )
+
+    notes = (
+        '<p class="muted" style="margin:10px 0 0;font-size:.9em">'
+        'A successful turn or dispel affects 2d6 undead. Mixed groups: '
+        'lowest HD turned first. Paladins use the priest column two lower '
+        'than their actual level (a 5th-level paladin reads column 3). '
+        'Druids cannot turn undead.'
+        '</p>'
+    )
+
+    body = (
+        '<h1>Turning Undead</h1>'
+        '<p class="muted">DMG Table 47. Cross-index the undead\'s type (or HD) '
+        'with the priest\'s level to find the d20 target.</p>'
+        '<div style="overflow-x:auto">'
+        '<table style="border-collapse:collapse;font-size:.93em;margin-top:8px">'
+        f'<thead><tr>{header}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table></div>'
+        + legend + notes
+    )
+    return render("Turning Undead", body)
+
+
+# ---------------------------------------------------------------------------
 # Reference index — hub for the lookup endpoints (monsters, spells, classes,
 # items). Folded into one nav slot so the header doesn't have four near-
 # identical reference links.
@@ -8418,6 +8517,8 @@ _REFERENCE_SECTIONS = [
      "Derived attributes per ability score: bend bars %, system shock, missile adjustments, bonus spells, henchmen caps."),
     ("/proficiencies", "Proficiencies",
      "Nonweapon proficiencies by group: slots required, relevant ability, check modifier, and class crossover."),
+    ("/turning", "Turning Undead",
+     "DMG Table 47: d20 target cross-indexed by undead type/HD and priest level. Paladins use level-2."),
     ("/greyhawk", "Greyhawk Setting",
      "Greyhawk wiki: deities, realms, characters, settlements, and full-text search."),
 ]

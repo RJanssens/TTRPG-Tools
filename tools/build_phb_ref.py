@@ -24,6 +24,7 @@ DROP TABLE IF EXISTS ability_scores;
 DROP TABLE IF EXISTS ability_notes;
 DROP TABLE IF EXISTS proficiencies;
 DROP TABLE IF EXISTS proficiency_class_crossover;
+DROP TABLE IF EXISTS turning_undead;
 
 CREATE TABLE ability_notes (
     ability   TEXT PRIMARY KEY,
@@ -67,7 +68,61 @@ CREATE TABLE proficiency_class_crossover (
     class_name TEXT PRIMARY KEY,
     groups     TEXT NOT NULL
 );
+
+CREATE TABLE turning_undead (
+    id          INTEGER PRIMARY KEY,
+    sort_order  INTEGER NOT NULL,
+    undead_type TEXT NOT NULL,
+    min_hd      INTEGER,
+    max_hd      INTEGER,
+    results     TEXT NOT NULL,   -- JSON list aligned to TURNING_LEVEL_COLUMNS
+    aliases     TEXT NOT NULL    -- JSON list of name aliases (lowercase)
+);
+CREATE INDEX idx_turning_sort ON turning_undead(sort_order);
 """
+
+
+# ---------------------------------------------------------------------------
+# Turning Undead  (DMG Table 47)
+# Rows: undead type (or HD bracket). Columns: priest level. Cell values:
+#   numeric d20 target, "T" (auto-turned, no roll), "D" (destroyed),
+#   "D*" (destroyed + extra 2d4), or "—" (cannot turn).
+# Paladins use the priest column two lower than their level.
+# ---------------------------------------------------------------------------
+TURNING_LEVEL_COLUMNS = [
+    "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "10-11", "12-13", "14+",
+]
+
+TURNING_TABLE = [
+    # sort, type, min_hd, max_hd, aliases, [12 cells]
+    (1,  "Skeleton or 1 HD",  1,    1,    ["skeleton"],
+     ["10","7","4","T","T","D","D","D*","D*","D*","D*","D*"]),
+    (2,  "Zombie",            None, None, ["zombie"],
+     ["13","10","7","4","T","T","D","D","D*","D*","D*","D*"]),
+    (3,  "Ghoul or 2 HD",     2,    2,    ["ghoul"],
+     ["16","13","10","7","4","T","T","D","D","D*","D*","D*"]),
+    (4,  "Shadow or 3-4 HD",  3,    4,    ["shadow"],
+     ["19","16","13","10","7","4","T","T","D","D","D*","D*"]),
+    (5,  "Wight or 5 HD",     5,    5,    ["wight"],
+     ["20","19","16","13","10","7","4","T","T","D","D","D*"]),
+    (6,  "Ghast",             None, None, ["ghast"],
+     ["—","20","19","16","13","10","7","4","T","T","D","D"]),
+    (7,  "Wraith or 6 HD",    6,    6,    ["wraith"],
+     ["—","—","20","19","16","13","10","7","4","T","T","D"]),
+    (8,  "Mummy or 7 HD",     7,    7,    ["mummy"],
+     ["—","—","—","20","19","16","13","10","7","4","T","T"]),
+    (9,  "Spectre or 8 HD",   8,    8,    ["spectre", "specter"],
+     ["—","—","—","—","20","19","16","13","10","7","4","T"]),
+    (10, "Vampire or 9 HD",   9,    9,    ["vampire"],
+     ["—","—","—","—","—","20","19","16","13","10","7","4"]),
+    (11, "Ghost or 10 HD",    10,   10,   ["ghost"],
+     ["—","—","—","—","—","—","20","19","16","13","10","7"]),
+    (12, "Lich or 11+ HD",    11,   999,  ["lich"],
+     ["—","—","—","—","—","—","—","20","19","16","13","10"]),
+    (13, "Special",           None, None, ["special"],
+     ["—","—","—","—","—","—","—","—","20","19","16","13"]),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +563,26 @@ def main() -> None:
                 (cls, json.dumps(groups)),
             )
 
+        # turning_undead
+        for sort_order, undead_type, min_hd, max_hd, aliases, results in TURNING_TABLE:
+            assert len(results) == len(TURNING_LEVEL_COLUMNS), (
+                f"row {undead_type!r} has {len(results)} cells, "
+                f"expected {len(TURNING_LEVEL_COLUMNS)}"
+            )
+            conn.execute(
+                "INSERT INTO turning_undead "
+                "(sort_order, undead_type, min_hd, max_hd, results, aliases) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sort_order, undead_type, min_hd, max_hd,
+                 json.dumps(results), json.dumps(aliases)),
+            )
+
         conn.commit()
 
         # Summary
         for tbl in ("ability_notes", "ability_columns", "ability_scores",
-                    "proficiencies", "proficiency_class_crossover"):
+                    "proficiencies", "proficiency_class_crossover",
+                    "turning_undead"):
             n = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
             print(f"  {tbl}: {n} rows")
     finally:

@@ -696,6 +696,166 @@ def register(mcp):
             } for r in rows],
         }
 
+    _TURNING_LEVEL_COLUMNS = [
+        "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        "10-11", "12-13", "14+",
+    ]
+
+    def _turning_level_column_index(eff_level: int) -> int | None:
+        if eff_level < 1:
+            return None
+        if 1 <= eff_level <= 9:
+            return eff_level - 1
+        if 10 <= eff_level <= 11:
+            return 9
+        if 12 <= eff_level <= 13:
+            return 10
+        if eff_level >= 14:
+            return 11
+        return None
+
+    def _turning_decode(cell: str) -> dict:
+        if cell == "—":
+            return {
+                "needs_roll":        False,
+                "destroys":          False,
+                "extra_turned_2d4":  False,
+                "affects_2d6":       False,
+                "meaning":           "A priest of this level cannot turn this type.",
+            }
+        if cell == "T":
+            return {
+                "needs_roll":        False,
+                "destroys":          False,
+                "extra_turned_2d4":  False,
+                "affects_2d6":       True,
+                "meaning":           "Automatically turned — no d20 roll required. "
+                                     "Affects 2d6 creatures.",
+            }
+        if cell == "D":
+            return {
+                "needs_roll":        False,
+                "destroys":          True,
+                "extra_turned_2d4":  False,
+                "affects_2d6":       True,
+                "meaning":           "Automatically destroyed (dispel). Affects 2d6 creatures.",
+            }
+        if cell == "D*":
+            return {
+                "needs_roll":        False,
+                "destroys":          True,
+                "extra_turned_2d4":  True,
+                "affects_2d6":       True,
+                "meaning":           "Automatically destroyed (dispel). Affects 2d6 creatures, "
+                                     "plus an additional 2d4 of that type are turned.",
+            }
+        # Numeric target
+        return {
+            "needs_roll":        True,
+            "target":            int(cell),
+            "destroys":          False,
+            "extra_turned_2d4":  False,
+            "affects_2d6":       True,
+            "meaning":           f"Roll 1d20; on a result of {cell} or higher, "
+                                 f"2d6 of these undead are turned and flee.",
+        }
+
+    @mcp.tool()
+    def turning_undead(level: int, undead: str = "", hd: int = 0,
+                       role: str = "priest") -> dict:
+        """Look up DMG Table 47 — turning undead.
+
+        level: caster's actual class level (priest or paladin).
+        undead: undead type name (e.g. 'ghoul', 'vampire', 'spectre', 'lich').
+                Case-insensitive; matches aliases stored on each row.
+        hd:     hit dice of the undead — used if undead is not supplied.
+                Recognised buckets: 1, 2, 3-4, 5, 6, 7, 8, 9, 10, 11+.
+        role:   'priest' (default) or 'paladin'. Paladins read the column
+                two lower than their actual level (a 5th-level paladin uses
+                column 3; 1st- and 2nd-level paladins cannot turn).
+
+        Druids cannot turn undead — not modelled here.
+
+        Returns the d20 target and a decoded meaning of the cell value
+        (number = roll-to-turn; T = auto-turn; D = destroy; D* = destroy
+        plus 2d4 extra; — = cannot turn at this level)."""
+        role_norm = (role or "priest").strip().lower()
+        if role_norm not in ("priest", "paladin"):
+            return {"error": f"Unknown role '{role}'. Use 'priest' or 'paladin'."}
+        if not undead and hd <= 0:
+            return {"error": "Provide either undead (name) or hd (hit dice)."}
+
+        eff_level = level - 2 if role_norm == "paladin" else level
+        col_idx = _turning_level_column_index(eff_level)
+        if col_idx is None:
+            return {
+                "error": f"{role_norm.capitalize()} of level {level} cannot "
+                         f"turn undead (effective turning level {eff_level}).",
+                "role": role_norm,
+                "caster_level": level,
+                "effective_level": eff_level,
+            }
+
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = None
+            if undead:
+                needle = undead.strip().lower()
+                candidates = list(conn.execute(
+                    "SELECT undead_type, min_hd, max_hd, results, aliases "
+                    "FROM turning_undead ORDER BY sort_order"
+                ).fetchall())
+                # Alias match first (cleanest).
+                for c in candidates:
+                    if needle in json.loads(c["aliases"]):
+                        row = c
+                        break
+                # Fallback: substring match on undead_type.
+                if row is None:
+                    for c in candidates:
+                        if needle in c["undead_type"].lower():
+                            row = c
+                            break
+                if row is None:
+                    return {
+                        "error": f"No turning entry matching '{undead}'.",
+                        "available": [c["undead_type"] for c in candidates],
+                    }
+            else:
+                row = conn.execute(
+                    "SELECT undead_type, min_hd, max_hd, results, aliases "
+                    "FROM turning_undead "
+                    "WHERE min_hd IS NOT NULL AND min_hd <= ? AND max_hd >= ? "
+                    "ORDER BY sort_order LIMIT 1",
+                    (hd, hd),
+                ).fetchone()
+                if row is None:
+                    return {
+                        "error": f"No HD-based turning entry for {hd} HD. "
+                                  f"(Zombies and Ghasts have no HD bucket — "
+                                  f"look them up by name.)",
+                    }
+        finally:
+            conn.close()
+
+        cells = json.loads(row["results"])
+        cell = cells[col_idx]
+        decoded = _turning_decode(cell)
+        return {
+            "undead":          row["undead_type"],
+            "role":            role_norm,
+            "caster_level":    level,
+            "effective_level": eff_level,
+            "level_column":    _TURNING_LEVEL_COLUMNS[col_idx],
+            "result":          cell,
+            **decoded,
+        }
+
     @mcp.tool()
     def proficiency_groups(class_name: str = "") -> dict:
         """Return PHB Table 38 — which proficiency groups each class draws from.

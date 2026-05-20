@@ -149,6 +149,8 @@ When in doubt, lean toward the score's implication, not toward what would be ent
 
 **Active effects:** For any spell or condition with a duration (bless, prayer, stinking cloud, haste, slow, web, sleep, hold person, shield, web), call `apply_effect(target, name, duration_rounds, to_hit?, ac?, dmg?, save?)`. Numeric modifiers are auto-applied to subsequent attacks; the duration auto-decrements at each new round and the effect expires on its own. Use `remove_effect(target, name)` for early termination (dispel, save succeeded, moved out of AOE).
 
+**Turning undead:** Priests and paladins can attempt to turn undead during their own initiative segment — one attempt per character per encounter. Always look up the target with `turning_undead(level, undead=name|hd=N, role="priest"|"paladin")` rather than recall the DMG table from memory. The tool decodes the cross-index cell: a number is the d20 target (≥ N succeeds), `T` is automatic turn (no roll), `D` is destroy outright, `D*` is destroy plus an extra 2d4 of that type turned, `—` means a caster of this level cannot turn this type. Paladins read the priest column two levels lower than their actual level; druids cannot turn. A successful turn or dispel affects 2d6 of that type, and in mixed groups the lowest-HD undead are turned first.
+
 ---
 
 ## Survival Resources
@@ -248,6 +250,7 @@ When you need several **independent reads** to resolve a turn, emit them as para
 - `class_lookup` for several PCs at level-up
 - `ability_lookup` for several PCs at once (e.g. open-doors checks across the party)
 - `proficiency_lookup` for every proficiency the party is weighing in one scene
+- `turning_undead` across each undead type in a mixed group, or for every cleric attempting to turn in the same round
 - `rules_lookup` / `rules_section` for competing rule questions
 - `greyhawk_lookup` / `greyhawk_search` for several entities named in one scene
 - Context refresh combos: `active_quests` + `search_lore` + `npc_history` + `quest_status`
@@ -276,8 +279,9 @@ When in doubt about a tool, treat it as sequential. The cost of a missed paralle
 - `ability_lookup(ability, score?)` — derived attributes for an ability score (bend bars %, system shock %, bonus priest spells, henchmen cap, missile/defensive adjustments, etc.). `ability` accepts full names or short forms (`str`, `dex`, `con`, `int`, `wis`, `cha`). `score` accepts exact labels (`"18/76-90"`, `"10-14"`), bare integers that fall inside a range (`"11"` resolves to `"10-14"` on Dex), and percentile bands (`"18/85"` resolves to `"18/76-90"`). Omit `score` to dump the full ability table. Use before any ruling driven by an ability score — open doors, languages known, save vs poison, max henchmen, illusion immunity, regeneration rate, priest bonus spells.
 - `proficiency_lookup(name?, group?, ability?)` — search PHB Table 37 nonweapon proficiencies. At least one filter is required. Returns slots required, relevant ability, and check modifier. A proficiency check is d20 ≤ (ability score + check modifier).
 - `proficiency_groups(class_name?)` — PHB Table 38 crossover: which proficiency groups each class draws from. Pass a class name for a single class, or omit for the whole table. Every class can additionally pick from General.
+- `turning_undead(level, undead?, hd?, role?)` — DMG Table 47. Provide either `undead` (e.g. `"ghoul"`, `"vampire"`, `"lich"`) or `hd` (1, 2, 3, 5, 6, …, 11+). `role` is `"priest"` (default) or `"paladin"` (paladin uses level-2). Returns the d20 target and a decoded meaning of the cell (number / `T` / `D` / `D*` / `—`). Use whenever a priest or paladin attempts to turn — do not recall the table from memory.
 
-Browsable in the dashboard at `/abilities` and `/proficiencies` (linked from `/reference`).
+Browsable in the dashboard at `/abilities`, `/proficiencies`, and `/turning` (linked from `/reference`).
 
 ### Greyhawk setting
 
