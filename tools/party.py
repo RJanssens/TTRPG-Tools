@@ -1,21 +1,136 @@
 """Party and character management tools: HP, XP, spells, rest, coin."""
 import re
+import sqlite3
+from pathlib import Path
+
 import _campaign as _c
 
+_2E_DB = Path(__file__).resolve().parent.parent / "global" / "2e.db"
 
-def _normalize_memorized(spells: list) -> list:
+# Priest-side and wizard-side class keywords, for disambiguating a spell name
+# that exists on both lists at different levels.
+_PRIEST_CLASSES = ("cleric", "priest", "druid", "paladin", "ranger", "shaman")
+_WIZARD_CLASSES = ("mage", "wizard", "illusionist", "magic-user", "sorcerer", "bard")
+
+# Warrior classes get the parenthetical (higher) Constitution HP bonus.
+_WARRIOR_CLASSES = ("fighter", "paladin", "ranger", "barbarian")
+
+_spell_level_cache: dict[tuple[str, str], int | None] = {}
+
+
+def _caster_kind(cls: str) -> str:
+    """'priest', 'wizard', or '' when the class says nothing useful."""
+    low = (cls or "").lower()
+    if any(k in low for k in _PRIEST_CLASSES):
+        return "priest"
+    if any(k in low for k in _WIZARD_CLASSES):
+        return "wizard"
+    return ""
+
+
+def _spell_level(name: str, caster_kind: str = "") -> int | None:
+    """Look a spell's level up in global/2e.db. None when it isn't found.
+
+    Memorised spells used to be stored with level 0 whenever memorize_spells
+    was handed bare names — which it usually is. cast_spell then skipped its
+    slot decrement entirely (`if spell_level:` on a 0), so casting cost nothing
+    and the whole spell economy was free. Levels are resolved here instead of
+    being asked of the caller. Cached: the spell DB is read-only at runtime."""
+    key = (name.lower().strip(), caster_kind)
+    if key in _spell_level_cache:
+        return _spell_level_cache[key]
+    level = None
+    if _2E_DB.exists() and key[0]:
+        try:
+            conn = sqlite3.connect(str(_2E_DB))
+            params: list = [name.strip()]
+            caster_sql = ""
+            if caster_kind:
+                caster_sql = " AND caster = ?"
+                params.append(caster_kind)
+            row = conn.execute(
+                f"SELECT level FROM spells WHERE name = ? COLLATE NOCASE{caster_sql} LIMIT 1",
+                params,
+            ).fetchone()
+            if row is None:
+                # Fall back to a prefix match, shortest name first, so
+                # "cure light wounds" doesn't land on "Cure Light Wounds, Mass".
+                params = [f"{name.strip()}%"]
+                if caster_kind:
+                    params.append(caster_kind)
+                row = conn.execute(
+                    f"SELECT level FROM spells WHERE name LIKE ? COLLATE NOCASE{caster_sql} "
+                    f"ORDER BY length(name) LIMIT 1",
+                    params,
+                ).fetchone()
+            if row is None and caster_kind:
+                # Known to the books but not on this class's list — take the
+                # level anyway rather than leaving it at 0.
+                row = conn.execute(
+                    "SELECT level FROM spells WHERE name = ? COLLATE NOCASE LIMIT 1",
+                    (name.strip(),),
+                ).fetchone()
+            conn.close()
+            if row is not None and row[0] is not None:
+                level = int(row[0])
+        except Exception:
+            level = None
+    _spell_level_cache[key] = level
+    return level
+
+
+def _con_hp_bonus(char: dict) -> int:
+    """The character's per-level Constitution hit-point bonus, used for the
+    weekly bed-rest bonus (PHB: "for each complete week of bed rest, add any
+    Constitution hit point bonus to the base of 21"). Warriors get the
+    parenthetical value. 0 when CON is unknown."""
+    ab = char.get("ability_scores") or char.get("abilities") or {}
+    con = ab.get("con") or ab.get("constitution")
+    if con is None or not _2E_DB.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(str(_2E_DB))
+        row = conn.execute(
+            "SELECT data FROM ability_scores WHERE ability='constitution' AND score=? LIMIT 1",
+            (str(con),),
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return 0
+    if not row:
+        return 0
+    import json as _json
+    try:
+        adj = str((_json.loads(row[0]) or {}).get("hp_adj", "0"))
+    except Exception:
+        return 0
+    # "+2(+3)" — plain value, then the warrior-only value in brackets.
+    warrior = any(k in (char.get("cls") or "").lower() for k in _WARRIOR_CLASSES)
+    m = re.search(r'\(([+-]?\d+)\)', adj)
+    if warrior and m:
+        return int(m.group(1))
+    m = re.match(r'\s*([+-]?\d+)', adj)
+    return int(m.group(1)) if m else 0
+
+
+def _normalize_memorized(spells: list, caster_kind: str = "") -> list:
     """Ensure memorized_spells is a list of {name, level, cast} dicts.
-    Accepts flat strings (legacy) or existing dicts."""
+
+    Accepts flat strings (legacy) or existing dicts. A missing or zero level is
+    resolved against global/2e.db, so a caller passing bare spell names still
+    ends up with levels that cast_spell can charge a slot against. Entries the
+    DB doesn't recognise keep level 0 and are reported by memorize_spells."""
     result = []
     for s in spells:
         if isinstance(s, dict):
-            result.append({
-                "name":  s.get("name", ""),
-                "level": int(s.get("level", 0)),
-                "cast":  bool(s.get("cast", False)),
-            })
+            name = s.get("name", "")
+            level = int(s.get("level") or 0)
+            cast = bool(s.get("cast", False))
         else:
-            result.append({"name": str(s), "level": 0, "cast": False})
+            name, level, cast = str(s), 0, False
+        if not level and name:
+            level = _spell_level(name, caster_kind) or 0
+        result.append({"name": name, "level": level, "cast": cast})
     return result
 
 
@@ -57,7 +172,7 @@ def register(mcp):
             "campaign": cfg.get("name", ""),
             "current_day": state.get("current_day", 1),
             "current_session": state.get("current_session", 0),
-            "coin": state.get("coin", {"gp": 0, "ep": 0, "sp": 0, "cp": 0}),
+            "coin": state.get("coin", {"pp": 0, "gp": 0, "ep": 0, "sp": 0, "cp": 0}),
             "characters": {},
         }
 
@@ -107,8 +222,10 @@ def register(mcp):
             slots_detail[f"level_{lvl}"] = {"remaining": remaining, "max": max_count}
 
         save_names = ["Paralysis/Poison/Death", "Rod/Staff/Wand", "Polymorph/Petrify", "Breath Weapon", "Spell/Magic"]
-        saves_raw = char.get("saves", [16, 18, 17, 20, 19])
-        saves_named = {save_names[i]: saves_raw[i] for i in range(len(saves_raw))}
+        saves_norm = _c.normalize_saves(char.get("saves"))
+        by_type = {s["type"]: s["value"] for s in saves_norm}
+        defaults = [16, 18, 17, 20, 19]
+        saves_named = {save_names[i]: by_type.get(_c.SAVE_TYPES[i], defaults[i]) for i in range(5)}
 
         return {
             "key": key,
@@ -232,7 +349,7 @@ def register(mcp):
             return {"error": f"Character '{character}' not found."}
 
         slot_cfg = char.get("spell_slots") or {}
-        normalized = _normalize_memorized(spells)
+        normalized = _normalize_memorized(spells, _caster_kind(char.get("cls", "")))
 
         # Validate total
         total_capacity = sum(slot_cfg.values()) if slot_cfg else 0
@@ -259,17 +376,31 @@ def register(mcp):
             k = str(s["level"]) if s["level"] else "?"
             by_level.setdefault(k, []).append(s["name"])
 
-        return {
+        out = {
             "character": char.get("label", key),
             "memorized": [s["name"] for s in normalized],
             "by_level": by_level,
         }
+        unresolved = [s["name"] for s in normalized if not s["level"]]
+        if unresolved:
+            out["unresolved_levels"] = unresolved
+            out["warning"] = (
+                f"No spell level found for {unresolved} — casting these will not "
+                f"consume a slot. Pass them as {{'name': ..., 'level': N}} if they "
+                f"are homebrew or from a source outside global/2e.db."
+            )
+        return out
 
     @mcp.tool()
     def cast_spell(character: str, spell_name: str) -> dict:
         """Cast a memorized spell by name.
-        Marks the first uncast instance as spent and decrements its slot.
-        Returns an error if the spell is not memorized or all instances are already cast."""
+
+        Marks the first uncast instance as spent AND decrements its slot — this
+        is the whole bookkeeping for a memorised cast. Do not follow it with
+        use_spell_slot(); that would charge the slot twice.
+
+        Returns an error if the spell is not memorized or every instance is
+        already cast."""
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
@@ -278,7 +409,8 @@ def register(mcp):
             return {"error": f"Character '{character}' not found."}
 
         cstate = state.setdefault("characters", {}).setdefault(key, {})
-        memorized = _normalize_memorized(cstate.get("memorized_spells", []))
+        memorized = _normalize_memorized(cstate.get("memorized_spells", []),
+                                         _caster_kind(char.get("cls", "")))
         needle = spell_name.lower().strip()
 
         # Find first uncast instance
@@ -308,12 +440,19 @@ def register(mcp):
         memorized[target]["cast"] = True
         cstate["memorized_spells"] = memorized
         _c.save_state(cfg, state)
+        slot_note = (
+            f"Level {spell_level} slot spent ({slot_state.get(str(spell_level))} left)."
+            if spell_level else
+            "No level on record for this spell, so no slot was charged — "
+            "re-memorise it with an explicit level if that is wrong."
+        )
 
         available = [s["name"] for s in memorized if not s["cast"]]
         return {
             "character": char.get("label", key),
             "cast": spell["name"],
             "level": spell_level or "unknown",
+            "slot_note": slot_note,
             "slots_remaining": {k: v for k, v in slot_state.items()},
             "available_spells": available,
         }
@@ -329,7 +468,8 @@ def register(mcp):
             return {"error": f"Character '{character}' not found."}
 
         cstate = state.get("characters", {}).get(key, {})
-        memorized = _normalize_memorized(cstate.get("memorized_spells", []))
+        memorized = _normalize_memorized(cstate.get("memorized_spells", []),
+                                         _caster_kind(char.get("cls", "")))
 
         slot_cfg  = char.get("spell_slots") or {}
         slot_state = cstate.get("spell_slots") or {}
@@ -348,8 +488,12 @@ def register(mcp):
 
     @mcp.tool()
     def use_spell_slot(character: str, level: int = 1) -> dict:
-        """Legacy: decrement a slot by level without specifying a spell name.
-        Prefer cast_spell() which tracks the exact spell used."""
+        """Decrement a slot by level without naming a spell.
+
+        For casts that bypass the memorised list: an innate ability, a scroll
+        or wand that burns a slot, a homebrew effect. For an ordinary
+        memorised spell use cast_spell(), which marks the spell AND spends the
+        slot — calling both charges the slot twice."""
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
@@ -372,7 +516,8 @@ def register(mcp):
         slot_state[lvl_key] = current - 1
 
         # Mark first uncast spell of matching level (or any level if unknown)
-        memorized = _normalize_memorized(cstate.get("memorized_spells", []))
+        memorized = _normalize_memorized(cstate.get("memorized_spells", []),
+                                         _caster_kind(char.get("cls", "")))
         removed = None
         for s in memorized:
             if not s["cast"] and (s["level"] == level or s["level"] == 0):
@@ -392,15 +537,48 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def rest(character: str = "") -> dict:
-        """Long rest. Restores HP to max and spell slots to full.
-        If character is empty string, rests the entire party.
-        Does NOT auto-memorize spells."""
+    def rest(
+        character:  str = "",
+        days:       int = 1,
+        bed_rest:   bool = False,
+        healer:     str = "",
+        herbalism:  bool = False,
+        provisioned: bool = True,
+        full:       bool = False,
+    ) -> dict:
+        """Rest for a number of days, healing at the by-the-book rate.
+
+        PHB natural healing: **1 hit point per day of rest**, where rest means
+        low activity — nothing more strenuous than riding or travelling. With
+        **complete bed rest** (doing nothing at all for the day) it is 3 hp per
+        day, and for each complete week of bed rest the character also adds
+        their Constitution hit point bonus. Nothing is regained on a day
+        without adequate food, water and sleep.
+
+        Under the care of someone with the Healing proficiency: 1 hp/day even
+        while travelling, 2 hp/day with complete rest, or 3 hp/day if the carer
+        has both Healing and Herbalism. Where the attended and unattended rates
+        overlap the better of the two applies (the PHB's two passages cross;
+        a healer never makes a patient heal slower).
+
+        days:        days of rest (default 1)
+        bed_rest:    complete bed rest rather than light activity
+        healer:      name of a character with Healing proficiency tending the
+                     party — cares for up to six patients
+        herbalism:   that carer also has Herbalism
+        provisioned: False if food/water/sleep were inadequate — no HP that day
+        full:        DM override. Restores everyone to maximum, the pre-2e-rules
+                     behaviour. Not the book rule; use it deliberately.
+
+        Spell slots and memorised-spell availability reset on any rest of a day
+        or more. Does NOT auto-memorize spells — call memorize_spells after.
+
+        Magical healing is apply_heal(); this is bed and time."""
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
+        days = max(0, int(days))
         chars_state = state.setdefault("characters", {})
-        rested = []
 
         target_keys = list(cfg.get("characters", {}).keys()) if not character else None
         if character:
@@ -409,30 +587,89 @@ def register(mcp):
                 return {"error": f"Character '{character}' not found."}
             target_keys = [key]
 
+        # Rate per day, before the weekly Constitution bonus.
+        natural = 3 if bed_rest else 1
+        if healer:
+            care = 3 if (bed_rest and herbalism) else (2 if bed_rest else 1)
+            rate = max(natural, care)
+        else:
+            rate = natural
+        if not provisioned:
+            rate = 0
+
+        healed_report = {}
+        rested = []
         for key in target_keys:
             char = cfg["characters"].get(key, {})
             cstate = chars_state.setdefault(key, {})
-            cstate["hp"] = char.get("hp_max", cstate.get("hp", 0))
-            # Restore spell slots from cfg
-            slot_cfg = char.get("spell_slots") or {}
-            if slot_cfg:
-                cstate["spell_slots"] = dict(slot_cfg)
-            # Reset cast flags — spells are available again after rest
-            memorized = _normalize_memorized(cstate.get("memorized_spells", []))
-            for s in memorized:
-                s["cast"] = False
-            cstate["memorized_spells"] = memorized
-            # Remove downed condition
-            conditions = cstate.get("conditions", [])
-            cstate["conditions"] = [c for c in conditions if c != "downed"]
+            hp_max = char.get("hp_max", 0)
+            before = cstate.get("hp", hp_max)
+
+            if full:
+                after = hp_max
+                gained = after - before
+                con_bonus = 0
+            else:
+                gained = rate * days
+                con_bonus = 0
+                if bed_rest and provisioned and days >= 7:
+                    con_bonus = _con_hp_bonus(char) * (days // 7)
+                    gained += con_bonus
+                # Healing stops at maximum, and the dead do not convalesce.
+                after = before if before <= -10 else min(hp_max, before + gained)
+                gained = after - before
+
+            cstate["hp"] = after
+            healed_report[char.get("label", key)] = {
+                "hp_before": before,
+                "hp_after":  after,
+                "healed":    gained,
+                "at_max":    after >= hp_max,
+            }
+            if con_bonus:
+                healed_report[char.get("label", key)]["con_weekly_bonus"] = con_bonus
+
+            if days >= 1:
+                slot_cfg = char.get("spell_slots") or {}
+                if slot_cfg:
+                    cstate["spell_slots"] = dict(slot_cfg)
+                memorized = _normalize_memorized(cstate.get("memorized_spells", []),
+                                                 _caster_kind(char.get("cls", "")))
+                for sp in memorized:
+                    sp["cast"] = False
+                cstate["memorized_spells"] = memorized
+
+            # Only someone actually back above 0 stops being down.
+            if after > 0:
+                cstate["conditions"] = [c for c in cstate.get("conditions", [])
+                                       if c != "downed"]
             rested.append(char.get("label", key))
 
         _c.save_state(cfg, state)
 
-        return {
-            "rested": rested,
-            "reminder": "Spell slots restored. Call memorize_spells for each spellcaster to set their new memorized spell list.",
+        if full:
+            basis = "DM override — restored to maximum (not the PHB rate)."
+        elif not provisioned:
+            basis = "No food, water or sleep — no hit points regained (PHB)."
+        else:
+            basis = f"{rate} hp/day x {days} day(s)" + (
+                f", tended by {healer}" if healer else ""
+            ) + (" (complete bed rest)" if bed_rest else " (light activity)")
+
+        out = {
+            "rested":   rested,
+            "days":     days,
+            "rate_per_day": rate,
+            "basis":    basis,
+            "healing":  healed_report,
         }
+        if days >= 1:
+            out["reminder"] = ("Spell slots restored. Call memorize_spells for each "
+                               "spellcaster to set their new memorized spell list.")
+        still_hurt = [n for n, r in healed_report.items() if not r["at_max"]]
+        if still_hurt and not full:
+            out["still_wounded"] = still_hurt
+        return out
 
     @mcp.tool()
     def award_xp(character: str, amount: int) -> dict:
@@ -462,18 +699,18 @@ def register(mcp):
 
     @mcp.tool()
     def update_coin(delta: str) -> dict:
-        """Parse a coin delta like '+50gp', '-10sp', '+3ep', '+100cp' and update the party coin."""
+        """Parse a coin delta like '+450pp', '+50gp', '-10sp', '+3ep', '+100cp' and update the party coin."""
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
-        m = re.match(r'^([+-]?\d+)(gp|ep|sp|cp)$', delta.strip().lower())
+        m = re.match(r'^([+-]?\d+)(pp|gp|ep|sp|cp)$', delta.strip().lower())
         if not m:
-            return {"error": f"Cannot parse coin delta '{delta}'. Expected format: +50gp, -10sp, +3ep, +100cp."}
+            return {"error": f"Cannot parse coin delta '{delta}'. Expected format: +450pp, +50gp, -10sp, +3ep, +100cp."}
 
         amount = int(m.group(1))
         denom = m.group(2)
 
-        coin = state.setdefault("coin", {"gp": 0, "ep": 0, "sp": 0, "cp": 0})
+        coin = state.setdefault("coin", {"pp": 0, "gp": 0, "ep": 0, "sp": 0, "cp": 0})
         coin[denom] = coin.get(denom, 0) + amount
         _c.save_state(cfg, state)
 

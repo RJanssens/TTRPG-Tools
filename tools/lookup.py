@@ -27,6 +27,11 @@ def _find_db(candidates) -> Path | None:
     return None
 
 
+def _has(row, col) -> bool:
+    """True if a sqlite3.Row carries `col` (tolerates pre-migration DBs)."""
+    return col in row.keys()
+
+
 def _generate_treasure_text(types_list: list[str]) -> str:
     """Run treasure.generate_treasure for each type, capture printed output as a
     single string. Replaces the previous subprocess+regex approach."""
@@ -88,6 +93,8 @@ def register(mcp):
                 "morale":            row["morale"],
                 "xp_value":          row["xp_value"],
                 "description":       row["description"],
+                "categories":        json.loads(row["categories"]) if _has(row, "categories") and row["categories"] else [],
+                "source":            (row["source"] if _has(row, "source") else None),
             }
         finally:
             conn.close()
@@ -305,14 +312,14 @@ def register(mcp):
 
         # ── Parse ────────────────────────────────────────────────────────
         import re as _re
-        coin_added = {"cp": 0, "sp": 0, "ep": 0, "gp": 0}
+        coin_added = {"cp": 0, "sp": 0, "ep": 0, "gp": 0, "pp": 0}
         gems       = []
         art        = []
         magic      = []
 
         # Lines of form: '  Gold (gp): 1,736 (25% ✓)' — only parse when value is numeric
         for m in _re.finditer(
-            r'\b(Copper|Silver|Electrum|Gold)\s*\((cp|sp|ep|gp)\):\s+([\d,]+)\b',
+            r'\b(Platinum|Copper|Silver|Electrum|Gold)\s*\((pp|cp|sp|ep|gp)\):\s+([\d,]+)\b',
             text,
         ):
             denom = m.group(2)
@@ -353,7 +360,7 @@ def register(mcp):
         # ── Apply to state ───────────────────────────────────────────────
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
-        coin = state.setdefault("coin", {"gp": 0, "ep": 0, "sp": 0, "cp": 0})
+        coin = state.setdefault("coin", {"pp": 0, "gp": 0, "ep": 0, "sp": 0, "cp": 0})
         for denom, val in coin_added.items():
             coin[denom] = coin.get(denom, 0) + val
 

@@ -22,6 +22,154 @@ def _excerpt(text: str, pos: int, radius: int = 100) -> str:
     return prefix + snippet + suffix
 
 
+# --- Scene rehydration -------------------------------------------------------
+# session_primer() used to return day/time/HP/quests and nothing about *where
+# the party is*. The DM filled the gap by shelling out to Bash — measured at 5
+# reads of adventure_log.md / state.json / locations/*.md / events.jsonl on a
+# session-start turn, i.e. 5 extra model round trips before a word was narrated.
+# These helpers fold that whole reconstruction into the primer payload.
+#
+# Everything below is DM-side context, exactly like get_location() output: it
+# may contain keyed/hidden material and is never narrated verbatim.
+
+_SCENE_LOCATION_CHARS = 2500
+_SCENE_AREA_CHARS     = 1200
+_SCENE_LOG_CHARS      = 1800
+
+
+def _tail(text: str, limit: int) -> str:
+    """Last `limit` chars of text, cut back to a paragraph boundary when possible."""
+    if len(text) <= limit:
+        return text.strip()
+    chunk = text[-limit:]
+    nl = chunk.find("\n\n")
+    if 0 <= nl <= limit // 3:
+        chunk = chunk[nl + 2:]
+    return "…\n" + chunk.strip()
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "\n…[truncated]"
+
+
+def _current_location(cfg: dict, events: list) -> dict | None:
+    """Resolve the party's current location from the last `location_visited`
+    event, and read its file (plus the parent area file when it has one)."""
+    last = None
+    for e in reversed(events):
+        if e.get("type") == "location_visited":
+            last = e
+            break
+    if last is None:
+        return None
+
+    slug = last.get("slug", "")
+    area = last.get("area", "") or ""
+    locs = cfg["_data_dir"] / "locations"
+    path = (locs / area / f"{slug}.md") if area else (locs / f"{slug}.md")
+
+    out: dict = {
+        "slug":    slug,
+        "area":    area,
+        "name":    last.get("name", slug),
+        "day":     last.get("day"),
+        "session": last.get("session"),
+    }
+    if path.exists():
+        out["content"] = _clip(_read_safe(path), _SCENE_LOCATION_CHARS)
+    else:
+        out["content"] = ""
+        out["note"] = f"No location file at locations/{area + '/' if area else ''}{slug}.md"
+
+    if area:
+        area_file = locs / f"{area}.md"
+        if area_file.exists():
+            out["area_content"] = _clip(_read_safe(area_file), _SCENE_AREA_CHARS)
+    return out
+
+
+def _light_block(state: dict) -> dict:
+    """Same reading as light_state(), inlined so the primer is one file read."""
+    lit = []
+    spent = 0
+    for s in state.get("light_sources", []):
+        entry = {
+            "holder":            s.get("holder", ""),
+            "type":              s.get("type", s.get("source_type", "")),
+            "minutes_remaining": s.get("minutes_remaining", 0),
+        }
+        if s.get("lit"):
+            entry["status"] = "guttering" if 0 <= entry["minutes_remaining"] <= 5 else "burning"
+            lit.append(entry)
+        elif entry["minutes_remaining"] <= 0:
+            # A long dungeon crawl accumulates dozens of burnt-out stubs; the
+            # DM only needs the count, not the list.
+            spent += 1
+    return {"any_lit": bool(lit), "lit": lit, "burnt_out_count": spent}
+
+
+def _combat_block(cfg: dict) -> dict | None:
+    """Live combat snapshot from combat_state.json, or None when no fight is up.
+
+    A forgotten end_combat leaves `active: true` behind, so report the flag as
+    stored and let the DM see the combatant list rather than guessing."""
+    p = cfg["_dir"] / "combat_state.json"
+    try:
+        st = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not st.get("active"):
+        return None
+    return {
+        "active": True,
+        "round":  st.get("round"),
+        "combatants": [
+            {
+                "name":       c.get("name"),
+                "side":       c.get("side"),
+                "hp":         c.get("hp"),
+                "hp_max":     c.get("hp_max"),
+                "init":       c.get("init"),
+                "current":    bool(c.get("current")),
+                "conditions": c.get("conditions", []),
+            }
+            for c in st.get("combatants", [])
+        ],
+    }
+
+
+def _scene_block(cfg: dict, state: dict, events: list) -> dict:
+    """Everything the DM needs to resume a scene without reading files."""
+    log_file = cfg["_data_dir"] / cfg.get("session_log_file", "adventure_log.md")
+    scene: dict = {
+        "location":         _current_location(cfg, events),
+        "recent_narrative": _tail(_read_safe(log_file), _SCENE_LOG_CHARS) if log_file.exists() else "",
+        "light":            _light_block(state),
+    }
+    combat = _combat_block(cfg)
+    if combat:
+        scene["combat"] = combat
+
+    conditions = {}
+    for key, cs in (state.get("characters") or {}).items():
+        conds = cs.get("conditions") or []
+        if conds:
+            conditions[key] = list(conds)
+    if conditions:
+        scene["conditions"] = conditions
+
+    # Consumables live at state["consumables"][key], not under characters.
+    consumables = {
+        key: {k: v for k, v in bag.items() if v}
+        for key, bag in (state.get("consumables") or {}).items()
+        if any(bag.values())
+    }
+    if consumables:
+        scene["consumables"] = consumables
+    return scene
+
+
 def register(mcp):
 
     @mcp.tool()
@@ -169,13 +317,31 @@ def register(mcp):
         return {"events": filtered}
 
     @mcp.tool()
-    def session_primer() -> dict:
-        """Generate a session-start brief: current day/session, party status,
-        last 3 events, active quests, and the most recent session heading from the chronicle."""
+    def session_primer(scene: bool = True) -> dict:
+        """Generate a session-start brief — everything needed to resume play
+        without reading a single campaign file by hand.
+
+        Returns current day/time/weather, the full party digest (HP, AC, THAC0,
+        class/level, conditions, slots, memorised spells), recent events, active
+        quests and world clocks, the last session heading, the prior session's
+        audit findings, and the narrative detail level.
+
+        With ``scene=True`` (the default) it also returns a ``scene`` block:
+        the party's current location file (and its parent area), the tail of the
+        chronicle, light sources, live combat state, conditions and consumables.
+        That block is DM-side context — like get_location() it can carry keyed
+        or hidden material, so read it silently and never narrate it verbatim.
+
+        Pass ``scene=False`` for the lean brief (no file reads) when you only
+        need the numbers."""
         cfg   = _c.load_campaign()
         state = _c.load_state(cfg)
 
         # --- Party status ---
+        # Carries the canonical mechanics too: the DM otherwise follows the
+        # primer with a get_character() per PC (~1.8k tokens each) just to
+        # learn AC/THAC0/level. See CLAUDE.md "Impartiality Rules" — read
+        # stats, never archetype-guess.
         party = {}
         chars_cfg = cfg.get("characters", {})
         chars_state = state.get("characters", {})
@@ -186,14 +352,30 @@ def register(mcp):
                 "hp":      cs.get("hp", char.get("hp_max")),
                 "hp_max":  char.get("hp_max"),
             }
+            for field, src in (("class", "cls"), ("level", "level"),
+                               ("ac", "ac"), ("thac0", "thac0"),
+                               ("weapon", "weapon")):
+                if char.get(src) is not None:
+                    entry[field] = char[src]
+            conds = cs.get("conditions") or []
+            if conds:
+                entry["conditions"] = list(conds)
             slots = cs.get("spell_slots")
             if slots:
                 entry["spell_slots"] = slots
+            memorized = [
+                m.get("name") for m in (cs.get("memorized_spells") or [])
+                if isinstance(m, dict) and not m.get("cast") and m.get("name")
+            ]
+            if memorized:
+                entry["memorized_uncast"] = memorized
             party[key] = entry
 
-        # --- Last 3 events ---
+        # --- Recent events ---
+        # Eight rather than three: the extra five are a few hundred tokens and
+        # they usually spare the DM a party_timeline() round trip.
         events = _c.load_events(cfg)
-        last_events = events[-3:] if len(events) >= 3 else events[:]
+        last_events = events[-8:]
 
         # --- Active quests (inline logic, same as active_quests tool) ---
         quest_events: dict[str, list[dict]] = {}
@@ -236,14 +418,40 @@ def register(mcp):
         m = state.get("current_minute", 0)
         time_str = f"{h:02d}:{m:02d}"
 
-        return {
+        # --- Audit findings from the prior session ---
+        # Surfaces procedural lapses (missing reactions, freehand combat,
+        # scope creep, etc.) at session start so the DM can address them
+        # before adding new content. See tools/audit.py for the full
+        # check list and CLAUDE.md "Audit" for usage guidance.
+        current_session = state.get("current_session", 1)
+        prior_session = max(1, current_session - 1)
+        try:
+            from tools.audit import _run_audit
+            prior_audit = _run_audit(prior_session)
+        except Exception as exc:  # pragma: no cover - audit must never break primer
+            prior_audit = {"error": str(exc), "findings": []}
+
+        # --- Narrative detail level (how much raw mechanical detail to expose
+        # in player-facing prose; set from the dashboard, honoured every turn) ---
+        try:
+            from tools.dm_session import detail_setting
+            narrative_detail = detail_setting()
+        except Exception:
+            narrative_detail = {"level": 2, "label": "Standard"}
+
+        out = {
             "current_day":         state.get("current_day", 1),
             "current_time":        time_str,
-            "current_session":     state.get("current_session", 1),
+            "current_session":     current_session,
             "current_weather":     state.get("current_weather", ""),
             "party":               party,
             "last_events":         last_events,
             "active_quests":       open_quests,
             "active_clocks":       active_clocks,
             "last_session_title":  last_session_title,
+            "prior_session_audit": prior_audit,
+            "narrative_detail":    narrative_detail,
         }
+        if scene:
+            out["scene"] = _scene_block(cfg, state, events)
+        return out

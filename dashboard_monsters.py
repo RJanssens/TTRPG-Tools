@@ -4,6 +4,7 @@ Extracted from dashboard.py — registers /monsters, /monsters/<slug>,
 /monsters/portraits/<filename>, and /monsters/<slug>/generate-portrait.
 """
 import html
+import json
 import re
 from pathlib import Path
 
@@ -13,12 +14,30 @@ from flask import abort, jsonify, request, send_from_directory
 _MONSTERS_PER_PAGE = 60
 
 
+def _slugify(name: str) -> str:
+    """Monster name -> URL/file slug. MUST match the slug the listing builds
+    and the image-filename convention, so links round-trip."""
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+def _resolve_by_slug(conn, slug: str):
+    """Find the monster row whose slugified name equals `slug`.
+
+    Slugs collapse spaces, parentheses, commas, apostrophes, etc. to dashes,
+    which a SQL `replace(name,' ','-')` can't reverse — so we slugify each name
+    in Python (cheap: a name-only scan, then one fetch by id)."""
+    for r in conn.execute("SELECT id, name FROM monsters"):
+        if _slugify(r["name"]) == slug:
+            return conn.execute("SELECT * FROM monsters WHERE id = ?", (r["id"],)).fetchone()
+    return None
+
+
 def _monster_row_to_dict(row) -> dict:
     keys = ["id","name","frequency","no_appearing","armor_class","move","hit_dice",
             "thac0","pct_in_lair","treasure_type","no_of_attacks","damage_attack",
             "special_attacks","special_defenses","magic_resistance","intelligence",
             "alignment","size","psionic_ability","attack_defense_modes","description",
-            "climate_terrain","morale","xp_value"]
+            "climate_terrain","morale","xp_value","categories","source"]
     return {k: row[k] for k in keys if k in row.keys()}
 
 
@@ -38,12 +57,7 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
             return jsonify({"error": "monsters.db not found"}), 404
 
         conn = db_get(_MONSTERS_DB)
-        name_pattern = slug.replace("-", "%")
-        row = conn.execute(
-            "SELECT * FROM monsters WHERE replace(lower(name),' ','-') LIKE ? "
-            "OR replace(lower(name),' ','%') LIKE ? COLLATE NOCASE LIMIT 1",
-            (slug, name_pattern),
-        ).fetchone()
+        row = _resolve_by_slug(conn, slug)
 
         if row is None:
             return jsonify({"error": "Monster not found"}), 404
@@ -129,7 +143,7 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
 
         cards = []
         for r in rows:
-            slug = re.sub(r"[^a-z0-9]+", "-", r["name"].lower()).strip("-")
+            slug = _slugify(r["name"])
             portrait_icon = ""
             if slug in portraits:
                 fn = html.escape(portraits[slug])
@@ -173,17 +187,11 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
 
     @app.route("/monsters/<slug>")
     def monster_detail(slug):
-        name_pattern = slug.replace("-", "%")
-
         if not _MONSTERS_DB.exists():
             abort(404)
 
         conn = db_get(_MONSTERS_DB)
-        row = conn.execute(
-            "SELECT * FROM monsters WHERE replace(lower(name),' ','-') LIKE ? "
-            "OR replace(lower(name),' ','%') LIKE ? COLLATE NOCASE LIMIT 1",
-            (slug, name_pattern),
-        ).fetchone()
+        row = _resolve_by_slug(conn, slug)
 
         if row is None:
             abort(404)
@@ -203,6 +211,26 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
         if m.get("description"):
             paras = [p.strip() for p in m["description"].split("\n") if p.strip()]
             desc_html = "".join(f"<p>{html.escape(p)}</p>" for p in paras)
+
+        try:
+            cats = json.loads(m["categories"]) if m.get("categories") else []
+        except (ValueError, TypeError):
+            cats = []
+        meta_html = ""
+        if cats:
+            chips = "".join(
+                f'<span style="display:inline-block;background:#2a2018;'
+                f'border:1px solid #4a3828;color:#c8a96e;border-radius:10px;'
+                f'padding:2px 10px;margin:0 6px 6px 0;font-size:0.8em">'
+                f'{html.escape(c)}</span>'
+                for c in cats
+            )
+            meta_html += f'<div style="margin-top:12px">{chips}</div>'
+        if m.get("source"):
+            meta_html += (
+                f'<p style="margin-top:8px;font-size:0.82em;color:#8a7a60">'
+                f'Source: {html.escape(str(m["source"]))}</p>'
+            )
 
         table = (
             "<table>"
@@ -281,6 +309,7 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
             f"{portrait_html}"
             f"{gen_button}"
             f'<div class="card">{table}</div>'
-            + (f'<div class="card" style="margin-top:12px">{desc_html}</div>' if desc_html else "")
+            + (f'<div class="card" style="margin-top:12px">{desc_html}{meta_html}</div>'
+               if (desc_html or meta_html) else "")
         )
         return render(f"{html.escape(name)} — Monsters", body)

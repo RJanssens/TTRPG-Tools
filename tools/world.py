@@ -35,6 +35,76 @@ def _first_heading(path: Path) -> str:
     return name
 
 
+_ABILITY_ORDER = ["str", "dex", "con", "int", "wis", "cha"]
+_SAVE_SHORT = {
+    "paralysis_poison_death": "PPD",
+    "rod_staff_wand":         "RSW",
+    "petrify_polymorph":      "PetP",
+    "breath_weapon":          "Breath",
+    "spell":                  "Spell",
+}
+
+
+def _canonical_mechanics(cfg: dict, slug: str) -> dict | None:
+    """Return the canonical char dict from campaign.json for `slug`, or None.
+
+    Checks the PC roster first, then the npcs table. campaign.json is the
+    source of truth for ability scores, level, HP, AC, THAC0 and saves —
+    the prose .md sheet may omit or lag them."""
+    for table in ("characters", "npcs"):
+        entry = (cfg.get(table) or {}).get(slug)
+        if isinstance(entry, dict):
+            return entry
+    return None
+
+
+def _mechanics_block(char: dict) -> str:
+    """Render a compact, authoritative mechanics header from a char dict.
+
+    Surfaces exactly the numbers a DM tends to archetype-guess when the prose
+    sheet is silent (ability scores, esp. CON for level-up HP). Empty string
+    if the dict carries nothing useful."""
+    ab = char.get("ability_scores") or char.get("abilities") or {}
+    cls   = char.get("cls") or char.get("class") or ""
+    level = char.get("level")
+    if not ab and level is None:
+        return ""
+
+    ident = " · ".join(p for p in [
+        cls,
+        char.get("alignment") or "",
+        f"Level {level}" if level is not None else "",
+        f"HP {char['hp_max']}" if char.get("hp_max") is not None else "",
+        f"AC {char['ac']}"     if char.get("ac")     is not None else "",
+        f"THAC0 {char['thac0']}" if char.get("thac0") is not None else "",
+    ] if p)
+
+    score_parts = []
+    for a in _ABILITY_ORDER:
+        if a not in ab:
+            continue
+        val = ab[a]
+        if a == "str" and ab.get("str_pct"):
+            val = f"{val}/{ab['str_pct']:02d}"
+        score_parts.append(f"{a.upper()} {val}")
+
+    lines = ["> **Canonical mechanics** — live from `campaign.json`, authoritative; "
+             "prose below may lag. Never archetype-guess these."]
+    if ident:
+        lines.append(f"> {ident}")
+    if score_parts:
+        lines.append("> " + " · ".join(score_parts))
+    saves = char.get("saves") or []
+    if isinstance(saves, list) and saves:
+        sv = " · ".join(
+            f"{_SAVE_SHORT.get(s['type'], s['type'])} {s['value']}"
+            for s in saves if isinstance(s, dict) and "value" in s
+        )
+        if sv:
+            lines.append(f"> Saves — {sv}")
+    return "\n".join(lines)
+
+
 def _roll_hd(notation: str) -> int:
     """Roll a hit-dice expression like '1d8', '3d10+1'."""
     m = re.match(r'^(\d+)d(\d+)([+-]\d+)?$', notation.strip().lower())
@@ -43,6 +113,9 @@ def _roll_hd(notation: str) -> int:
     n, sides, mod = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
     return max(1, sum(random.randint(1, sides) for _ in range(n)) + mod)
 
+
+# Cap for get_character(brief=True) — the opening section, not the sheet.
+_BRIEF_CHARS = 900
 
 _DEFAULT_AC = {
     "fighter": 5, "ranger": 6, "paladin": 4, "cleric": 5, "druid": 7,
@@ -109,6 +182,24 @@ def register(mcp):
             "race":  race,
             "notes": description,
         })
+
+        # Auto-tag with the party's current location + chapter so the
+        # /characters filter has a facet without manual bookkeeping. Both are
+        # editable later via set_character_location. Best-effort.
+        try:
+            state = _c.load_state(cfg)
+            loc_name = ""
+            for e in reversed(_c.load_events(cfg)):
+                if e.get("type") == "location_visited":
+                    loc_name = e.get("name") or e.get("slug") or ""
+                    break
+            _c.set_character_meta(
+                cfg, slug,
+                location=loc_name,
+                chapter=f"Session {state.get('current_session', 1)}",
+            )
+        except Exception:
+            pass
 
         # Auto-generate portrait — best-effort
         try:
@@ -394,19 +485,53 @@ def register(mcp):
             "label":      npc.get("label", slug),
             "before":     before,
             "after":      npc["disposition"],
+            "band":       _c.disposition_band(npc["disposition"])["label"],
             "faction":    npc.get("faction", ""),
             "modifier_applied_to_reaction": npc["disposition"] // 20,
         }
 
     @mcp.tool()
-    def get_character(slug: str) -> dict:
+    def get_character(slug: str, brief: bool = False) -> dict:
         """Read a character file by slug.
-        Returns the full markdown content, or an error if not found."""
+
+        Returns the markdown content with a canonical mechanics header
+        prepended from campaign.json (ability scores, level, HP, AC, THAC0,
+        saves) so the read-path is never silent on a stat the prose omits —
+        this closes the gap that led to archetype-guessing CON at level-up.
+        Also returns the structured `mechanics` dict for programmatic use.
+
+        brief: return the mechanics header plus only the opening section of the
+        file instead of the whole sheet. A full PC sheet runs to ~8k characters
+        (~1.8k tokens) and mid-scene the DM usually wants the numbers, not the
+        backstory — the full read is still there when the prose matters."""
         cfg = _c.load_campaign()
         path = cfg["_data_dir"] / "characters" / f"{slug}.md"
         if not path.exists():
             return {"error": f"Character '{slug}' not found at {path}"}
-        return {"slug": slug, "content": path.read_text(encoding="utf-8")}
+
+        content = path.read_text(encoding="utf-8")
+        char = _canonical_mechanics(cfg, slug)
+        block = _mechanics_block(char) if char else ""
+
+        if brief:
+            body = content.strip()
+            # Cut at the second heading: the first is the name, so this keeps
+            # the opening description and drops the long tail of sections.
+            headings = list(re.finditer(r'^##+\s', body, re.MULTILINE))
+            if len(headings) > 1:
+                body = body[:headings[1].start()].rstrip()
+            if len(body) > _BRIEF_CHARS:
+                body = body[:_BRIEF_CHARS].rstrip() + "\n…[truncated — call get_character without brief for the full sheet]"
+            return {
+                "slug":      slug,
+                "brief":     True,
+                "content":   f"{block}\n\n{body}" if block else body,
+                "mechanics": char or {},
+            }
+
+        if block:
+            content = f"{block}\n\n{content}"
+        return {"slug": slug, "content": content, "mechanics": char or {}}
 
     @mcp.tool()
     def update_character(slug: str, content: str) -> dict:
@@ -425,6 +550,24 @@ def register(mcp):
         })
 
         return {"slug": slug, "updated": True}
+
+    @mcp.tool()
+    def set_character_location(slug: str, location: str = "", chapter: str = "") -> dict:
+        """Tag a character with a location/area and a chapter (or session)
+        label, used for filtering on the dashboard /characters page.
+        slug: character slug (the characters/<slug>.md filename without .md)
+        location: where the character is found (a place name or area slug)
+        chapter: a chapter/session label (e.g. 'Session 4', 'The Sunless Sea')
+        Only non-empty fields are written; an omitted/empty field is left
+        unchanged. introduce_npc auto-fills both from the party's current
+        location and session — call this to correct or refine them."""
+        cfg = _c.load_campaign()
+        entry = _c.set_character_meta(
+            cfg, slug,
+            location=location if location else None,
+            chapter=chapter if chapter else None,
+        )
+        return {"slug": slug, "meta": entry}
 
     @mcp.tool()
     def list_characters() -> dict:

@@ -8,6 +8,55 @@ from pathlib import Path
 BASE_DIR      = Path(__file__).parent
 CAMPAIGNS_DIR = BASE_DIR / "campaigns"
 ACTIVE_FILE   = BASE_DIR / ".active"
+_2E_DB        = BASE_DIR / "global" / "2e.db"
+
+# Canonical AD&D 2e saving-throw order. The sheet renderer (dashboard._saves_grid)
+# keys panel boxes off these identifiers — keep them in sync.
+SAVE_TYPES = (
+    "paralysis_poison_death",
+    "rod_staff_wand",
+    "petrify_polymorph",
+    "breath_weapon",
+    "spell",
+)
+
+
+def normalize_saves(saves) -> list[dict]:
+    """Coerce a saves value into the canonical [{type, value}, ...] shape.
+    Accepts None, a positional list of 5 ints, a list of {type, value} dicts,
+    or a mix. Unrecognised entries are dropped; the result preserves SAVE_TYPES
+    order."""
+    if not saves:
+        return []
+    if all(isinstance(s, (int, float)) for s in saves):
+        return [{"type": t, "value": int(v)} for t, v in zip(SAVE_TYPES, saves)]
+    by_type: dict[str, int] = {}
+    for s in saves:
+        if isinstance(s, dict) and s.get("type") in SAVE_TYPES and s.get("value") is not None:
+            by_type[s["type"]] = int(s["value"])
+    return [{"type": t, "value": by_type[t]} for t in SAVE_TYPES if t in by_type]
+
+
+def base_saves_for(cls: str, level: int) -> list[dict]:
+    """Class+level base saves from global/2e.db in canonical shape. Returns []
+    when the class is unknown or the db is missing — caller picks the fallback."""
+    if not _2E_DB.exists() or not cls or not level:
+        return []
+    import sqlite3
+    try:
+        conn = sqlite3.connect(_2E_DB)
+        row = conn.execute(
+            "SELECT save_paralysis, save_rsw, save_petrify, save_breath, save_spell "
+            "FROM class_levels cl JOIN classes c ON c.id = cl.class_id "
+            "WHERE lower(c.name) = lower(?) AND cl.level = ?",
+            (cls, int(level)),
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return []
+    if not row:
+        return []
+    return normalize_saves(list(row))
 
 _cache: dict | None = None
 _cache_mtime: float = 0.0
@@ -154,6 +203,81 @@ def _seed_state(cfg: dict) -> dict:
     return state
 
 
+# Disposition bands: map a stored disposition (-100..+100) to a human label
+# and a display colour. Shared by the dashboard and the MCP tools so the raw
+# number always carries a readable, consistent meaning. Thresholds are the
+# floor of each band, checked high-to-low.
+_DISPOSITION_BANDS = [
+    (61,   "Devoted ally", "#5fb86d"),
+    (21,   "Friendly",     "#8fc97a"),
+    (6,    "Cordial",      "#c8b86e"),
+    (-5,   "Neutral",      "#9a9488"),
+    (-20,  "Wary",         "#d2a05a"),
+    (-60,  "Hostile",      "#d2784a"),
+    (-100, "Sworn enemy",  "#cc5a4a"),
+]
+
+
+def disposition_band_order() -> list[str]:
+    """Band labels from most positive (Devoted ally) to most negative
+    (Sworn enemy) — for ordering disposition selectors on the dashboard."""
+    return [label for _t, label, _c in _DISPOSITION_BANDS]
+
+
+def disposition_band(value) -> dict:
+    """Return {"value", "label", "color"} for a disposition score. Clamps to
+    -100..+100 and never raises (non-numeric input falls back to neutral)."""
+    try:
+        v = max(-100, min(100, int(value)))
+    except (TypeError, ValueError):
+        v = 0
+    for threshold, label, color in _DISPOSITION_BANDS:
+        if v >= threshold:
+            return {"value": v, "label": label, "color": color}
+    return {"value": v, "label": "Sworn enemy", "color": "#cc5a4a"}
+
+
+def character_meta_path(cfg: dict) -> Path:
+    return cfg["_dir"] / "_character_meta.json"
+
+
+def load_character_meta(cfg: dict) -> dict:
+    """Per-campaign sidecar mapping character slug -> {location, chapter}.
+
+    Drives the /characters filter facets. Kept separate from campaign.json
+    so it also covers introduce_npc'd NPCs (which are .md-only, never in the
+    characters/npcs records) and never pollutes the canonical sheets."""
+    p = character_meta_path(cfg)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def set_character_meta(cfg: dict, slug: str,
+                       location: str | None = None,
+                       chapter: str | None = None) -> dict:
+    """Update a character's location/chapter tags. Only the fields passed
+    (non-None) are written; pass an empty string to clear a field. Returns
+    the merged entry for the slug."""
+    meta = load_character_meta(cfg)
+    entry = dict(meta.get(slug, {}))
+    if location is not None:
+        entry["location"] = str(location).strip()
+    if chapter is not None:
+        entry["chapter"] = str(chapter).strip()
+    entry = {k: v for k, v in entry.items() if v}
+    if entry:
+        meta[slug] = entry
+    else:
+        meta.pop(slug, None)
+    atomic_write_text(character_meta_path(cfg), json.dumps(meta, indent=2))
+    return entry
+
+
 def load_events(cfg: dict) -> list:
     """Read all events. Prefers events.jsonl (append-only) but falls back to
     legacy events.json (single JSON array) for older campaigns. If both exist,
@@ -194,14 +318,14 @@ def append_event(cfg: dict, event: dict):
 
 
 def char_key_for(cfg: dict, label: str) -> tuple[str | None, dict | None]:
-    """Return (key, char_dict) by label, case-insensitive prefix match."""
+    """Return (key, char_dict) by key or label, case-insensitive prefix match."""
     low   = label.lower()
     chars = cfg.get("characters", {})
     for k, c in chars.items():
-        if c["label"].lower() == low:
+        if k.lower() == low or c["label"].lower() == low:
             return k, c
     for k, c in chars.items():
-        if c["label"].lower().startswith(low):
+        if k.lower().startswith(low) or c["label"].lower().startswith(low):
             return k, c
     return None, None
 
@@ -236,7 +360,8 @@ def write_character_sheet(cfg: dict, key: str, char: dict):
 
     # ── Header ───────────────────────────────────────────────────────────────
     L += [f"# {label}", ""]
-    parts = [p for p in [cls, race, gender, f"Level {level}" if level else ""] if p]
+    align  = char.get("alignment", "")
+    parts = [p for p in [cls, race, gender, align, f"Level {level}" if level else ""] if p]
     L += ["  ".join(f"**{p}**" if i == 0 else p for i, p in enumerate(parts)), ""]
 
     # ── Background ───────────────────────────────────────────────────────────
@@ -299,12 +424,14 @@ def write_character_sheet(cfg: dict, key: str, char: dict):
         ]
 
     # ── Saving Throws ────────────────────────────────────────────────────────
-    saves = char.get("saves", [])
-    if saves:
-        save_names = ["Paralysis/Poison", "RSW", "Petrify/Poly", "Breath", "Spell"]
-        head = " | ".join(save_names[:len(saves)])
-        sep  = " | ".join("---" for _ in saves)
-        vals = " | ".join(str(s) for s in saves)
+    saves_norm = normalize_saves(char.get("saves"))
+    if saves_norm:
+        type_to_name = dict(zip(SAVE_TYPES, [
+            "Paralysis/Poison", "RSW", "Petrify/Poly", "Breath", "Spell",
+        ]))
+        head = " | ".join(type_to_name[s["type"]] for s in saves_norm)
+        sep  = " | ".join("---" for _ in saves_norm)
+        vals = " | ".join(str(s["value"]) for s in saves_norm)
         L += [
             "## Saving Throws", "",
             f"| {head} |",

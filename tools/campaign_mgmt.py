@@ -15,7 +15,7 @@ _CAMPAIGN_SCHEMA = {
     "default_character": "",
     "session_log_file": "adventure_log.md",
     "chronicle_file": "adventure_log.md",
-    "initial_coin": {"gp": 0, "ep": 0, "sp": 0, "cp": 0},
+    "initial_coin": {"pp": 0, "gp": 0, "ep": 0, "sp": 0, "cp": 0},
     "characters": {},
     "encounter_tables": {
         "dungeon_l1": [],
@@ -66,7 +66,7 @@ def register(mcp):
         campaign_data["system"] = system
         campaign_data["world"] = world
         campaign_data["tone"] = tone
-        campaign_data["initial_coin"] = {"gp": initial_gp, "ep": 0, "sp": 0, "cp": 0}
+        campaign_data["initial_coin"] = {"pp": 0, "gp": initial_gp, "ep": 0, "sp": 0, "cp": 0}
 
         # Deep-copy nested dicts so schema isn't mutated
         campaign_data["encounter_tables"] = {k: list(v) for k, v in _CAMPAIGN_SCHEMA["encounter_tables"].items()}
@@ -301,6 +301,7 @@ def register(mcp):
         saves: list = None,
         race: str = "human",
         gender: str = "male",
+        alignment: str = "",
         level: int = 1,
         ability_scores: dict = None,
         background: str = "",
@@ -319,17 +320,26 @@ def register(mcp):
         ability_scores: {"str": 16, "dex": 12, "con": 14, "int": 10, "wis": 11, "cha": 8}
         attacks: [{name, speed, attacks, thac0, damage_sm, damage_l?, range?}, ...]
         weapon_profs: ["Longsword", "Dagger", ...]
+        alignment: e.g. "Lawful Good", "Chaotic Neutral"
         nwps: ["Riding (WIS)", ...] or [{name, ability, slots?}, ...]
         natural_abilities: ["Infravision 60'", ...]
         inventory: ["Longsword", "Chain mail", "Backpack", ...]
         portrait_prompt: canonical image-generation prompt (stored and reused for future portraits)
         skills: thief/bard skill percentages {skill_name: pct}
+        saves: either five ints in PP&D/RSW/PETR/BREATH/SPELL order, or a list of
+               {type, value} dicts. When omitted, derived from cls + level via the
+               2e DB (and equipment/level-up adjustments should be applied
+               afterwards through normal updates).
         """
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
-        if saves is None:
-            saves = [16, 18, 17, 20, 19]
+        saves_norm = _c.normalize_saves(saves) or _c.base_saves_for(cls, level)
+        if not saves_norm:
+            # Class unknown to the 2e DB and no explicit saves passed — fall back
+            # to a placeholder so the field exists, but flag it in the return.
+            saves_norm = _c.normalize_saves([16, 18, 17, 20, 19])
+        saves = saves_norm
         spell_slots_cfg = {str(k): int(v) for k, v in spell_slots.items()} if spell_slots else None
 
         char_data: dict = {
@@ -348,6 +358,7 @@ def register(mcp):
             "saves":        saves,
             "skills":       skills or {},
         }
+        if alignment:           char_data["alignment"]         = alignment
         if ability_scores:      char_data["ability_scores"]    = ability_scores
         if background:          char_data["background"]        = background
         if attacks:             char_data["attacks"]           = attacks

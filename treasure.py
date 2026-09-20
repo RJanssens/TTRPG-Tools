@@ -56,7 +56,18 @@ def pct(chance):
 # Each entry: (lo, hi, chance_pct) — chance=None means automatic
 # magic_type: 'any' | 'any_no_weapons' | 'armor_weapon' | 'potion' | 'scroll'
 # magic_extra: extra forced item type appended ('+potion' or '+scroll')
+#
+# NOTE on the 'ep' key: in the 2e DMG (Table 84) the fourth coin column is a
+# single "Platinum or Electrum*" column, where the footnote * reads "DM's
+# choice". We store that column's range under 'ep'; at generation it resolves
+# to electrum OR platinum (see PLATINUM_CHANCE). 1 pp = 5 gp (PHB Table 42).
 # ---------------------------------------------------------------------------
+
+# Odds that the "Platinum or Electrum" column (Table 84) comes up PLATINUM for a
+# given hoard rather than electrum — the DMG leaves this to "DM's choice", so
+# this is the automated stand-in. 0.0 = always electrum (legacy behaviour),
+# 1.0 = always platinum.
+PLATINUM_CHANCE = 0.5
 
 TYPES = {
     # --- Lair Treasures (A-I) ---
@@ -670,7 +681,11 @@ def generate_treasure(ttype, verbose=True):
                 lines.append(f"  {label}: — (rolled {random.randint(1,100)}, needed ≤{chance})")
             return
         amount = rng(lo, hi)
-        coin_total += amount * {'cp':0.01,'sp':0.1,'gp':1,'ep':0.5}[key]
+        # Table 84's 4th column is "Platinum or Electrum" (DM's choice). It is
+        # stored under 'ep'; resolve which metal this hoard uses here.
+        if key == 'ep' and random.random() < PLATINUM_CHANCE:
+            key, label = 'pp', 'Platinum (pp)'
+        coin_total += amount * {'cp':0.01,'sp':0.1,'gp':1,'ep':0.5,'pp':5}[key]
         tag = f' (auto)' if chance is None else f' ({chance}% ✓)'
         lines.append(f"  {label}: {amount:,}{tag}")
         found_any = True
