@@ -2,8 +2,9 @@
 
 The map renderer delegates to the dungml backend (`dmap-server`) at
 `DUNGML_API_BASE` (default http://127.0.0.1:8000). Rooms, corridors,
-doors, windows, and features are drawn by dungml's classic-bw / hatched
-/ floorplan renderers; combatants ride on top as integer-cell tokens in
+doors, windows, and features are drawn by dungml's classic-bw /
+hatched / floorplan / oldschool-blue renderers; combatants ride on top
+as integer-cell tokens in
 the same coordinate space as the map's `grid { bounds W x H }` block.
 """
 import base64
@@ -431,10 +432,12 @@ def register(mcp):
           dsl:      a full .dmap source string, including a top-level
                     `map "Name" { grid { bounds W x H } ... }` block and
                     any rooms / corridors / doors / features you want.
-          renderer: optional override — one of "classic-bw" (default),
-                    "floorplan" (building style alias), or "hatched"
-                    (architectural section drawings). If unset the
-                    renderer named in the source is used.
+          renderer: optional override — "classic-bw" (default),
+                    "floorplan" (building style), "hatched" (architectural
+                    section drawings) or "oldschool-blue" (blueprint look).
+                    If unset the renderer named in the source is used.
+                    `GET /api/dsl/renderers` on the dungml backend is
+                    authoritative if you need to check.
 
         Returns: {size, scale, diagnostics} on success, or {error, ...}
         on parse failure / backend unreachable. `diagnostics` is a list

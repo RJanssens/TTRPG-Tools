@@ -457,14 +457,14 @@ Overland maps authored in a Structurizr-style DSL (`campaigns/<active>/maps/<slu
 
 For tactical encounters (5 ft grid, walls, doors, rooms), `create_map(dsl, renderer=None)` delegates to **dungml**, a declarative `.dmap` DSL rendered to SVG and embedded in `combat_state.json` — shown on `/combat` with combatants as tokens. Use this when PCs are about to roll initiative; use World Maps for choosing a road on a regional view.
 
-**Prerequisite — start `dmap-server` once per boot** (`uv run dmap-server` from `~/claude/dungml` → `http://127.0.0.1:8000`). `tools/combat_map.py` honours `DUNGML_API_BASE`. If unreachable, `create_map` returns an `{"error": "dungml backend unreachable ..."}` — surface it to the user verbatim; do not invent a fallback (no hand-drawn ASCII map).
+**Prerequisite — start `dmap-server` once per boot** (`uv run dmap-server` from `~/claude/dungml` → `http://127.0.0.1:8000`; see *Running the System* below). `tools/combat_map.py` honours `DUNGML_API_BASE`. If unreachable, `create_map` returns an `{"error": "dungml backend unreachable ..."}` — surface it to the user verbatim; do not invent a fallback (no hand-drawn ASCII map).
 
 **Writing the DSL.** Mandatory: a `map "Name" { grid { units feet 5 bounds W x H } }` block (W×H is the integer **cell** space combatants sit in) plus at least one room. Subset that covers most needs:
 - **Rooms:** `rect X,Y W x H` or `polygon (x,y) ...` (vertices CCW, top-left origin); add `label`, `description`, and `feature NAME at X,Y [scale N] [rotate D]` lines.
 - **Corridors:** `corridor "n" { width W  segment line from X,Y to X,Y }` (also `segment arc center ... radius ...`).
 - **Doors:** `door at X,Y { connects room.foo  type wooden|iron|stone|arch|portcullis|secret  state closed|open|locked|trapped }` — cut walls automatically (~1-unit snap). **Windows:** `window at X,Y { in room.foo  width 1.5 }`.
-- **Built-in features:** `pillar`, `rubble`, `chest`, `altar`, `trap`, `stairs-up/down`, `water`, `brazier`, `statue`, `hearth`, `table`, `chair`, `bed`, `desk`, `bookshelf`, `barrel`, `crate`, … Custom: `feature_def "name" { shape circle radius R  background "#hex" }`.
-- **Hidden layer:** wrap traps/secret rooms in `layer "secrets" hidden { ... }` — excluded from the render. Optional `background "stone"|"parchment"|...` at map or room level; optional `legend` strip (off by default — only for player handouts). Renderers: `classic-bw` (default), `floorplan`, `hatched`.
+- **Built-in features:** `pillar`, `rubble`, `chest`, `altar`, `trap`, `stairs-up/down`, `water`, `brazier`, `statue`, `hearth`, `table`, `chair`, `bed`, `desk`, `bookshelf`, `barrel`, `crate`, … Custom: `feature_def "name" { shape circle radius R  background "#hex" }`. These shapes live in dungml's bundled include libraries (`core`, `common-dungeon`, `dungeon`, `crypt`, `city`, `forest`, `outdoor`); `create_map` prepends `include "core.dmap"` when your source names no library of its own, so the everyday shapes just work. Name a different library explicitly and that auto-include steps aside — add `core` yourself if you still want the basics.
+- **Hidden layer:** wrap traps/secret rooms in `layer "secrets" hidden { ... }` — excluded from the render. Optional `background "stone"|"parchment"|...` at map or room level; optional `legend` strip (off by default — only for player handouts). Renderers: `classic-bw` (default), `floorplan`, `hatched`, `oldschool-blue`.
 
 Minimal example:
 ```
@@ -529,6 +529,59 @@ Run `python3 dashboard.py [--port 5000]` for the web interface:
 - `/locations` — two-level location browser
 - `/maps` — world-map index (per-slug Leaflet views with kind-toggle layers)
 - `/sheets/<slug>` — character sheet
+
+---
+
+## Running the System
+
+Three processes, all local. Only the first is required to play.
+
+| Process | Start it with | Serves |
+|---|---|---|
+| **MCP server** | launched by Claude Code as the `ttrpg` server (`python3 server.py`) | every tool in this file |
+| **Dashboard** | `python3 dashboard.py [--port 5000]` | `/party`, `/combat`, `/log`, the reference browsers |
+| **dmap-server** | `uv run dmap-server` from `~/claude/dungml` | tactical map rendering + fog of war |
+
+`server.py` registers each module in `tools/` via its `register(mcp)`. A new
+tool module must be added to both the import line and the register list, or
+it silently won't exist. Dependencies are in `requirements.txt` (`mcp`,
+`flask`, `python-dotenv`, `replicate`, `openai`).
+
+Tests: `python3 -m unittest discover -s tests` — run before committing.
+
+### The dungml dependency
+
+Tactical maps and fog of war are rendered by **dungml**, a separate repo at
+`~/claude/dungml` (see its own CLAUDE.md). It is a service, not a library —
+this repo only ever talks HTTP to it. The line of development is
+`summersong-main`; the contract endpoints this repo's fog tools need are on
+`feat/ttrpg2-combat-fog`, so that is the branch `dmap-server` should be
+running for fog of war to work.
+
+| Variable | Default | Used by |
+|---|---|---|
+| `DUNGML_API_BASE` | `http://127.0.0.1:8000` | `tools/combat_map.py`, `tools/dungml_play.py` |
+| `DUNGML_SERVICE_TOKEN` | `dev-service` | `tools/dungml_play.py` — the contract routes need a service principal |
+
+The defaults work for a stock local `dmap-server`, so normally there is
+nothing to set. dungml holds its own fog state (what each campaign has
+discovered) keyed by the **campaign slug**; this repo stores only the link —
+which map and which view — in `state.json` under `dungml`.
+
+**dmap-server loads Python at boot.** If you change dungml's code, restart it
+or the change is invisible. Symptoms of a stale or missing server:
+
+| Symptom | Cause |
+|---|---|
+| `create_map` → `{"error": "dungml backend unreachable …"}` | server not running — surface it verbatim, never hand-draw a map |
+| combat tab pill says `map service offline` | same |
+| pill says `no fog session` | server is up but no map pushed yet — run `create_map`, or pick a locale |
+| `unknown feature 'chest'` diagnostics | source names a library, so the `core.dmap` auto-include stepped aside |
+| a fix to dungml appears to do nothing | server still running the old code — restart it |
+
+If `dmap-server` is down, nothing here breaks: `create_map` reports the error
+and every fog tool degrades to a no-op. **Play is never blocked on the map
+service** — narrate the scene without a map rather than inventing one.
 
 ---
 
