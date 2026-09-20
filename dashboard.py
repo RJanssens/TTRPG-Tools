@@ -2,16 +2,19 @@
 """Campaign dashboard web app. Run: python3 dashboard.py [--campaign NAME] [--port 5000]"""
 
 import argparse
+import hashlib
 import html
+import ipaddress
 import json
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from datetime import datetime, timezone
 
-from flask import Flask, Response, abort, jsonify, render_template_string, request, send_file, send_from_directory
+from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, send_file, send_from_directory
 
 import _campaign as _c
 from tools import campaign_archive as _arch
@@ -21,6 +24,7 @@ from tools import homebrew_classes as _hb
 from tools import dm_session as _dm
 from tools import images as _img
 from tools import tts as _tts
+from tools import dungml_play as _dungml
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -337,7 +341,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     position: relative;
     transition: color 180ms ease;
   }}
-  nav a:not(:last-child)::after {{
+  nav a:not(:last-of-type)::after {{
     content: '';
     position: absolute;
     right: 0; top: 28%; bottom: 28%;
@@ -345,6 +349,23 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     background: linear-gradient(to bottom, transparent, rgba(200,169,110,0.24), transparent);
   }}
   nav a:hover {{ color: var(--accent-gold-hi); }}
+  /* /play-only toggles for the toolbar (subheader) and party panel.
+     Hidden everywhere else via the :has() scope. */
+  .nav-play-toggles {{ display: none; margin-left: auto; gap: 6px; align-items: center; }}
+  body:has(.play-shell) .nav-play-toggles {{ display: inline-flex; }}
+  .nav-icon-btn {{
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--accent-gold);
+    border-radius: 6px;
+    padding: 3px 9px;
+    font-size: 0.95em;
+    line-height: 1;
+    cursor: pointer;
+    transition: color 180ms ease, border-color 180ms ease, opacity 180ms ease;
+  }}
+  .nav-icon-btn:hover {{ color: var(--accent-gold-hi); border-color: var(--accent-gold-hi); }}
+  .nav-icon-btn.off {{ opacity: 0.4; }}
   nav a.is-active {{ color: var(--ink-display); }}
   nav a.is-active::before {{
     content: '';
@@ -728,6 +749,16 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     text-transform: uppercase;
     letter-spacing: 0.08em;
     font-size: 0.84em;
+  }}
+  table.gh-wikitable {{ width: auto; min-width: 320px; max-width: 100%; }}
+  table.gh-wikitable caption {{
+    caption-side: top;
+    text-align: left;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+    font-size: 0.9em;
+    letter-spacing: 0.06em;
+    padding: 0 0 6px;
   }}
   img:not(#lb-img) {{ cursor: zoom-in; }}
 
@@ -1133,17 +1164,20 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <nav>
   <a href="/play">Play</a>
   <a href="/">Gallery</a>
-  <a href="/party">Party</a>
   <a href="/world">World</a>
   <a href="/quests">Quests</a>
   <a href="/log">Chronicle</a>
   <a href="/sessions">Sessions</a>
-  <a href="/characters">Characters</a>
+  <a href="/characters">Cast</a>
   <a href="/locations">Locations</a>
   <a href="/reference">Reference</a>
   <a href="/combat">Combat</a>
   <a href="/maps">Maps</a>
   <a href="/campaigns">Campaigns</a>
+  <span class="nav-play-toggles">
+    <button id="nav-toggle-toolbar" type="button" class="nav-icon-btn" title="Show/hide the play toolbar" aria-label="Toggle play toolbar">⚙</button>
+    <button id="nav-toggle-party" type="button" class="nav-icon-btn" title="Show/hide the party panel" aria-label="Toggle party panel">👤</button>
+  </span>
 </nav>
 <div class="container">
 {body}
@@ -1384,7 +1418,7 @@ def _world_info_bar(state: dict) -> str:
 
     coin = state.get("coin", {})
     coin_parts = []
-    for denom in ("gp", "ep", "sp", "cp"):
+    for denom in ("pp", "gp", "ep", "sp", "cp"):
         v = coin.get(denom, 0)
         if v:
             coin_parts.append(f"{v} {denom}")
@@ -1619,8 +1653,11 @@ def gallery():
     return render(f"{campaign_name} — Gallery", body)
 
 
-@app.route("/party")
-def party():
+def _party_body(heading_tag: str = "h1", heading_text: str | None = None) -> str:
+    """Build the live party panel: world-info bar + rich PC cards + light /
+    consumables / loot. Shared by the combined /characters ("Cast") page,
+    where it renders as an <h2> section above the full cast grid. The heading
+    is parameterised so the same markup serves both contexts."""
     state = _c.load_state(cfg)
     campaign_name = cfg.get("name", "Campaign")
     characters = cfg.get("characters", {})
@@ -1649,7 +1686,7 @@ def party():
 
     coin = state.get("coin", {})
     coin_parts = []
-    for denom in ("gp", "ep", "sp", "cp"):
+    for denom in ("pp", "gp", "ep", "sp", "cp"):
         v = coin.get(denom, 0)
         if v:
             coin_parts.append(f"{v} {denom}")
@@ -1919,15 +1956,21 @@ def party():
             f'<div class="card"><h2>Light Sources</h2>{"".join(rows)}</div>'
         )
 
-    body = (
-        f"<h1>{html.escape(campaign_name)} — Party</h1>"
+    head = heading_text if heading_text is not None else f"{campaign_name} — Party"
+    return (
+        f"<{heading_tag}>{html.escape(head)}</{heading_tag}>"
         + _world_info_bar(state)
         + "".join(cards)
         + light_html
         + consumables_html
         + loot_html
     )
-    return render(f"{campaign_name} — Party", body)
+
+
+@app.route("/party")
+def party():
+    """Legacy route — the party view now lives on the combined Cast page."""
+    return redirect("/characters")
 
 
 @app.route("/world")
@@ -2157,6 +2200,37 @@ def log():
 
 def _sessions_dir() -> Path:
     return _export.PROJECTS_DIR / _export.encode_cwd(Path(__file__).parent)
+
+
+def _active_campaign_slug() -> str | None:
+    """Slug of the campaign currently bound to /play (from .active)."""
+    return cfg.get("_name") if cfg else None
+
+
+def _campaign_session_md_dir(slug: str) -> Path:
+    """Per-campaign markdown export dir for SessionEnd hooks."""
+    return Path(__file__).parent / "campaigns" / slug / "_session-logs"
+
+
+def _active_campaign_session_paths() -> list[Path]:
+    """JSONL paths for sids in the active campaign's manifest, newest first.
+
+    Returns ``[]`` when no campaign is active, the manifest is empty, or
+    the JSONLs have been pruned from Claude's pool dir."""
+    slug = _active_campaign_slug()
+    if not slug:
+        return []
+    sdir = _sessions_dir()
+    if not sdir.is_dir():
+        return []
+    sids = _dm.manifest_sids(slug)
+    paths = []
+    for sid in sids:
+        p = sdir / f"{sid}.jsonl"
+        if p.is_file():
+            paths.append(p)
+    paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return paths
 
 
 def _session_teaser(path: Path, max_chars: int = 140) -> str:
@@ -2681,7 +2755,7 @@ def campaign_create():
     data["name"] = name
     data["world"] = world
     data["tone"] = tone
-    data["initial_coin"] = {"gp": initial_gp, "ep": 0, "sp": 0, "cp": 0}
+    data["initial_coin"] = {"pp": 0, "gp": initial_gp, "ep": 0, "sp": 0, "cp": 0}
     data["encounter_tables"] = {k: list(v) for k, v in _CAMPAIGN_SCHEMA["encounter_tables"].items()}
     data["encounter_frequency"] = {k: dict(v) for k, v in _CAMPAIGN_SCHEMA["encounter_frequency"].items()}
     data["characters"] = {}
@@ -2847,7 +2921,12 @@ def sessions_index():
         body = "<h1>Sessions</h1><p class='muted'>No transcript directory found.</p>"
         return render("Sessions", body)
 
-    files = _export.list_sessions(sdir)
+    slug = _active_campaign_slug()
+    if not slug:
+        body = "<h1>Sessions</h1><p class='muted'>No active campaign — switch one in on /campaigns first.</p>"
+        return render("Sessions", body)
+    files = _active_campaign_session_paths()
+    campaign_name = cfg.get("name", slug) if cfg else slug
     rows = []
     for p in files:
         st = p.stat()
@@ -2870,7 +2949,10 @@ def sessions_index():
         )
 
     if not rows:
-        body = "<h1>Sessions</h1><p class='muted'>No sessions yet.</p>"
+        body = (
+            f"<h1>Sessions — {html.escape(campaign_name)}</h1>"
+            f"<p class='muted'>No sessions recorded for this campaign yet.</p>"
+        )
     else:
         body = (
             "<style>"
@@ -2922,8 +3004,8 @@ def sessions_index():
             "  padding: 0 2px; border-radius: 2px;"
             "}"
             "</style>"
-            "<h1>Sessions</h1>"
-            f"<p class='muted'>{len(rows)} session(s). Newest first.</p>"
+            f"<h1>Sessions — {html.escape(campaign_name)}</h1>"
+            f"<p class='muted'>{len(rows)} session(s) in this campaign. Newest first.</p>"
             '<div class="session-search-bar">'
             '  <input type="search" id="session-search" placeholder="Search across all sessions…" autocomplete="off">'
             '  <span id="session-search-status" class="muted"></span>'
@@ -3158,6 +3240,7 @@ def _play_state() -> dict:
             "key": key,
             "label": char.get("label", key),
             "cls": char.get("cls", ""),
+            "alignment": _alignment_abbrev(char.get("alignment") or ""),
             "level": level,
             "hp": hp_cur,
             "hp_max": hp_max,
@@ -3173,7 +3256,7 @@ def _play_state() -> dict:
     coin = state.get("coin", {}) or {}
     # Show every non-zero denomination; if the party is genuinely broke,
     # surface "0 gp" rather than blank — players want to see the zero.
-    coin_parts = [f"{coin[d]} {d}" for d in ("gp", "ep", "sp", "cp") if coin.get(d)]
+    coin_parts = [f"{coin[d]} {d}" for d in ("pp", "gp", "ep", "sp", "cp") if coin.get(d)]
 
     hour = state.get("current_hour")
     minute = state.get("current_minute")
@@ -3277,6 +3360,44 @@ _PLAY_HTML = """
     letter-spacing: 0;
     margin-left: 6px;
   }
+  .play-toolbar .sid code.sid-size {
+    color: var(--ink-muted);
+    margin-left: 8px;
+  }
+  .play-toolbar .sid code.sid-size:empty { display: none; }
+  .play-toolbar .sid code.sid-size.near-reset { color: var(--accent-gold, #d4a14a); font-weight: 600; }
+  .play-toolbar .tone-group { display: inline-flex; align-items: center; gap: 4px; }
+  .play-toolbar .tone-group .tone-icon { font-size: 0.95em; opacity: 0.8; }
+  .play-toolbar #play-tone {
+    background: var(--panel-2, #1b1b1b);
+    color: var(--ink, #e8e2d0);
+    border: 1px solid var(--border, #3a3a3a);
+    border-radius: 5px;
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 0.85em;
+    cursor: pointer;
+  }
+  .play-toolbar #play-tone-custom {
+    background: var(--panel-2, #1b1b1b);
+    color: var(--ink, #e8e2d0);
+    border: 1px solid var(--border, #3a3a3a);
+    border-radius: 5px;
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 0.85em;
+    width: 14ch;
+  }
+  .play-toolbar #play-tone-custom[hidden] { display: none; }
+  .play-toolbar .detail-group { display: inline-flex; align-items: center; gap: 5px; }
+  .play-toolbar .detail-group .detail-icon { font-size: 0.95em; opacity: 0.8; }
+  .play-toolbar #play-detail { width: 70px; cursor: pointer; accent-color: var(--accent-gold, #c8a24a); vertical-align: middle; }
+  .play-toolbar .detail-label {
+    font-size: 0.8em;
+    opacity: 0.75;
+    min-width: 7ch;
+    color: var(--ink, #e8e2d0);
+  }
   .play-toolbar .spacer { flex: 1; }
   .play-toolbar button {
     background: transparent;
@@ -3306,6 +3427,11 @@ _PLAY_HTML = """
      together, with a small gap between the two groups. */
   .view-controls { display: inline-flex; align-items: center; gap: 10px; }
   .filter-group, .font-group { display: inline-flex; gap: 4px; }
+  /* Session id + new-session button hug together on the left. */
+  .session-group { display: inline-flex; align-items: baseline; gap: 6px; }
+  /* Logical clusters of icon buttons (picture, reply-effects, recovery)
+     keep tight internal spacing; the toolbar's own gap separates groups. */
+  .icon-group { display: inline-flex; align-items: center; gap: 4px; }
   .icon-btn {
     width: 30px;
     height: 26px;
@@ -3537,6 +3663,7 @@ _PLAY_HTML = """
   #play-debug.debug-on { color: var(--accent-gold); border-color: var(--accent-gold); }
   #play-suggest.suggest-on { color: var(--accent-gold); border-color: var(--accent-gold); }
   #play-bell.bell-on { color: var(--accent-gold); border-color: var(--accent-gold); }
+  #play-pin-scroll.pin-on { color: var(--accent-gold); border-color: var(--accent-gold); }
   /* Suggested-action chips appear under the last DM turn when the
      'suggest' toggle is on. Clicking a chip fills the input and submits. */
   .suggest-row {
@@ -4167,6 +4294,102 @@ _PLAY_HTML = """
   }
   .party-list { display: flex; flex-direction: column; gap: 16px; }
   .party-mini { display: flex; gap: 12px; align-items: flex-start; }
+
+  /* ---- Party reorder handles ---- */
+  /* The party sequence *is* campaign.json's `characters` key order, which
+     every surface iterates (this sidebar, the Cast page, the statusline,
+     combat setup) — so moving a card here moves it everywhere. Faint until
+     the card is hovered; the column always occupies its width so revealing
+     the arrows never shifts the layout. */
+  .party-mini-order {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex-shrink: 0;
+    opacity: 0.22;
+    transition: opacity 180ms ease;
+  }
+  .party-mini:hover .party-mini-order,
+  .party-mini-order:focus-within { opacity: 1; }
+  .ord-btn {
+    appearance: none;
+    width: 17px; height: 15px;
+    padding: 0;
+    line-height: 1;
+    font-size: 0.7em;
+    background: var(--bg-rec);
+    color: var(--ink-muted);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    cursor: pointer;
+    transition: color 140ms ease, border-color 140ms ease;
+  }
+  .ord-btn:hover:not(:disabled) {
+    color: var(--accent-gold-hi);
+    border-color: var(--accent-gold);
+  }
+  .ord-btn:disabled { opacity: 0.25; cursor: default; }
+
+  /* ---- Audit dialog + toolbar pip ---- */
+  /* The post-turn audit lives behind the 📋 button in the recovery/debug
+     toolbar group. Findings are surfaced in a modal so the sidebar stays
+     focused on party state. The button's pip turns red when there are new
+     lapses since last open, so the human still gets passive notification. */
+  .audit-btn {{ position: relative; }}
+  .audit-btn-pip {{
+    position: absolute; top: 2px; right: 2px;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--hp-bad);
+    box-shadow: 0 0 4px var(--hp-bad);
+    pointer-events: none;
+  }}
+  .audit-btn-pip.has-warning {{ background: #d4a14a; box-shadow: 0 0 4px #d4a14a; }}
+
+  .audit-dialog {{ max-width: 720px; }}
+  .audit-toggle {{
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 12px;
+    margin: 0 0 12px 0;
+    background: rgba(200,169,110,0.05);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 0.88em;
+    line-height: 1.45;
+  }}
+  .audit-toggle:hover {{ border-color: var(--accent-gold); }}
+  .audit-toggle input {{ margin-top: 3px; }}
+  .audit-toggle strong {{ color: var(--accent-gold-hi); }}
+
+  .audit-list {{
+    list-style: none; padding: 0; margin: 0;
+    display: flex; flex-direction: column; gap: 8px;
+    font-size: 0.88em;
+    max-height: 50vh;
+    overflow-y: auto;
+  }}
+  .audit-item {{
+    padding: 8px 12px;
+    border-left: 2px solid var(--rule);
+    color: var(--ink-muted);
+    line-height: 1.45;
+  }}
+  .audit-item.sev-lapse   {{ border-left-color: var(--hp-bad); color: var(--ink-body); }}
+  .audit-item.sev-warning {{ border-left-color: #d4a14a; }}
+  .audit-item .audit-kind {{
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-size: 0.78em;
+    color: var(--accent-gold-hi);
+  }}
+  .audit-item .audit-slug {{
+    font-family: var(--font-mono, monospace);
+    color: var(--ink-body);
+    background: rgba(200,169,110,0.08);
+    padding: 0 4px;
+    border-radius: 2px;
+  }}
   .portrait-frame {
     flex-shrink: 0;
     width: 58px; height: 58px;
@@ -4181,11 +4404,11 @@ _PLAY_HTML = """
     display: block;
     transition: box-shadow 200ms ease, transform 200ms ease;
   }
-  a.portrait-frame:hover {
+  .portrait-frame:hover {
     box-shadow: 0 0 0 1px var(--bg-deep), 0 0 0 2px var(--accent-gold-hi), 0 4px 12px rgba(200,169,110,0.25);
     transform: translateY(-1px);
   }
-  .portrait-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .portrait-frame img { width: 100%; height: 100%; object-fit: cover; display: block; cursor: zoom-in; }
   .portrait-frame.empty {
     background: linear-gradient(135deg, #1a130c, #0f0a07);
     display: flex;
@@ -4301,13 +4524,46 @@ _PLAY_HTML = """
 <div class="play-shell">
   <section class="play-main">
     <div class="play-toolbar">
-      <h1>Live Play</h1>
-      <span class="sid">session<code id="play-sid">…</code></span>
+      <span class="session-group">
+        <span class="sid">session<a id="play-sid" href="#" target="_blank" rel="noopener"><code>…</code></a><code id="play-sid-size" class="sid-size"></code></span>
+        <button id="play-reset" type="button" class="icon-btn" title="New session: start a fresh DM conversation (current session remains in /sessions)" aria-label="New session">✨</button>
+      </span>
+      <span class="tone-group" role="group" aria-label="DM narration tone" title="DM narration tone — shapes voice and texture only, never the rules">
+        <span class="tone-icon" aria-hidden="true">🎭</span>
+        <select id="play-tone" aria-label="DM narration tone">
+          <option value="classic">Classic</option>
+          <option value="grimdark">Grimdark</option>
+          <option value="heroic">High-heroic</option>
+          <option value="horror">Horror</option>
+          <option value="comedic">Wry / comedic</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <input id="play-tone-custom" type="text" maxlength="2000" placeholder="describe your own tone…" hidden aria-label="Custom tone description" />
+      </span>
+      <span class="detail-group" role="group" aria-label="Narrative detail level" title="Narrative detail — how much raw mechanical detail (coin counts, ability scores, stat blocks) the DM exposes in prose. Never changes the rules or the fourth wall.">
+        <span class="detail-icon" aria-hidden="true">🎚️</span>
+        <input id="play-detail" type="range" min="0" max="3" step="1" value="2" aria-label="Narrative detail level" />
+        <span id="play-detail-label" class="detail-label">Standard</span>
+      </span>
+      <span class="tone-group" role="group" aria-label="DM reasoning effort" title="Reasoning effort — how long the DM deliberates before answering. Auto spends it where the rules bite (live combat, multi-NPC scenes, staged plans) and stays cheap elsewhere. Lower is faster; pinning Low everywhere trades procedural care for speed.">
+        <span class="tone-icon" aria-hidden="true">⚡</span>
+        <select id="play-effort" aria-label="DM reasoning effort">
+          <option value="auto">Effort: auto</option>
+          <option value="low">Effort: low</option>
+          <option value="medium">Effort: medium</option>
+          <option value="high">Effort: high</option>
+          <option value="xhigh">Effort: xhigh</option>
+          <option value="max">Effort: max</option>
+        </select>
+      </span>
       <span class="view-controls">
         <span class="filter-group" role="group" aria-label="Show message types">
           <button class="turn-toggle icon" data-filter="player" type="button" title="Show player echoes" aria-label="Show player echoes">◇</button>
           <button class="turn-toggle icon" data-filter="tools"  type="button" title="Show tool calls"     aria-label="Show tool calls">⚙</button>
           <button class="turn-toggle icon" data-filter="meta"   type="button" title="Show meta lines"     aria-label="Show meta lines">✦</button>
+        </span>
+        <span class="scroll-group" role="group" aria-label="Scroll behaviour">
+          <button id="play-pin-scroll" class="icon-btn" type="button" title="Pin scroll position: pause auto-scroll during streaming so you can read at your own pace" aria-label="Pin scroll position">📌</button>
         </span>
         <span class="font-group" role="group" aria-label="Narrative font">
           <button id="play-font-family" class="icon-btn" type="button" title="Cycle narrative font" aria-label="Cycle narrative font">Aa</button>
@@ -4315,15 +4571,25 @@ _PLAY_HTML = """
           <button id="play-font-inc"    class="icon-btn" type="button" title="Larger text"  aria-label="Increase narrative text size">A+</button>
         </span>
       </span>
+      <span class="icon-group" role="group" aria-label="Generate illustration">
+        <button id="play-make-pic" type="button" class="icon-btn" title="Make picture: generate an illustration of the last DM reply" aria-label="Make picture">🖼</button>
+        <button id="play-make-pic-hint" type="button" class="icon-btn" title="Make picture with a hint" aria-label="Make picture with a hint">…</button>
+      </span>
+      <span class="icon-group" role="group" aria-label="Per-reply effects">
+        <button id="play-voices" type="button" class="icon-btn" title="Configure narration voices" aria-label="Configure narration voices">🎙</button>
+        <button id="play-suggest" type="button" class="icon-btn" title="Suggest 2-4 next actions after each DM reply" aria-label="Toggle suggested actions">💡</button>
+        <button id="play-bell" type="button" class="icon-btn" title="Play a chime when the DM finishes a response" aria-label="Toggle response chime">🔔</button>
+      </span>
+      <span class="icon-group" role="group" aria-label="Recovery and debug">
+        <button id="play-fetch-last" type="button" class="icon-btn" title="Fetch the last DM reply from the transcript (recovers a response if the SSE stream dropped)" aria-label="Fetch last DM reply">↻</button>
+        <button id="play-audit" type="button" class="icon-btn audit-btn" title="View procedural-fairness audit findings (toggle DM nudge from inside)" aria-label="Open audit panel">
+          <span aria-hidden="true">📋</span>
+          <span class="audit-btn-pip" id="audit-btn-pip" hidden></span>
+        </button>
+        <button id="play-debug" type="button" class="icon-btn" title="Inspect the raw stream-JSON events from claude -p (last 200)" aria-label="Open debug log">🐛</button>
+      </span>
       <span class="spacer"></span>
       <span id="play-status"></span>
-      <button id="play-make-pic" type="button" title="Generate an illustration of the last DM reply">Make picture</button>
-      <button id="play-make-pic-hint" type="button" class="icon-btn" title="Make picture with a hint" aria-label="Make picture with a hint">…</button>
-      <button id="play-voices" type="button" class="icon-btn" title="Configure narration voices" aria-label="Configure narration voices">🎙</button>
-      <button id="play-suggest" type="button" class="icon-btn" title="Suggest 2-4 next actions after each DM reply" aria-label="Toggle suggested actions">💡</button>
-      <button id="play-bell" type="button" class="icon-btn" title="Play a chime when the DM finishes a response" aria-label="Toggle response chime">🔔</button>
-      <button id="play-debug" type="button" class="icon-btn" title="Inspect the raw stream-JSON events from claude -p (last 200)" aria-label="Open debug log">🐛</button>
-      <button id="play-reset" type="button">New session</button>
     </div>
     <dialog id="hint-dialog" class="hint-dialog">
       <form id="hint-form">
@@ -4347,6 +4613,21 @@ _PLAY_HTML = """
         </div>
       </form>
     </dialog>
+    <dialog id="audit-dialog" class="debug-dialog audit-dialog">
+      <h3>Procedural-fairness audit <span class="muted" id="audit-summary">(loading…)</span></h3>
+      <p class="muted">Findings from the post-turn scan: missed reactions, freehand combat, module-canon leaks in narrative, directive language in OOC prompts. See <code>tools/audit.py</code>.</p>
+      <label class="audit-toggle">
+        <input type="checkbox" id="audit-inject-toggle">
+        <span><strong>Inject into DM</strong> — prepend up to 8 new lapses to the next system prompt as a "don't repeat these" addendum (B4). Off by default.</span>
+      </label>
+      <ul class="audit-list audit-dialog-list" id="audit-dialog-list">
+        <li class="muted">(no findings yet)</li>
+      </ul>
+      <div class="actions">
+        <button type="button" id="audit-clear-shown" title="Re-surface every current lapse to the DM on the next turn. Use if you want to retry the nudge after toggling injection back on.">Reset shown</button>
+        <button type="button" id="audit-close">Close</button>
+      </div>
+    </dialog>
     <dialog id="debug-dialog" class="debug-dialog">
       <h3>Stream-JSON events <span class="muted" id="debug-count">(0)</span></h3>
       <p class="muted">Last 200 events from <code>claude -p</code>. Per-turn token + cost are inside each <code>result</code> event's <code>usage</code> field.</p>
@@ -4367,8 +4648,8 @@ _PLAY_HTML = """
     </div>
     <button id="jump-to-bottom" class="jump-btn" type="button" aria-label="Jump to latest" title="Jump to latest">↓</button>
     <form class="play-form" id="play-form">
-      <textarea id="play-input" placeholder="Describe your action…  (Ctrl+Enter to send)" autocomplete="off"></textarea>
-      <button type="submit" id="play-send" title="Send (Ctrl+Enter)" aria-label="Send">
+      <textarea id="play-input" placeholder="Describe your action…  (Enter to send, Shift+Enter for new line)" autocomplete="off"></textarea>
+      <button type="submit" id="play-send" title="Send (Enter)" aria-label="Send">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M3.5 11.6 21 4l-7.5 17-2.2-7.4-7.8-2z"/>
           <path d="m11.3 13.6 4.6-4.6" opacity="0.7"/>
@@ -4394,6 +4675,186 @@ _PLAY_HTML = """
   const send = document.getElementById('play-send');
   const form = document.getElementById('play-form');
   const sidEl = document.getElementById('play-sid');
+  const sidSizeEl = document.getElementById('play-sid-size');
+
+  function fmtSize(bytes) {
+    if (typeof bytes !== 'number' || bytes < 0) return '';
+    if (bytes < 1024) return bytes + 'B';
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + 'K';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + 'M';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + 'G';
+  }
+
+  function fmtTokens(n) {
+    if (typeof n !== 'number' || n < 0) return '';
+    return n < 1000 ? String(n) : (n / 1000).toFixed(n < 10000 ? 1 : 0) + 'k';
+  }
+
+  // Show live context size (tokens) on the session chip — the number that
+  // actually drives cost and the auto-reset, not the inflated file bytes.
+  // Turns amber as it nears the auto-reset threshold, so you can watch it climb.
+  function renderSessionMeta(d) {
+    const tok = d.context_tokens;
+    if (typeof tok !== 'number') {
+      sidSizeEl.textContent = '';
+      sidSizeEl.classList.remove('near-reset');
+      sidSizeEl.removeAttribute('title');
+      return;
+    }
+    sidSizeEl.textContent = fmtTokens(tok);
+    const limit = d.auto_reset_tokens;
+    let title = tok.toLocaleString() + ' tokens of context';
+    if (typeof limit === 'number') {
+      title += ' — auto-resets at ' + limit.toLocaleString()
+            + ' (' + Math.round(100 * tok / limit) + '%) when not in combat';
+      sidSizeEl.classList.toggle('near-reset', tok >= 0.8 * limit);
+    } else {
+      title += ' — auto-reset disabled';
+      sidSizeEl.classList.remove('near-reset');
+    }
+    if (typeof d.size_bytes === 'number') title += '; transcript ' + fmtSize(d.size_bytes);
+    sidSizeEl.title = title;
+  }
+
+  async function refreshSessionSize() {
+    try {
+      const r = await fetch('/play/session');
+      if (!r.ok) return;
+      const d = await r.json();
+      renderSessionMeta(d);
+    } catch (e) { /* best-effort */ }
+  }
+
+  // --- DM tone selector ---------------------------------------------------
+  const toneSel = document.getElementById('play-tone');
+  const toneCustom = document.getElementById('play-tone-custom');
+
+  function applyToneSetting(t) {
+    if (!t || !toneSel) return;
+    const known = [...toneSel.options].some(o => o.value === t.preset);
+    toneSel.value = known ? t.preset : 'classic';
+    toneCustom.value = t.custom || '';
+    toneCustom.hidden = toneSel.value !== 'custom';
+  }
+
+  async function saveTone() {
+    const preset = toneSel.value;
+    const body = preset === 'custom' ? {preset, custom: toneCustom.value} : {preset};
+    try {
+      await fetch('/play/tone', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+    } catch (e) { /* best-effort */ }
+  }
+
+  if (toneSel) {
+    toneSel.addEventListener('change', () => {
+      const isCustom = toneSel.value === 'custom';
+      toneCustom.hidden = !isCustom;
+      if (isCustom) {
+        toneCustom.focus();
+        if (toneCustom.value.trim()) saveTone();  // re-applying an existing custom tone
+      } else {
+        saveTone();
+      }
+    });
+    // Custom text commits on blur or Enter (change event covers both).
+    toneCustom.addEventListener('change', saveTone);
+    toneCustom.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); toneCustom.blur(); }
+    });
+  }
+
+  // --- Narrative detail level slider --------------------------------------
+  const detailSlider = document.getElementById('play-detail');
+  const detailLabel = document.getElementById('play-detail-label');
+  let detailLabels = {0: 'Immersive', 1: 'Light', 2: 'Standard', 3: 'Open table'};
+
+  function applyDetailSetting(d) {
+    if (!d || !detailSlider) return;
+    if (Array.isArray(d.choices)) {
+      detailLabels = {};
+      d.choices.forEach(c => { detailLabels[c.level] = c.label; });
+    }
+    const lvl = (d.detail && typeof d.detail.level === 'number') ? d.detail.level : 2;
+    detailSlider.value = String(lvl);
+    if (detailLabel) detailLabel.textContent = detailLabels[lvl] || '';
+  }
+
+  async function saveDetail() {
+    try {
+      await fetch('/play/detail', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({level: parseInt(detailSlider.value, 10)}),
+      });
+    } catch (e) { /* best-effort */ }
+  }
+
+  if (detailSlider) {
+    detailSlider.addEventListener('input', () => {
+      if (detailLabel) detailLabel.textContent = detailLabels[detailSlider.value] || '';
+    });
+    detailSlider.addEventListener('change', saveDetail);
+  }
+
+  // --- Reasoning effort ---------------------------------------------------
+  const effortSel = document.getElementById('play-effort');
+
+  function applyEffortSetting(e) {
+    if (!effortSel || !e || !e.effort) return;
+    effortSel.value = e.effort;
+  }
+
+  if (effortSel) {
+    effortSel.addEventListener('change', async () => {
+      try {
+        await fetch('/play/effort', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({effort: effortSel.value}),
+        });
+      } catch (err) { /* best-effort */ }
+    });
+  }
+
+  // --- Nav toggles: subheader (toolbar) + party panel ---------------------
+  (function(){
+    const shell = document.querySelector('.play-shell');
+    const toolbar = document.querySelector('.play-toolbar');
+    const side = document.querySelector('.play-side');
+    const tBtn = document.getElementById('nav-toggle-toolbar');
+    const pBtn = document.getElementById('nav-toggle-party');
+
+    function applyToolbar(hidden){
+      if (toolbar) toolbar.style.display = hidden ? 'none' : '';
+      if (tBtn) tBtn.classList.toggle('off', hidden);
+    }
+    function applyParty(hidden){
+      if (side) side.style.display = hidden ? 'none' : '';
+      if (shell) shell.style.gridTemplateColumns = hidden ? 'minmax(0, 1fr)' : '';
+      if (pBtn) pBtn.classList.toggle('off', hidden);
+    }
+
+    let toolbarHidden = localStorage.getItem('play.hide.toolbar') === '1';
+    let partyHidden   = localStorage.getItem('play.hide.party') === '1';
+    applyToolbar(toolbarHidden);
+    applyParty(partyHidden);
+
+    if (tBtn) tBtn.addEventListener('click', () => {
+      toolbarHidden = !toolbarHidden;
+      localStorage.setItem('play.hide.toolbar', toolbarHidden ? '1' : '0');
+      applyToolbar(toolbarHidden);
+    });
+    if (pBtn) pBtn.addEventListener('click', () => {
+      partyHidden = !partyHidden;
+      localStorage.setItem('play.hide.party', partyHidden ? '1' : '0');
+      applyParty(partyHidden);
+    });
+  })();
+
   const statusEl = document.getElementById('play-status');
   const resetBtn = document.getElementById('play-reset');
   const partyList = document.getElementById('party-list');
@@ -4458,7 +4919,16 @@ _PLAY_HTML = """
   function refreshJumpBtn() {
     jumpBtn.classList.toggle('visible', isFarFromBottom());
   }
+  // When the user pins the scroll (📌 in the toolbar), auto-scroll is
+  // suppressed entirely — even from "near bottom" — so they can read
+  // mid-stream without the page chasing the cursor. The jump-to-bottom
+  // button still catches up on demand.
+  let scrollPinned = localStorage.getItem('play.pinScroll') === '1';
   function maybeScrollToBottom() {
+    if (scrollPinned) {
+      refreshJumpBtn();
+      return;
+    }
     if (isNearBottom()) {
       log.scrollTop = log.scrollHeight;
     } else {
@@ -4468,6 +4938,22 @@ _PLAY_HTML = """
   function forceScrollToBottom() {
     log.scrollTop = log.scrollHeight;
     jumpBtn.classList.remove('visible');
+  }
+  const pinBtn = document.getElementById('play-pin-scroll');
+  if (pinBtn) {
+    function reflectPin() {
+      pinBtn.classList.toggle('pin-on', scrollPinned);
+      pinBtn.setAttribute('aria-pressed', String(scrollPinned));
+    }
+    reflectPin();
+    pinBtn.addEventListener('click', () => {
+      scrollPinned = !scrollPinned;
+      localStorage.setItem('play.pinScroll', scrollPinned ? '1' : '0');
+      reflectPin();
+      // When unpinning, also snap to the live cursor — the user just
+      // opted back in to "follow the response".
+      if (!scrollPinned) forceScrollToBottom();
+    });
   }
   log.addEventListener('scroll', refreshJumpBtn);
   // Also re-check after layout changes that aren't a scroll event:
@@ -4501,9 +4987,20 @@ _PLAY_HTML = """
     const out = [];
     let para = [];
 
+    // A whole-paragraph quoted line (with optional italic wrap) renders as
+    // <blockquote> so character speech keeps its distinctive styling even
+    // when the DM omits the `> ` prefix. Matches the escaped form: optional
+    // leading `*`, then a curly or straight opening quote, then anything,
+    // then a matching closing quote, then an optional trailing `*`. Inner
+    // quote chars are allowed — what's required is that the paragraph
+    // begins and ends with a quote (no narration outside).
+    const SPEECH_PARA_RE = /^\\s*\\*?\\s*(?:&quot;|&ldquo;|\\u201C)[\\s\\S]*(?:&quot;|&rdquo;|\\u201D)\\s*\\*?\\s*$/;
+
     function flushPara() {
       if (para.length) {
-        out.push('<p>' + renderInline(para.join(' ')) + '</p>');
+        const joined = para.join(' ');
+        const tag = SPEECH_PARA_RE.test(joined) ? 'blockquote' : 'p';
+        out.push('<' + tag + '>' + renderInline(joined) + '</' + tag + '>');
         para = [];
       }
     }
@@ -4698,7 +5195,7 @@ _PLAY_HTML = """
       glyph: '\\u29C9',  // ⧉
       summary: (i) => {
         const parts = [];
-        for (const d of ['gp','ep','sp','cp']) if (i[d]) parts.push(i[d] + ' ' + d);
+        for (const d of ['pp','gp','ep','sp','cp']) if (i[d]) parts.push(i[d] + ' ' + d);
         return parts.length ? parts.join(', ') : 'treasure';
       },
     },
@@ -4706,7 +5203,7 @@ _PLAY_HTML = """
       glyph: '\\u29C9',
       summary: (i) => {
         const parts = [];
-        for (const d of ['gp','ep','sp','cp']) {
+        for (const d of ['pp','gp','ep','sp','cp']) {
           if (i[d] != null && i[d] !== 0) {
             const sign = i[d] > 0 ? 'pos' : 'neg';
             parts.push('<span class="' + sign + '">' + (i[d] > 0 ? '+' : '') + i[d] + ' ' + d + '</span>');
@@ -5264,7 +5761,8 @@ _PLAY_HTML = """
       debugEvents.splice(0, debugEvents.length - DEBUG_BUFFER_MAX);
     }
     if (evt.type === 'system' && evt.session_id) {
-      sidEl.textContent = evt.session_id.slice(0, 8);
+      sidEl.querySelector('code').textContent = evt.session_id.slice(0, 8);
+      sidEl.href = '/sessions/' + evt.session_id;
     } else if (evt.type === 'stream_event' && evt.event) {
       const ev = evt.event;
       if (ev.type === 'content_block_start' && ev.content_block && ev.content_block.type === 'text') {
@@ -5349,6 +5847,7 @@ _PLAY_HTML = """
       }
       appendMeta(parts.join(' · '), tip.join('\\n'));
       refreshState();
+      refreshSessionSize();
       if (bellEnabled) playBell();
       if (suggestEnabled) fetchSuggestions(lastDmText);
     } else if (evt.type === 'error') {
@@ -5418,7 +5917,7 @@ _PLAY_HTML = """
       partyList.innerHTML = '<div class="muted" style="text-align:center; font-size:0.82em; font-style:italic">No characters in roster.</div>';
       return;
     }
-    partyList.innerHTML = chars.map(c => {
+    partyList.innerHTML = chars.map((c, i) => {
       const pct = c.hp_max > 0 ? Math.max(0, Math.min(100, (c.hp / c.hp_max) * 100)) : 0;
       const ko = (c.hp || 0) <= 0;
       const portrait = c.portrait
@@ -5426,7 +5925,7 @@ _PLAY_HTML = """
         : '<span>' + esc((c.label || '?').slice(0, 1).toUpperCase()) + '</span>';
       const conds = (c.conditions || []).map(x =>
         '<span class="cond-chip">' + esc(x) + '</span>').join('');
-      const cls = [c.cls, c.level].filter(Boolean).join(' ').trim();
+      const cls = [c.alignment, c.cls, c.level].filter(Boolean).join(' ').trim();
       const acStr = (c.ac !== undefined && c.ac !== null) ? 'AC ' + c.ac : '';
       const sub = [cls, acStr].filter(Boolean).join('  \\u00b7  ');
       const sheetUrl = '/sheets/' + encodeURIComponent(c.key || '');
@@ -5447,9 +5946,21 @@ _PLAY_HTML = """
           + '</div>';
       }
 
+      // Reorder handles. Disabled at the ends so the arrow that can't do
+      // anything reads as unavailable rather than silently no-opping.
+      const ordKey = esc(c.key || '');
+      const ordName = esc(c.label || '');
+      const ordHtml = ''
+        + '<div class="party-mini-order">'
+        +   '<button type="button" class="ord-btn" data-key="' + ordKey + '" data-dir="up"'
+        +     (i === 0 ? ' disabled' : '') + ' title="Move up" aria-label="Move ' + ordName + ' up">▴</button>'
+        +   '<button type="button" class="ord-btn" data-key="' + ordKey + '" data-dir="down"'
+        +     (i === chars.length - 1 ? ' disabled' : '') + ' title="Move down" aria-label="Move ' + ordName + ' down">▾</button>'
+        + '</div>';
+
       return ''
         + '<article class="party-mini">'
-        +   '<a class="portrait-frame ' + (ko ? 'kod ' : '') + (c.portrait ? '' : 'empty') + '" href="' + sheetUrl + '" title="Open ' + esc(c.label) + '\\u2019s sheet">' + portrait + '</a>'
+        +   '<div class="portrait-frame ' + (ko ? 'kod ' : '') + (c.portrait ? '' : 'empty') + '"' + (c.portrait ? ' title="Click to enlarge"' : '') + '>' + portrait + '</div>'
         +   '<div class="party-mini-body">'
         +     '<a class="party-mini-name" href="' + sheetUrl + '">' + esc(c.label) + '</a>'
         +     (sub ? '<div class="party-mini-class">' + esc(sub) + '</div>' : '')
@@ -5460,6 +5971,7 @@ _PLAY_HTML = """
         +     xpHtml
         +     (conds ? '<div class="party-mini-conds">' + conds + '</div>' : '')
         +   '</div>'
+        +   ordHtml
         + '</article>';
     }).join('');
   }
@@ -5497,6 +6009,30 @@ _PLAY_HTML = """
     }
   }
 
+  // Party reorder. The server owns the sequence (campaign.json's `characters`
+  // key order), so we POST the move and re-render from /api/play_state.json
+  // rather than shuffling the DOM locally — that keeps the sidebar honest if
+  // the write is rejected or the roster changed underneath us. Delegated,
+  // because renderParty replaces the whole list on every poll.
+  partyList.addEventListener('click', async (e) => {
+    const btn = e.target.closest('.ord-btn');
+    if (!btn || btn.disabled) return;
+    e.preventDefault();
+    partyList.querySelectorAll('.ord-btn').forEach(b => { b.disabled = true; });
+    try {
+      const r = await fetch('/api/party/reorder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: btn.dataset.key, direction: btn.dataset.dir}),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+    } catch (err) {
+      statusEl.textContent = 'reorder failed';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+    }
+    await refreshState();
+  });
+
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     const text = input.value.trim();
@@ -5505,7 +6041,7 @@ _PLAY_HTML = """
     submitTurn(text);
   });
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       form.requestSubmit();
     }
@@ -5513,7 +6049,9 @@ _PLAY_HTML = """
   resetBtn.addEventListener('click', async () => {
     if (!confirm('Start a new DM session? The current conversation will no longer be resumed.')) return;
     await fetch('/play/reset', {method: 'POST'});
-    sidEl.textContent = '(new)';
+    sidEl.querySelector('code').textContent = '(new)';
+    sidEl.href = '#';
+    renderSessionMeta({context_tokens: null});
     append('meta', 'new session started');
   });
 
@@ -5869,7 +6407,12 @@ _PLAY_HTML = """
   });
 
   fetch('/play/session').then(r => r.json()).then(d => {
-    sidEl.textContent = d.session_id ? d.session_id.slice(0, 8) : '(new)';
+    sidEl.querySelector('code').textContent = d.session_id ? d.session_id.slice(0, 8) : '(new)';
+    sidEl.href = d.session_id ? '/sessions/' + d.session_id : '#';
+    renderSessionMeta(d);
+    applyToneSetting(d.tone);
+    applyDetailSetting({detail: d.detail, choices: d.detail_choices});
+    applyEffortSetting(d.effort);
   });
 
   // ------------------------------------------------------------------
@@ -5980,8 +6523,30 @@ _PLAY_HTML = """
         append('dm', d.text);
         lastDmText = d.text;
         refreshState();
+        return 'appended';
       }
-    } catch (e) { /* ignore */ }
+      return d && d.text ? 'unchanged' : 'empty';
+    } catch (e) { return 'error'; }
+  }
+  const fetchLastBtn = document.getElementById('play-fetch-last');
+  if (fetchLastBtn) {
+    fetchLastBtn.addEventListener('click', async () => {
+      fetchLastBtn.disabled = true;
+      const orig = statusEl.textContent;
+      statusEl.textContent = 'fetching last reply…';
+      const outcome = await refreshLastNarrative();
+      const msg = {
+        appended: 'recovered last DM reply',
+        unchanged: 'already up to date',
+        empty: 'no DM reply in transcript',
+        error: 'fetch failed',
+      }[outcome] || '';
+      statusEl.textContent = msg;
+      setTimeout(() => {
+        if (statusEl.textContent === msg) statusEl.textContent = orig;
+        fetchLastBtn.disabled = false;
+      }, 2000);
+    });
   }
   async function pollTurnState() {
     try {
@@ -6016,6 +6581,114 @@ _PLAY_HTML = """
   // Background refresh — picks up MCP-tool mutations made outside the turn flow.
   setInterval(refreshState, 20000);
 
+  // ----- Audit dialog (procedural-fairness findings, post-turn) -----
+  const auditBtn      = document.getElementById('play-audit');
+  const auditBtnPip   = document.getElementById('audit-btn-pip');
+  const auditDialog   = document.getElementById('audit-dialog');
+  const auditSummary  = document.getElementById('audit-summary');
+  const auditDlgList  = document.getElementById('audit-dialog-list');
+  const auditInject   = document.getElementById('audit-inject-toggle');
+  const auditClearShown = document.getElementById('audit-clear-shown');
+  const auditClose    = document.getElementById('audit-close');
+  let auditSnap = null;
+
+  function renderAuditPip(snap) {
+    const findings = (snap && snap.findings) || [];
+    const lapses   = findings.filter(f => f.severity === 'lapse').length;
+    const warnings = findings.filter(f => f.severity === 'warning').length;
+    if (!lapses && !warnings) {
+      auditBtnPip.hidden = true;
+      auditBtnPip.className = 'audit-btn-pip';
+      return;
+    }
+    auditBtnPip.hidden = false;
+    auditBtnPip.className = 'audit-btn-pip' + (lapses ? '' : ' has-warning');
+  }
+
+  function renderAuditDialog(snap) {
+    const findings = (snap && snap.findings) || [];
+    const lapses   = findings.filter(f => f.severity === 'lapse').length;
+    const warnings = findings.filter(f => f.severity === 'warning').length;
+    const infos    = findings.filter(f => f.severity === 'info').length;
+    const parts = [];
+    if (lapses)   parts.push(lapses + ' lapse' + (lapses > 1 ? 's' : ''));
+    if (warnings) parts.push(warnings + ' warning' + (warnings > 1 ? 's' : ''));
+    if (infos)    parts.push(infos + ' note' + (infos > 1 ? 's' : ''));
+    auditSummary.textContent = parts.length ? '(' + parts.join(', ') + ')' : '(no findings)';
+
+    if (!findings.length) {
+      auditDlgList.innerHTML = '<li class="muted">(no findings — DM is clean so far)</li>';
+    } else {
+      auditDlgList.innerHTML = findings.map(f => {
+        const sev = esc(f.severity || 'info');
+        const kind = esc((f.kind || '').replace(/_/g, ' '));
+        const slug = f.slug ? ' <span class="audit-slug">' + esc(f.slug) + '</span>' : '';
+        const fix = f.fix ? ' — ' + esc(f.fix) : '';
+        return '<li class="audit-item sev-' + sev + '">'
+          + '<span class="audit-kind">' + kind + '</span>:'
+          + slug + fix
+          + '</li>';
+      }).join('');
+    }
+
+    // Sync the inject toggle from server-side settings.
+    const inject = !!(snap && snap.settings && snap.settings.inject_addendum);
+    auditInject.checked = inject;
+  }
+
+  async function refreshAudit() {
+    try {
+      const r = await fetch('/api/audit_live.json');
+      if (!r.ok) return;
+      auditSnap = await r.json();
+      renderAuditPip(auditSnap);
+      // Only refresh the dialog DOM when it's open — keep cycles down.
+      if (auditDialog.open) renderAuditDialog(auditSnap);
+    } catch (e) { /* best-effort */ }
+  }
+
+  auditBtn.addEventListener('click', () => {
+    renderAuditDialog(auditSnap || {findings: [], settings: {}});
+    if (typeof auditDialog.showModal === 'function') auditDialog.showModal();
+  });
+  auditClose.addEventListener('click', () => auditDialog.close());
+
+  auditInject.addEventListener('change', async () => {
+    const orig = auditInject.checked;
+    try {
+      const r = await fetch('/api/audit_settings', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({inject_addendum: orig}),
+      });
+      if (!r.ok) throw new Error('save failed');
+      const d = await r.json();
+      auditInject.checked = !!(d.settings && d.settings.inject_addendum);
+    } catch (e) {
+      // Revert on failure
+      auditInject.checked = !orig;
+    }
+  });
+
+  auditClearShown.addEventListener('click', async () => {
+    const orig = auditClearShown.textContent;
+    auditClearShown.disabled = true;
+    auditClearShown.textContent = 'Resetting…';
+    try {
+      await fetch('/api/audit_clear_shown', {method: 'POST'});
+      auditClearShown.textContent = 'Reset ✓';
+    } catch (e) {
+      auditClearShown.textContent = 'Failed';
+    }
+    setTimeout(() => {
+      auditClearShown.textContent = orig;
+      auditClearShown.disabled = false;
+    }, 1400);
+  });
+
+  refreshAudit();
+  setInterval(refreshAudit, 5000);
+
   input.focus();
 })();
 </script>
@@ -6029,7 +6702,62 @@ def play_page():
 
 @app.route("/play/session")
 def play_session_id():
-    return jsonify({"session_id": _dm.session_id()})
+    sid = _dm.session_id()
+    size_bytes = None
+    context_tokens = None
+    if sid:
+        p = _dm._project_jsonl_dir() / f"{sid}.jsonl"
+        try:
+            size_bytes = p.stat().st_size
+        except OSError:
+            size_bytes = None
+        context_tokens = _dm._session_context_tokens(sid)
+    return jsonify({
+        "session_id": sid,
+        "size_bytes": size_bytes,
+        "context_tokens": context_tokens,
+        "auto_reset_tokens": _dm._AUTO_RESET_TOKENS if _dm._AUTO_RESET_ENABLED else None,
+        "tone": _dm.tone_setting(),
+        "detail": _dm.detail_setting(),
+        "detail_choices": _dm.detail_choices(),
+        "effort": _dm.effort_setting(),
+        "effort_choices": _dm.effort_choices(),
+    })
+
+
+@app.route("/play/tone", methods=["POST"])
+def play_set_tone():
+    """Persist the active campaign's DM narration tone. Body:
+    {"preset": <key>, "custom": <text>}. The directive is injected into every
+    subsequent DM turn's system prompt; takes effect on the next turn."""
+    data = request.get_json(silent=True) or {}
+    setting = _dm.set_tone(preset=data.get("preset"), custom=data.get("custom"))
+    return jsonify({"ok": True, "tone": setting})
+
+
+@app.route("/play/detail", methods=["POST"])
+def play_set_detail():
+    """Persist the active campaign's narrative detail level. Body:
+    {"level": 0-3}. Controls how much raw mechanical detail (coin counts,
+    ability scores, stat-block values) the DM exposes in prose; injected into
+    every subsequent turn's system prompt. Takes effect on the next turn."""
+    data = request.get_json(silent=True) or {}
+    setting = _dm.set_detail_level(data.get("level"))
+    return jsonify({"ok": True, "detail": setting})
+
+
+@app.route("/play/effort", methods=["POST"])
+def play_set_effort():
+    """Persist the active campaign's DM reasoning effort. Body:
+    {"effort": "auto"|"low"|"medium"|"high"|"xhigh"|"max"}.
+
+    "auto" lets the driver pick per turn — full effort for a live combat, a
+    multi-NPC scene or a staged plan, cheap effort for routine turns. A pinned
+    level applies to every turn. Changing this replaces the resident CLI
+    process on the next turn, so it takes effect immediately."""
+    data = request.get_json(silent=True) or {}
+    setting = _dm.set_effort(data.get("effort"))
+    return jsonify({"ok": True, "effort": setting})
 
 
 @app.route("/play/reset", methods=["POST"])
@@ -6052,12 +6780,106 @@ def api_play_state():
     return jsonify(_play_state())
 
 
+@app.route("/api/party/reorder", methods=["POST"])
+def api_party_reorder():
+    """Reorder the party sequence. Body is either
+
+        {"key": "<char key>", "direction": "up"|"down"}   — move one slot
+        {"order": ["<key>", ...]}                          — apply a sequence
+
+    The sequence *is* campaign.json's `characters` key order — the /play
+    sidebar, the Cast page, the statusline and `start_combat` all iterate that
+    dict — so this rewrites the object with its keys in the new order and
+    leaves every character record untouched."""
+    if not cfg:
+        return jsonify({"error": "no active campaign"}), 400
+    data = request.get_json(silent=True) or {}
+
+    # Read campaign.json straight off disk rather than writing back the
+    # dashboard's in-memory cfg: the MCP tools write this same file from
+    # another process during play, and a stale in-memory copy would clobber a
+    # quest or NPC added seconds ago. We reorder `characters` on the fresh
+    # document and leave every other key exactly as we found it.
+    path = cfg["_dir"] / "campaign.json"
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return jsonify({"error": f"cannot read campaign.json: {exc}"}), 500
+
+    chars = doc.get("characters") or {}
+    keys = list(chars)
+    if not keys:
+        return jsonify({"error": "no characters in roster"}), 400
+
+    explicit = data.get("order")
+    if explicit is not None:
+        if (not isinstance(explicit, list) or len(explicit) != len(keys)
+                or set(map(str, explicit)) != set(keys)):
+            return jsonify({"error": "order must be a permutation of the roster keys"}), 400
+        new_keys = [str(k) for k in explicit]
+    else:
+        key = str(data.get("key") or "")
+        direction = str(data.get("direction") or "").lower()
+        if key not in chars:
+            return jsonify({"error": f"unknown character key '{key}'"}), 404
+        if direction not in ("up", "down"):
+            return jsonify({"error": "direction must be 'up' or 'down'"}), 400
+        i = keys.index(key)
+        j = i - 1 if direction == "up" else i + 1
+        if not 0 <= j < len(keys):
+            # Already at that end. A no-op rather than an error, so a stray
+            # click on an end-of-list arrow costs nothing.
+            return jsonify({"ok": True, "order": keys, "moved": False})
+        new_keys = keys[:]
+        new_keys[i], new_keys[j] = new_keys[j], new_keys[i]
+
+    doc["characters"] = {k: chars[k] for k in new_keys}
+    _c.atomic_write_text(path, json.dumps(doc, indent=2))
+    _reload_cfg()          # pick the new order up for this process straight away
+    return jsonify({"ok": True, "order": new_keys, "moved": True})
+
+
 @app.route("/api/last_narrative")
 def api_last_narrative():
     """Return the most recent DM text from the resumed Claude Code session,
     so the /play surface can replay it on reload. Returns {"text": null} when
     there's no session, no transcript, or no recorded DM prose yet."""
     return jsonify({"text": _dm.last_dm_text()})
+
+
+@app.route("/api/audit_live.json")
+def api_audit_live():
+    """Return the latest post-turn audit snapshot for the active campaign.
+    Refreshed asynchronously after each DM turn (see tools/dm_session.py
+    `_audit_after_turn`). Returns {"findings": [], ...} when no audit has
+    run yet, or an empty payload when no campaign is active."""
+    snap = _dm.latest_audit()
+    if snap is None:
+        snap = {"findings": [], "summary": "", "session": None, "timestamp": None}
+    # Attach the campaign's audit settings so the UI can render the
+    # toggle state without a second roundtrip.
+    snap = dict(snap)
+    snap["settings"] = _dm.audit_settings()
+    return jsonify(snap)
+
+
+@app.route("/api/audit_settings", methods=["POST"])
+def api_audit_settings():
+    """Update the active campaign's audit settings. Accepts JSON body
+    with any of the known keys (currently: ``inject_addendum``). Returns
+    the merged result. Unknown keys are silently dropped."""
+    data = request.get_json(silent=True) or {}
+    result = _dm.set_audit_settings(**{k: bool(v) for k, v in data.items()})
+    return jsonify({"settings": result})
+
+
+@app.route("/api/audit_clear_shown", methods=["POST"])
+def api_audit_clear_shown():
+    """Reset the shown-findings tracker so the next turn re-surfaces every
+    current lapse via the addendum. Used when the user wants to retry the
+    nudge — e.g. after toggling injection back on after a quiet period."""
+    _dm.clear_shown_findings()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/history")
@@ -6550,6 +7372,27 @@ def _extract_alignment(content: str) -> str:
     return ""
 
 
+_ALIGN_ABBREV_MAP = {
+    "lawful good": "LG", "lawful neutral": "LN", "lawful evil": "LE",
+    "neutral good": "NG", "true neutral": "TN", "neutral": "N", "neutral evil": "NE",
+    "chaotic good": "CG", "chaotic neutral": "CN", "chaotic evil": "CE",
+}
+_VALID_ABBREVS = {"LG", "LN", "LE", "NG", "TN", "N", "NE", "CG", "CN", "CE"}
+
+
+def _alignment_abbrev(value: str) -> str:
+    """Normalize an alignment (full label like 'Neutral Good' or an existing
+    short code like 'NG') to a compact code for sidebar display. '' if empty
+    or unrecognized."""
+    t = (value or "").strip()
+    if not t:
+        return ""
+    up = t.upper().replace(".", "")
+    if up in _VALID_ABBREVS:
+        return up
+    return _ALIGN_ABBREV_MAP.get(t.lower(), "")
+
+
 def _memorized_panel(memorized: list) -> str:
     """Memorized spells grouped by level. Returns panel-body HTML (or "")."""
     if not memorized:
@@ -6842,7 +7685,7 @@ def mount_detail(slug: str):
         panels.append(_sheet_panel("Notes", hint))
 
     body = '<div class="sheet">' + header + "".join(panels) + '</div>'
-    body += '<p class="muted" style="margin-top:18px"><a href="/party">← back to Party</a></p>'
+    body += '<p class="muted" style="margin-top:18px"><a href="/characters">← back to Cast</a></p>'
     body += _HOLDING_DETAIL_JS
     return render(f"{html.escape(name)} — {html.escape(cfg.get('name','Campaign'))}", body)
 
@@ -6934,7 +7777,7 @@ def house_detail(slug: str):
         panels.append(_sheet_panel("Notes", hint))
 
     body = '<div class="sheet">' + header + "".join(panels) + '</div>'
-    body += '<p class="muted" style="margin-top:18px"><a href="/party">← back to Party</a></p>'
+    body += '<p class="muted" style="margin-top:18px"><a href="/characters">← back to Cast</a></p>'
     body += _HOLDING_DETAIL_JS
     return render(f"{html.escape(name)} — {html.escape(cfg.get('name','Campaign'))}", body)
 
@@ -6978,35 +7821,190 @@ def characters():
     chars_dir = cfg["_data_dir"] / "characters"
     index = _load_image_index()
 
+    # Live party panel (PCs) sits above the full cast grid.
+    party_section = _party_body(heading_tag="h2", heading_text="Party")
+    # PC record keys — so party members aren't also listed in the cast grid.
+    pc_keys = set(cfg.get("characters", {}).keys())
+    page_title = f"{campaign_name} — Cast"
+
     if not chars_dir.exists():
-        body = f"<h1>{html.escape(campaign_name)} — Characters</h1><p class='muted'>No characters yet.</p>"
-        return render(f"{campaign_name} — Characters", body)
+        body = f"<h1>{html.escape(page_title)}</h1>" + party_section
+        return render(page_title, body)
+
+    meta = _c.load_character_meta(cfg)
+    npcs = cfg.get("npcs", {})
 
     cards = []
+    locations: set[str] = set()
+    chapters: set[str] = set()
+    dispositions: set[str] = set()
     for md in sorted(chars_dir.glob("*.md")):
+        slug = md.stem
+        if slug in pc_keys:        # already shown in the live Party panel
+            continue
         name = _read_first_heading(md)
         blurb = _read_first_paragraph(md)
-        slug = md.stem
         portrait = _find_portrait(name, index, slug)
+
+        m = meta.get(slug, {})
+        loc = (m.get("location") or "").strip()
+        chap = (m.get("chapter") or "").strip()
+        if loc:
+            locations.add(loc)
+        if chap:
+            chapters.add(chap)
+
+        # Disposition toward the party (from campaign.json["npcs"]).
+        nd = npcs.get(slug) or {}
+        disp_band = None
+        if "disposition" in nd:
+            disp_band = _c.disposition_band(nd["disposition"])
+            dispositions.add(disp_band["label"])
 
         img_html = ""
         if portrait:
             fn = html.escape(portrait["filename"])
             img_html = f'<img src="/images/{fn}" alt="{html.escape(name)}" class="portrait">'
 
+        tags = []
+        if disp_band:
+            v = disp_band["value"]
+            tags.append(
+                f'<span class="char-tag disp" '
+                f'style="border-color:{disp_band["color"]};color:{disp_band["color"]}">'
+                f'{html.escape(disp_band["label"])} ({v:+d})</span>'
+            )
+        if loc:
+            tags.append(f'<span class="char-tag">📍 {html.escape(loc)}</span>')
+        if chap:
+            tags.append(f'<span class="char-tag">📖 {html.escape(chap)}</span>')
+        tags_html = f'<p class="char-tags">{"".join(tags)}</p>' if tags else ""
+
         cards.append(
-            f'<div class="card clearfix">'
+            f'<div class="card clearfix char-card" '
+            f'data-name="{html.escape(name.lower())}" '
+            f'data-blurb="{html.escape(blurb.lower())}" '
+            f'data-location="{html.escape(loc)}" '
+            f'data-chapter="{html.escape(chap)}" '
+            f'data-disposition="{html.escape(disp_band["label"]) if disp_band else ""}">'
             f"{img_html}"
             f'<h2><a href="/sheets/{html.escape(slug)}">{html.escape(name)}</a></h2>'
             f"<p>{_inline(html.escape(blurb))}</p>"
+            f"{tags_html}"
             f"</div>"
         )
 
-    body = (
-        f"<h1>{html.escape(campaign_name)} — Characters</h1>"
-        + ("".join(cards) if cards else "<p class='muted'>No characters yet.</p>")
+    if not cards:
+        body = (
+            f"<h1>{html.escape(page_title)}</h1>"
+            + party_section
+            + "<h2>All Characters</h2>"
+            "<p class='muted'>No other characters recorded yet.</p>"
+        )
+        return render(page_title, body)
+
+    def _opts(values: set[str]) -> str:
+        out = ['<option value="">All</option>']
+        for v in sorted(values, key=str.lower):
+            out.append(f'<option value="{html.escape(v)}">{html.escape(v)}</option>')
+        return "".join(out)
+
+    loc_filter = (
+        f'<select id="char-loc" aria-label="Filter by location">{_opts(locations)}</select>'
+        if locations else ""
     )
-    return render(f"{campaign_name} — Characters", body)
+    chap_filter = (
+        f'<select id="char-chap" aria-label="Filter by chapter">{_opts(chapters)}</select>'
+        if chapters else ""
+    )
+    # Disposition options are ordered by the band scale (Devoted → Sworn
+    # enemy), not alphabetically — only bands with members are listed.
+    def _disp_opts(present: set[str]) -> str:
+        out = ['<option value="">All</option>']
+        for label in _c.disposition_band_order():
+            if label in present:
+                out.append(f'<option value="{html.escape(label)}">{html.escape(label)}</option>')
+        return "".join(out)
+
+    disp_filter = (
+        f'<select id="char-disp" aria-label="Filter by disposition">{_disp_opts(dispositions)}</select>'
+        if dispositions else ""
+    )
+
+    controls = (
+        '<div class="char-controls">'
+        '<input type="search" id="char-search" placeholder="Search characters…" aria-label="Search characters">'
+        + (f'<label>📍 {loc_filter}</label>' if loc_filter else "")
+        + (f'<label>📖 {chap_filter}</label>' if chap_filter else "")
+        + (f'<label>🤝 {disp_filter}</label>' if disp_filter else "")
+        + '<span id="char-count" class="muted"></span>'
+        "</div>"
+    )
+
+    grid = f'<div id="char-grid">{"".join(cards)}</div>'
+    no_match = '<p id="char-nomatch" class="muted" hidden>No characters match.</p>'
+
+    script = """
+<style>
+  .char-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 12px 0 20px; }
+  .char-controls input[type=search] { flex: 1; min-width: 180px; padding: 6px 10px; font: inherit;
+    background: var(--panel-2, #1b1b1b); color: var(--ink, #e8e2d0);
+    border: 1px solid var(--border, #3a3a3a); border-radius: 6px; }
+  .char-controls select { padding: 5px 8px; font: inherit; background: var(--panel-2, #1b1b1b);
+    color: var(--ink, #e8e2d0); border: 1px solid var(--border, #3a3a3a); border-radius: 6px; }
+  .char-controls label { display: inline-flex; align-items: center; gap: 4px; font-size: 0.9em; }
+  .char-tags { margin: 6px 0 0; }
+  .char-tag { display: inline-block; font-size: 0.78em; opacity: 0.8; margin-right: 8px;
+    padding: 1px 6px; border: 1px solid var(--rule, #3a3a3a); border-radius: 10px; }
+  .char-tag.disp { opacity: 1; font-weight: 500; }
+  .char-card[hidden] { display: none; }
+</style>
+<script>
+(function(){
+  const search = document.getElementById('char-search');
+  const locSel = document.getElementById('char-loc');
+  const chapSel = document.getElementById('char-chap');
+  const dispSel = document.getElementById('char-disp');
+  const cards = Array.from(document.querySelectorAll('.char-card'));
+  const count = document.getElementById('char-count');
+  const noMatch = document.getElementById('char-nomatch');
+
+  function apply(){
+    const q = (search.value || '').trim().toLowerCase();
+    const loc = locSel ? locSel.value : '';
+    const chap = chapSel ? chapSel.value : '';
+    const disp = dispSel ? dispSel.value : '';
+    let shown = 0;
+    cards.forEach(c => {
+      const okText = !q || c.dataset.name.includes(q) || c.dataset.blurb.includes(q);
+      const okLoc = !loc || c.dataset.location === loc;
+      const okChap = !chap || c.dataset.chapter === chap;
+      const okDisp = !disp || c.dataset.disposition === disp;
+      const ok = okText && okLoc && okChap && okDisp;
+      c.hidden = !ok;
+      if (ok) shown++;
+    });
+    if (count) count.textContent = shown + ' of ' + cards.length;
+    if (noMatch) noMatch.hidden = shown !== 0;
+  }
+
+  let t = null;
+  search.addEventListener('input', () => { clearTimeout(t); t = setTimeout(apply, 120); });
+  if (locSel) locSel.addEventListener('change', apply);
+  if (chapSel) chapSel.addEventListener('change', apply);
+  if (dispSel) dispSel.addEventListener('change', apply);
+  apply();
+})();
+</script>
+"""
+
+    body = (
+        f"<h1>{html.escape(page_title)}</h1>"
+        + party_section
+        + "<h2>All Characters</h2>"
+        + controls + grid + no_match + script
+    )
+    return render(page_title, body)
 
 
 @app.route("/locations")
@@ -7173,7 +8171,8 @@ def api_session_activate(sid: str):
 @app.route("/api/sessions/<sid>", methods=["DELETE"])
 def api_session_delete(sid: str):
     """Delete a Claude Code session JSONL transcript and the matching
-    campaigns/_session-logs/<sid>.md export if one exists.
+    campaigns/<slug>/_session-logs/<sid>.md export if one exists.
+    Also strips the sid from every campaign's sessions.json manifest.
     Validates the session id against the same charset the /sessions/<sid>
     viewer accepts."""
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", sid):
@@ -7188,17 +8187,28 @@ def api_session_delete(sid: str):
     except OSError as exc:
         return jsonify({"error": f"transcript delete failed: {exc}"}), 500
 
+    # Strip from every manifest (sid may have been mis-attributed historically;
+    # the loop keeps the index clean across campaigns).
+    from tools import session_manifest as _smf
+    for slug in _smf.list_campaign_slugs() + [_smf._UNSORTED_SLUG]:
+        _dm.remove_session_from_manifest(slug, sid)
+
     # Best-effort: also remove the corresponding markdown export written by
-    # the SessionEnd hook (campaigns/_session-logs/<sid>.md). Failures here
+    # the SessionEnd hook. Check the active campaign first, then any other
+    # campaign-scoped dir, then the legacy shared location. Failures here
     # don't fail the response — the primary JSONL is gone.
-    log_md = Path(__file__).parent / "campaigns" / "_session-logs" / f"{sid}.md"
     log_removed = False
-    if log_md.is_file():
-        try:
-            log_md.unlink()
-            log_removed = True
-        except OSError:
-            pass
+    candidates = []
+    for slug in _smf.list_campaign_slugs():
+        candidates.append(_campaign_session_md_dir(slug) / f"{sid}.md")
+    candidates.append(Path(__file__).parent / "campaigns" / "_session-logs" / f"{sid}.md")
+    for log_md in candidates:
+        if log_md.is_file():
+            try:
+                log_md.unlink()
+                log_removed = True
+            except OSError:
+                pass
 
     return jsonify({"ok": True, "deleted": sid, "log_removed": log_removed})
 
@@ -7245,12 +8255,14 @@ def api_sessions_search():
     sdir = _sessions_dir()
     if not sdir.is_dir():
         return jsonify({"query": q, "terms": terms, "results": []})
+    if not _active_campaign_slug():
+        return jsonify({"query": q, "terms": terms, "results": []})
 
     MAX_PER_SESSION = 5
     MAX_RESULTS = 50
 
     results = []
-    for path in _export.list_sessions(sdir):
+    for path in _active_campaign_session_paths():
         matches = []
         match_count = 0
         try:
@@ -7437,10 +8449,14 @@ SELECT_STYLE = (
     'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
     'padding:6px 10px;border-radius:4px;font-size:1em"'
 )
-INPUT_STYLE = (
-    'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
-    'padding:6px 10px;border-radius:4px;width:220px;font-size:1em"'
+# Raw CSS (no ``style="…"`` wrapper) so callers can append extra declarations,
+# e.g. ``style="{_INPUT_CSS};width:100%"``. INPUT_STYLE is the ready-to-drop-in
+# attribute form for the common case (a standalone ``{INPUT_STYLE}`` in a tag).
+_INPUT_CSS = (
+    'background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
+    'padding:6px 10px;border-radius:4px;width:220px;font-size:1em'
 )
+INPUT_STYLE = f'style="{_INPUT_CSS}"'
 BTN_STYLE = (
     'style="background:#3a2818;border:1px solid #5a4030;color:#c8a96e;'
     'padding:6px 14px;border-radius:4px;cursor:pointer"'
@@ -7981,6 +8997,30 @@ def class_detail(slug: str):
 
 _COMBAT_CSS = """
 <style>
+  /* dungml fog controls. The pill is the at-a-glance answer to "is a play
+     session driving this map?" — amber when fogged, blue on the GM view,
+     grey when the tab has fallen back to the plain local render. */
+  .fog-pill {
+    font-size: .74em; letter-spacing: .04em; text-transform: uppercase;
+    padding: 2px 8px; border-radius: 9px; border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .fog-pill.fog-on   { color:#e8c88a; border-color:#6b5426; background:#2a2114; }
+  .fog-pill.fog-gm   { color:#9fc4e8; border-color:#2f4a63; background:#141d26; }
+  .fog-pill.fog-off  { color:#7a7266; border-color:#332e26; background:#1d1a15; }
+  .fog-select {
+    background:#1d1a15; color:#d4c5a9; border:1px solid #3a332a;
+    border-radius:4px; font-size:.8em; padding:2px 4px; max-width:200px;
+  }
+  .fog-toggle { display:inline-flex; gap:2px; }
+  .fog-toggle .zoom-btn.is-active {
+    background:#3a2f1c; color:#e8c88a; border-color:#6b5426;
+  }
+</style>
+"""
+
+_COMBAT_CSS_BASE = """
+<style>
 .container{max-width:1400px}
 .combat-layout{display:flex;gap:20px;align-items:flex-start;flex-wrap:nowrap}
 .combat-canvas-wrap{flex:1 1 auto;overflow:hidden;min-width:0;height:560px;
@@ -8005,6 +9045,8 @@ _COMBAT_CSS = """
 .init-val{color:#8a7a60;font-size:.85em;font-family:monospace;margin-left:6px;flex-shrink:0}
 </style>
 """
+
+_COMBAT_CSS = _COMBAT_CSS + _COMBAT_CSS_BASE
 
 _COMBAT_JS = (
     'var map = new CombatMap(document.getElementById("cmap"), {cellPx: 36});\n'
@@ -8032,21 +9074,164 @@ _COMBAT_JS = (
     '  document.getElementById("coords").textContent = \'place_combatant("name", \'+x+", "+y+")";\n'
     '};\n'
     '\n'
+    '// Cached DSL from the last /combat-state poll. The "Copy DSL"\n'
+    '// button reads from here so the user always gets the most recent\n'
+    '// version (positions, HP-derived tags, etc.).\n'
+    'var _currentDsl = null;\n'
+    '\n'
+    'var copyBtn = document.getElementById("copy-dsl-btn");\n'
+    'if (copyBtn) {\n'
+    '  copyBtn.addEventListener("click", async function() {\n'
+    '    if (!_currentDsl) {\n'
+    '      copyBtn.textContent = "No DSL";\n'
+    '      setTimeout(function(){ copyBtn.textContent = "Copy DSL"; }, 1500);\n'
+    '      return;\n'
+    '    }\n'
+    '    try {\n'
+    '      await navigator.clipboard.writeText(_currentDsl);\n'
+    '      copyBtn.textContent = "Copied ✓";\n'
+    '    } catch(e) {\n'
+    '      // Fallback for browsers/contexts without async clipboard\n'
+    '      // (typically http:// without secure context). Use the legacy\n'
+    '      // execCommand hack with a hidden textarea.\n'
+    '      var ta = document.createElement("textarea");\n'
+    '      ta.value = _currentDsl;\n'
+    '      ta.style.position = "fixed";\n'
+    '      ta.style.opacity = "0";\n'
+    '      document.body.appendChild(ta);\n'
+    '      ta.focus();\n'
+    '      ta.select();\n'
+    '      var ok = false;\n'
+    '      try { ok = document.execCommand("copy"); } catch(_) {}\n'
+    '      document.body.removeChild(ta);\n'
+    '      copyBtn.textContent = ok ? "Copied ✓" : "Copy failed";\n'
+    '    }\n'
+    '    setTimeout(function(){ copyBtn.textContent = "Copy DSL"; }, 1500);\n'
+    '  });\n'
+    '}\n'
+    '\n'
+    '\n'
+    '// ── dungml fog-of-war view ────────────────────────────────────────────\n'
+    '// When a play session is connected the map background comes from\n'
+    '// dmap-server (fogged to what the party has discovered) instead of the\n'
+    '// flat render create_map cached locally. Geometry still comes from the\n'
+    '// session block, so tokens land on the same cells either way.\n'
+    'var _fogPill   = document.getElementById("fog-pill");\n'
+    'var _fogView   = document.getElementById("fog-view");\n'
+    'var _fogLocale = document.getElementById("fog-locale");\n'
+    'var _localesLoaded = false;\n'
+    '\n'
+    'function fogState(data, dm) {\n'
+    '  if (!dm || !dm.connected || !dm.width || !dm.height) return data;\n'
+    '  var base = data.grid || {};\n'
+    '  var g = {};\n'
+    '  for (var k in base) g[k] = base[k];\n'
+    '  g.width   = dm.width;\n'
+    '  g.height  = dm.height;\n'
+    '  g.scale   = base.scale || "5ft";\n'
+    '  // ?v= is the render fingerprint: it changes when fog burns off, the\n'
+    '  // party moves, or the scope flips, and only then.\n'
+    '  g.svg_url = dm.render_url + "?v=" + encodeURIComponent(dm.version || "0");\n'
+    '  var out = {};\n'
+    '  for (var k2 in data) out[k2] = data[k2];\n'
+    '  out.grid = g;\n'
+    '  return out;\n'
+    '}\n'
+    '\n'
+    'function updateFogUi(dm) {\n'
+    '  if (!_fogPill) return;\n'
+    '  var on = dm && dm.connected;\n'
+    '  var gm = on && dm.scope === "gm";\n'
+    '  _fogPill.className = "fog-pill " + (gm ? "fog-gm" : on ? "fog-on" : "fog-off");\n'
+    '  if (on) {\n'
+    '    var where = dm.map_name || "combat map";\n'
+    '    _fogPill.textContent = (gm ? "GM view" : "fog of war") + " · " + where;\n'
+    '    _fogPill.title = dm.party_node\n'
+    '      ? "party at " + dm.party_node\n'
+    '      : "no party marker set — use dungml_party_at";\n'
+    '  } else {\n'
+    '    _fogPill.textContent = (dm && dm.reachable) ? "no fog session" : "map service offline";\n'
+    '    _fogPill.title = (dm && dm.detail) || "";\n'
+    '  }\n'
+    '  if (_fogView) {\n'
+    '    _fogView.style.display = on ? "inline-flex" : "none";\n'
+    '    var btns = _fogView.querySelectorAll("button");\n'
+    '    for (var i = 0; i < btns.length; i++) {\n'
+    '      var active = btns[i].getAttribute("data-scope") === (dm.scope || "fog");\n'
+    '      btns[i].classList.toggle("is-active", active);\n'
+    '    }\n'
+    '  }\n'
+    '  if (_fogLocale) {\n'
+    '    _fogLocale.style.display = (dm && dm.reachable) ? "" : "none";\n'
+    '    if (dm && dm.reachable && !_localesLoaded) { _localesLoaded = true; loadLocales(dm); }\n'
+    '  }\n'
+    '}\n'
+    '\n'
+    'async function loadLocales(dm) {\n'
+    '  try {\n'
+    '    var r = await fetch("/combat-fog-locales");\n'
+    '    var d = await r.json();\n'
+    '    var cur = d.map_id || "combat";\n'
+    '    var opts = [\'<option value="combat">Combat map (pushed)</option>\'];\n'
+    '    (d.locales || []).forEach(function(m) {\n'
+    '      opts.push(\'<option value="\' + m.map_id + \'">\' + (m.name || m.map_id) + "</option>");\n'
+    '    });\n'
+    '    _fogLocale.innerHTML = opts.join("");\n'
+    '    _fogLocale.value = cur;\n'
+    '  } catch(e) { _localesLoaded = false; }\n'
+    '}\n'
+    '\n'
+    'if (_fogView) {\n'
+    '  _fogView.addEventListener("click", async function(e) {\n'
+    '    var b = e.target.closest("button[data-scope]");\n'
+    '    if (!b) return;\n'
+    '    await fetch("/combat-fog-view", {method: "POST",\n'
+    '      headers: {"content-type": "application/json"},\n'
+    '      body: JSON.stringify({scope: b.getAttribute("data-scope")})});\n'
+    '    refresh();\n'
+    '  });\n'
+    '}\n'
+    'if (_fogLocale) {\n'
+    '  _fogLocale.addEventListener("change", async function() {\n'
+    '    await fetch("/combat-fog-locale", {method: "POST",\n'
+    '      headers: {"content-type": "application/json"},\n'
+    '      body: JSON.stringify({map_id: _fogLocale.value})});\n'
+    '    refresh();\n'
+    '  });\n'
+    '}\n'
+    '\n'
     'async function refresh() {\n'
     '  try {\n'
     '    var r = await fetch("/combat-state");\n'
     '    var data = await r.json();\n'
-    '    if (!data.active || !data.grid) {\n'
+    '    var dm = data.dungml || {};\n'
+    '    updateFogUi(dm);\n'
+    '    var hasCombat = !!(data.active && data.grid);\n'
+    '    if (!hasCombat && !dm.connected) {\n'
     '      document.getElementById("round-info").textContent = "No active combat map";\n'
     '      document.getElementById("turn-info").textContent = "";\n'
     '      initListEl.innerHTML = \'<p class="muted" style="font-size:.85em">No combat active</p>\';\n'
+    '      document.getElementById("unplaced").innerHTML = "";\n'
+    '      _currentDsl = null;\n'
+    '      if (copyBtn) copyBtn.disabled = true;\n'
     '      return;\n'
     '    }\n'
-    '    document.getElementById("round-info").textContent = "Round " + data.round;\n'
-    '    document.getElementById("turn-info").textContent = "▶ " + (data.current || "");\n'
-    '    map.render(data);\n'
-    '    map.renderInitList(initListEl, data.combatants || []);\n'
-    '    var unplaced = (data.combatants || []).filter(function(c){\n'
+    '    if (hasCombat) {\n'
+    '      document.getElementById("round-info").textContent = "Round " + data.round;\n'
+    '      document.getElementById("turn-info").textContent = "▶ " + (data.current || "");\n'
+    '      _currentDsl = (data.grid && data.grid.dsl) || null;\n'
+    '    } else {\n'
+    '      // Session connected between fights: the tab is a live locale view.\n'
+    '      document.getElementById("round-info").textContent = dm.map_name || "Current locale";\n'
+    '      document.getElementById("turn-info").textContent =\n'
+    '        dm.party_node ? "party at " + dm.party_node : "";\n'
+    '      initListEl.innerHTML = \'<p class="muted" style="font-size:.85em">No combat active</p>\';\n'
+    '      _currentDsl = null;\n'
+    '    }\n'
+    '    if (copyBtn) copyBtn.disabled = !_currentDsl;\n'
+    '    map.render(fogState(data, dm));\n'
+    '    map.renderInitList(initListEl, hasCombat ? (data.combatants || []) : []);\n'
+    '    var unplaced = (hasCombat ? (data.combatants || []) : []).filter(function(c){\n'
     '      return c.x === null || c.x === undefined;\n'
     '    });\n'
     '    document.getElementById("unplaced").innerHTML = unplaced.length\n'
@@ -8063,6 +9248,167 @@ _COMBAT_JS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# dungml fog-of-war bridge
+#
+# When a dungml play session is connected, the combat tab draws the *fogged*
+# render of the party's current locale instead of the flat local one. The SVG
+# comes from dmap-server, so it is cached briefly here: the tab polls
+# /combat-state every 2s, and both that poll (for the version fingerprint)
+# and the <img> fetch would otherwise each hit the map service.
+# ---------------------------------------------------------------------------
+
+_DUNGML_SVG_TTL_S   = 1.5
+_DUNGML_BLOCK_TTL_S = 2.0
+
+_dungml_svg_cache: dict = {"key": None, "svg": b"", "etag": "", "meta": {}, "ts": 0.0}
+_dungml_block_cache: dict = {"block": None, "ts": 0.0}
+
+
+def _dungml_fog_svg(scope: str | None = None) -> tuple[bytes | None, str, dict]:
+    """The current fogged SVG, a short content fingerprint, and its metadata.
+
+    Returns `(None, "", {})` when no session is connected or the map service
+    is down — callers fall back to the plain local render.
+    """
+    link = _dungml.link_state(cfg)
+    key = (link["source"], link["map_id"], scope or link["scope"])
+    now = time.monotonic()
+    c = _dungml_svg_cache
+    if c["key"] == key and c["svg"] and (now - c["ts"]) < _DUNGML_SVG_TTL_S:
+        return c["svg"], c["etag"], c["meta"]
+    try:
+        svg, meta = _dungml.render_current(cfg, scope=scope)
+    except _dungml.DungmlUnavailable:
+        return None, "", {}
+    if not svg or meta.get("placeholder"):
+        return None, "", {}
+    etag = hashlib.sha1(svg).hexdigest()[:16]
+    c.update(key=key, svg=svg, etag=etag, meta=meta, ts=now)
+    return svg, etag, meta
+
+
+def _dungml_block() -> dict:
+    """The `dungml` block served on /combat-state.
+
+    Carries a `version` fingerprint that changes whenever the render changes —
+    fog burning off, the party moving, the scope flipping — so the tab knows
+    to refetch the image instead of trusting its cache.
+    """
+    now = time.monotonic()
+    c = _dungml_block_cache
+    if c["block"] is not None and (now - c["ts"]) < _DUNGML_BLOCK_TTL_S:
+        return c["block"]
+    try:
+        block = _dungml.connection_block(cfg)
+    except Exception as e:  # never let the map service break the combat tab
+        block = {"connected": False, "reachable": False, "detail": str(e)}
+    if block.get("connected"):
+        _svg, etag, meta = _dungml_fog_svg()
+        if etag:
+            block["version"] = etag
+            # The render is authoritative: the party may have been moved from
+            # the dungml side, leaving the cached link stale.
+            if meta.get("party_node") is not None:
+                block["party_node"] = meta["party_node"]
+            if meta.get("width"):
+                block["width"] = meta["width"]
+                block["height"] = meta["height"]
+        else:
+            # Connected per the link, but nothing renders — treat as not
+            # connected so the tab shows the local map rather than a blank.
+            block["connected"] = False
+            block.setdefault("detail", "map not ready")
+    c.update(block=block, ts=now)
+    return block
+
+
+@app.route("/combat-fog.svg")
+def combat_fog_svg():
+    """Proxy the fogged render from dmap-server.
+
+    Proxied rather than linked directly so the browser sees one origin (the
+    render token stays server-side) and so the bytes are already cached from
+    the /combat-state poll.
+    """
+    scope = request.args.get("scope") or None
+    if scope not in (None, "fog", "gm"):
+        scope = None
+    svg, etag, _meta = _dungml_fog_svg(scope)
+    if svg is None:
+        abort(404)
+    resp = Response(svg, mimetype="image/svg+xml")
+    # The fog changes as the party explores; the ?v= fingerprint is what
+    # makes a new version load, so the response itself must not be cached.
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["ETag"] = etag
+    return resp
+
+
+@app.route("/combat-fog-view", methods=["POST"])
+def combat_fog_view():
+    """Flip the combat tab between the players' fogged view and the GM view.
+
+    A display setting only — it reveals nothing and does not touch what the
+    party has discovered.
+    """
+    scope = (request.get_json(silent=True) or {}).get("scope", "fog")
+    if scope not in ("fog", "gm"):
+        return jsonify({"error": "scope must be 'fog' or 'gm'"}), 400
+    link = _dungml.save_link_state(cfg, scope=scope)
+    _dungml_block_cache.update(block=None, ts=0.0)
+    return jsonify({"scope": link["scope"]})
+
+
+@app.route("/combat-fog-locales")
+def combat_fog_locales():
+    """Authored maps this campaign can use as its current locale."""
+    link = _dungml.link_state(cfg)
+    try:
+        maps = _dungml.campaign_maps(_dungml.external_id(cfg))
+    except _dungml.DungmlUnavailable as e:
+        return jsonify({"locales": [], "detail": str(e)})
+    return jsonify({
+        "source": link["source"],
+        "map_id": link["map_id"],
+        "locales": [
+            {"map_id": m.get("id"), "name": m.get("name"),
+             "is_default": m.get("is_default", False)}
+            for m in maps
+        ],
+    })
+
+
+@app.route("/combat-fog-locale", methods=["POST"])
+def combat_fog_locale():
+    """Select which map the combat tab draws: an authored locale, or the map
+    `create_map` last pushed (`map_id` omitted / "combat")."""
+    body = request.get_json(silent=True) or {}
+    map_id = (body.get("map_id") or "").strip()
+    if not map_id or map_id == "combat":
+        _dungml.save_link_state(cfg, source="combat", map_id=None, map_name=None)
+    else:
+        try:
+            maps = _dungml.campaign_maps(_dungml.external_id(cfg))
+        except _dungml.DungmlUnavailable as e:
+            return jsonify({"error": str(e)}), 503
+        hit = next((m for m in maps if str(m.get("id")) == map_id), None)
+        if hit is None:
+            return jsonify({"error": "unknown locale"}), 404
+        _dungml.save_link_state(
+            cfg, source="campaign", map_id=hit["id"], map_name=hit.get("name")
+        )
+    _dungml_svg_cache.update(key=None, svg=b"", etag="", ts=0.0)
+    _dungml_block_cache.update(block=None, ts=0.0)
+    try:
+        link = _dungml.probe(cfg)
+    except Exception:
+        link = _dungml.link_state(cfg)
+    return jsonify({"source": link["source"], "map_id": link["map_id"],
+                    "map_name": link["map_name"],
+                    "width": link["width"], "height": link["height"]})
+
+
 @app.route("/combat")
 def combat_view():
     name = html.escape(cfg.get("name", "Campaign"))
@@ -8072,7 +9418,16 @@ def combat_view():
         + '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px">'
         + '  <span id="round-info" style="color:#c8a96e;font-weight:bold">Loading…</span>'
         + '  <span id="turn-info" style="color:#d4c5a9"></span>'
+        + '  <span id="fog-pill" class="fog-pill fog-off" title="dungml play-session status">map service offline</span>'
+        + '  <select id="fog-locale" class="fog-select" title="Which map the tab draws — an authored dungml locale, or the map create_map last pushed" style="display:none">'
+        + '    <option value="combat">Combat map (pushed)</option>'
+        + '  </select>'
+        + '  <span id="fog-view" class="fog-toggle" style="display:none">'
+        + '    <button type="button" class="zoom-btn" data-scope="fog" title="Players\' view — only what the party has discovered">Fog</button>'
+        + '    <button type="button" class="zoom-btn" data-scope="gm" title="GM view — the whole map with the party marker">GM</button>'
+        + '  </span>'
         + '  <span style="margin-left:auto;display:flex;gap:5px;align-items:center">'
+        + '    <button class="zoom-btn" id="copy-dsl-btn" title="Copy current map DSL to clipboard (paste into the dungml editor to persist)">Copy DSL</button>'
         + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*1.25)">+</button>'
         + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*0.8)">−</button>'
         + '    <button class="zoom-btn" onclick="map.setZoom(1)" title="Reset zoom">□</button>'
@@ -8101,13 +9456,17 @@ def combat_view():
 @app.route("/combat-state")
 def combat_state():
     cs = cfg.get("_dir", Path(".")) / "combat_state.json"
+    data = {"active": False}
     if cs.exists():
         try:
             data = json.loads(cs.read_text(encoding="utf-8"))
-            return jsonify(data)
         except Exception:
-            pass
-    return jsonify({"active": False})
+            data = {"active": False}
+    # The fog view is independent of whether a fight is running — a connected
+    # play session means the tab can show the party's current locale even
+    # between combats.
+    data["dungml"] = _dungml_block()
+    return jsonify(data)
 
 
 # ---------------------------------------------------------------------------
@@ -8270,6 +9629,110 @@ def _proficiency_rows(group: str | None = None) -> list[sqlite3.Row]:
     ).fetchall())
 
 
+# PHB Tables 34 (nonweapon) and 35 (weapon): proficiency slots progress by
+# class GROUP (warrior/wizard/priest/rogue), not by individual class.
+# initial = slots at level 1; every = gain +1 slot every N levels.
+_SLOT_PROGRESSION: dict[str, dict[str, dict[str, int]]] = {
+    "warrior": {"nwp": {"initial": 3, "every": 3}, "weapon": {"initial": 4, "every": 3}},
+    "wizard":  {"nwp": {"initial": 4, "every": 3}, "weapon": {"initial": 1, "every": 6}},
+    "priest":  {"nwp": {"initial": 4, "every": 3}, "weapon": {"initial": 2, "every": 4}},
+    "rogue":   {"nwp": {"initial": 3, "every": 4}, "weapon": {"initial": 2, "every": 4}},
+}
+
+# Which class group each class belongs to (primary group, per PHB). A
+# class spends NWP slots in its own group plus any crossover groups (see
+# proficiency_class_crossover), but its slot *count* always tracks the
+# primary group's progression.
+_CLASS_PRIMARY_GROUP: dict[str, str] = {
+    "Bard": "rogue",
+    "Cleric": "priest",
+    "Druid": "priest",
+    "Fighter": "warrior",
+    "Illusionist": "wizard",
+    "Mage": "wizard",
+    "Paladin": "warrior",
+    "Ranger": "warrior",
+    "Specialist Mage": "wizard",
+    "Thief": "rogue",
+}
+
+# Levels to surface in the per-group progression table. Includes every
+# milestone level for at least one group so no gain is invisible.
+_SLOT_PROGRESSION_LEVELS = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 20]
+
+
+def _slot_count(initial: int, every: int, level: int) -> int:
+    """PHB formula: +1 slot every ``every`` levels past 1st."""
+    return initial + (level // every)
+
+
+def _render_slot_progression_table() -> str:
+    """8-row matrix (4 groups × NWP/Weapon) across selected levels, with
+    each group's member classes listed beside the group label."""
+    members: dict[str, list[str]] = {g: [] for g in _SLOT_PROGRESSION}
+    for cls, group in sorted(_CLASS_PRIMARY_GROUP.items()):
+        members[group].append(cls)
+
+    head = (
+        '<tr>'
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Group</th>'
+        '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Type</th>'
+        + "".join(
+            f'<th style="text-align:center;padding:4px 8px;border-bottom:1px solid #4a3828">L{L}</th>'
+            for L in _SLOT_PROGRESSION_LEVELS
+        )
+        + '<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #4a3828">Cadence</th>'
+        + '</tr>'
+    )
+
+    body_rows = []
+    for group, prog in _SLOT_PROGRESSION.items():
+        member_html = (
+            f'<div style="text-transform:capitalize;font-weight:600">{html.escape(group)}</div>'
+            f'<div class="muted" style="font-size:.85em;margin-top:2px">'
+            f'{html.escape(", ".join(members[group]) or "—")}</div>'
+        )
+        for type_key, type_label in (("nwp", "Nonweapon"), ("weapon", "Weapon")):
+            cfg = prog[type_key]
+            cells = "".join(
+                f'<td style="text-align:center;padding:4px 8px;border-bottom:1px solid #2a2018;'
+                f'font-variant-numeric:tabular-nums">'
+                f'{_slot_count(cfg["initial"], cfg["every"], L)}</td>'
+                for L in _SLOT_PROGRESSION_LEVELS
+            )
+            cadence = f'{cfg["initial"]} initial, +1 every {cfg["every"]} levels'
+            # Only print the group label/members on the first row of each
+            # group so the matrix reads as two grouped lines per cluster.
+            group_cell = (
+                f'<td rowspan="2" style="padding:6px 10px;border-bottom:1px solid #2a2018;'
+                f'vertical-align:top">{member_html}</td>'
+                if type_key == "nwp" else ""
+            )
+            body_rows.append(
+                f'<tr>{group_cell}'
+                f'<td style="padding:4px 10px;border-bottom:1px solid #2a2018">{type_label}</td>'
+                f'{cells}'
+                f'<td class="muted" style="padding:4px 10px;border-bottom:1px solid #2a2018;'
+                f'font-size:.88em">{cadence}</td>'
+                f'</tr>'
+            )
+
+    return (
+        '<section id="slots" style="margin:18px 0">'
+        '<h2 style="margin:0 0 8px">Slots by class &amp; level</h2>'
+        '<p class="muted" style="margin:0 0 8px;font-size:.9em">'
+        'Slot progression follows the class\'s primary group (PHB Tables 34 &amp; 35). '
+        'NWP slots can be spent across the class\'s allowed groups (see Class crossover below); '
+        'weapon slots feed weapon proficiency picks.'
+        '</p>'
+        '<div style="overflow-x:auto">'
+        '<table style="border-collapse:collapse;font-size:.93em;min-width:720px">'
+        f'<thead>{head}</thead>'
+        f'<tbody>{"".join(body_rows)}</tbody></table></div>'
+        '</section>'
+    )
+
+
 def _proficiency_class_crossover() -> list[tuple[str, list[str]]]:
     if not _2E_DB.exists():
         return []
@@ -8380,10 +9843,11 @@ def proficiencies_view(group: str | None = None):
         return render(f"{group.capitalize()} Proficiencies", body)
 
     crossover = _proficiency_class_crossover()
-    toc = ' · '.join(
+    group_links = ' · '.join(
         f'<a href="#{g}" style="text-transform:capitalize">{g}</a>'
         for g in _PROF_GROUPS
     )
+    toc = f'<a href="#slots">Slots by class</a> · {group_links}'
     sections = "".join(
         _render_proficiency_table(g, _proficiency_rows(g))
         for g in _PROF_GROUPS
@@ -8394,6 +9858,7 @@ def proficiencies_view(group: str | None = None):
         'per proficiency. To make a proficiency check, roll d20 ≤ '
         '(ability score + check modifier).</p>'
         f'<p style="margin:8px 0 16px">Jump to: {toc}</p>'
+        + _render_slot_progression_table()
         + (_render_crossover_table(crossover) if crossover else "")
         + sections
     )
@@ -8963,14 +10428,171 @@ def _greyhawk_render_infobox(template_name: str | None,
     )
 
 
+def _greyhawk_iter_tables(text: str):
+    """Yield (start, end, block) for each top-level ``{| ... |}`` table,
+    tracking nesting so an inner table doesn't prematurely close the outer
+    one. Bails out at the first unbalanced ``{|`` (malformed source), leaving
+    the remainder untouched."""
+    i, n = 0, len(text)
+    while i < n:
+        if text[i:i + 2] == "{|":
+            depth, j = 1, i + 2
+            while j < n and depth > 0:
+                if text[j:j + 2] == "{|":
+                    depth += 1; j += 2
+                elif text[j:j + 2] == "|}":
+                    depth -= 1; j += 2
+                else:
+                    j += 1
+            if depth == 0:
+                yield (i, j, text[i:j])
+                i = j
+            else:
+                return        # unbalanced — stop, leave the rest as-is
+        else:
+            i += 1
+
+
+def _greyhawk_inline(text: str) -> str:
+    """Apply inline wiki markup — [[links]], '''bold''', ''italic'' — used by
+    both the body renderer and table cells so formatting is consistent."""
+    def _link(m):
+        target = m.group(1).strip()
+        label = (m.group(2) or target).strip()
+        anchor = target.split("#", 1)[0]
+        return (f'<a href="/greyhawk/page/{html.escape(anchor)}">'
+                f'{html.escape(label)}</a>')
+    text = re.sub(r"\[\[([^\[\]|#]+)(?:#[^\[\]|]+)?(?:\|([^\[\]]+))?\]\]",
+                  _link, text)
+    text = re.sub(r"'''([^']+)'''", r"<b>\1</b>", text)
+    text = re.sub(r"''([^']+)''", r"<i>\1</i>", text)
+    return text
+
+
+def _greyhawk_strip_cell_attrs(cell: str) -> str:
+    """Strip MediaWiki per-cell attributes (`style=... | content`) from a
+    table cell, keeping just the content. Leaves plain cells untouched."""
+    m = re.match(r"^\s*([^|]*?)\s*\|(?!\|)\s*(.*)$", cell, re.S)
+    if m and "=" in m.group(1):
+        return m.group(2).strip()
+    return cell.strip()
+
+
+def _greyhawk_render_wikitable(block: str) -> str:
+    """Convert a MediaWiki `{| ... |}` table into an HTML <table>.
+
+    Handles captions (`|+`), row breaks (`|-`), header cells (`!`, `!!`),
+    data cells (`|`, `||`), per-cell attribute prefixes, and cell content
+    that wraps onto a continuation line. Cell text runs through
+    _greyhawk_inline so links/bold/italic render inside tables too."""
+    inner = block.strip()
+    inner = re.sub(r"^\{\|[^\n]*", "", inner)   # drop "{| <attrs>"
+    inner = re.sub(r"\|\}\s*$", "", inner)       # drop closing "|}"
+
+    # Pull out nested tables first (render recursively) so the pipe-based
+    # cell parser below never sees their '|' / '||' separators.
+    nspans = list(_greyhawk_iter_tables(inner))
+    nested: list[str] = [None] * len(nspans)
+    # Render forward for stable ids; splice from the end to keep offsets valid.
+    for idx in range(len(nspans) - 1, -1, -1):
+        s, e, b = nspans[idx]
+        nested[idx] = _greyhawk_render_wikitable(b)
+        inner = inner[:s] + f"\x00NT{idx}\x00" + inner[e:]
+
+    caption = None
+    rows: list[tuple[bool, list[str]]] = []
+    current: list[str] = []
+    current_is_header = False
+    started = False
+
+    for raw in inner.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("|+"):
+            caption = line[2:].strip()
+        elif line.startswith("|-"):
+            if started:
+                rows.append((current_is_header, current))
+            current, current_is_header, started = [], False, True
+        elif line.startswith("!"):
+            started = True
+            current_is_header = True
+            current += [c.strip() for c in re.split(r"!!", line[1:])]
+        elif line.startswith("|"):
+            started = True
+            current += [c.strip() for c in re.split(r"\|\|", line[1:])]
+        elif current:                 # wrapped cell content
+            current[-1] += " " + line
+    if started or current:
+        rows.append((current_is_header, current))
+
+    html_rows = []
+    for is_header, cells in rows:
+        if not cells:
+            continue
+        tag = "th" if is_header else "td"
+        tds = "".join(
+            f"<{tag}>{_greyhawk_inline(_greyhawk_strip_cell_attrs(c))}</{tag}>"
+            for c in cells
+        )
+        html_rows.append(f"<tr>{tds}</tr>")
+
+    cap = f"<caption>{_greyhawk_inline(caption)}</caption>" if caption else ""
+    out = f'<table class="gh-wikitable">{cap}{"".join(html_rows)}</table>'
+    for idx, nested_html in enumerate(nested):
+        out = out.replace(f"\x00NT{idx}\x00", nested_html)
+    return out
+
+
+def _greyhawk_build_list(items: list[tuple[str, str]], i: int = 0,
+                         depth: int = 1):
+    """Build nested <ul>/<ol> HTML from MediaWiki list items.
+
+    items: (markers, content) where markers is a run of '*'/'#' (e.g. '*',
+    '**', '*#'). Returns (html, next_index). The list kind at each level is
+    set by the marker char at that depth ('#' → ordered, '*' → unordered)."""
+    kind = "ol" if items[i][0][depth - 1] == "#" else "ul"
+    html_parts = [f"<{kind}>"]
+    while i < len(items):
+        markers, content = items[i]
+        d = len(markers)
+        if d < depth:
+            break
+        if d == depth:
+            html_parts.append(f"<li>{content}")
+            if i + 1 < len(items) and len(items[i + 1][0]) > depth:
+                sub, i = _greyhawk_build_list(items, i + 1, depth + 1)
+                html_parts.append(sub)
+            else:
+                i += 1
+            html_parts.append("</li>")
+        else:                       # deeper than expected — recurse
+            sub, i = _greyhawk_build_list(items, i, depth + 1)
+            html_parts.append(sub)
+    html_parts.append(f"</{kind}>")
+    return "".join(html_parts), i
+
+
+def _greyhawk_render_deflist(items: list[tuple[str, str]]) -> str:
+    """Render a run of ';'/':' definition-list lines into a <dl>."""
+    out = ["<dl>"]
+    for mark, content in items:
+        tag = "dt" if mark == ";" else "dd"
+        out.append(f"<{tag}>{content}</{tag}>")
+    out.append("</dl>")
+    return "".join(out)
+
+
 def _greyhawk_render_wiki(text: str) -> str:
     """Minimal wiki-markup renderer for raw_text.
 
     The Greyhawk DB stores MediaWiki-flavoured source. We don't try to be a
-    full parser — we just turn [[link]] / [[link|label]] into dashboard
-    anchors, headings into <h2>/<h3>, and preserve paragraph breaks. Anything
-    we don't recognise (tables, refs) falls through as escaped text so the
-    page is still readable even if ugly.
+    full parser, but we handle the common constructs: [[links]], headings,
+    '''bold'''/''italic'', {| tables |} (incl. nested), bullet/numbered/
+    definition lists, horizontal rules, and [[File:]] images. Citation
+    <ref>s, <gallery>s and magic words (__TOC__) are stripped. Anything else
+    falls through as text so the page stays readable.
     """
     if not text:
         return ""
@@ -8980,6 +10602,24 @@ def _greyhawk_render_wiki(text: str) -> str:
     # appear as raw source in the middle of paragraphs.
     text = _greyhawk_strip_templates(text)
 
+    # Strip citation <ref>s, <gallery> blocks, and MediaWiki magic words —
+    # these have no useful body rendering and otherwise leak as raw markup.
+    text = re.sub(r"<ref[^>]*/>", "", text, flags=re.I)
+    text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.S | re.I)
+    text = re.sub(r"</?ref[^>]*>", "", text, flags=re.I)   # orphan/unclosed refs
+    text = re.sub(r"<gallery[^>]*>.*?</gallery>", "", text, flags=re.S | re.I)
+    text = re.sub(r"__[A-Z]+__", "", text)
+
+    # Render MediaWiki tables to HTML (depth-aware, so nested tables don't
+    # truncate the outer one) and stash them behind sentinels, so the
+    # heading/inline/paragraph passes below leave the table markup intact.
+    tspans = list(_greyhawk_iter_tables(text))
+    _tables: list[str] = [None] * len(tspans)
+    for idx in range(len(tspans) - 1, -1, -1):
+        start, end, block = tspans[idx]
+        _tables[idx] = _greyhawk_render_wikitable(block)
+        text = text[:start] + f"\n\n\x00GHT{idx}\x00\n\n" + text[end:]
+
     # Expand [[File:...]] refs next so the generic [[link]] regex below
     # doesn't try to turn the filename into a wiki page anchor. We walk
     # from the end so the indices we collected stay valid as we splice.
@@ -8987,36 +10627,58 @@ def _greyhawk_render_wiki(text: str) -> str:
     for start, end, inner in reversed(spans):
         text = text[:start] + _greyhawk_render_file_ref(inner) + text[end:]
 
-    out_lines = []
-    for raw in text.splitlines():
-        line = raw.rstrip()
+    list_re = re.compile(r"^([*#]+)[ \t]*(.*)$")
+    def_re = re.compile(r"^([;:])\s*(.*\S.*)$")
+    lines = text.splitlines()
+    out_lines: list[str] = []
+    k = 0
+    while k < len(lines):
+        line = lines[k].rstrip()
         if re.match(r"^==+\s*[^=]+\s*==+\s*$", line):
             depth = len(line) - len(line.lstrip("="))
             heading = line.strip("= ").strip()
             tag = "h2" if depth <= 2 else "h3"
             out_lines.append(f"<{tag}>{html.escape(heading)}</{tag}>")
+            k += 1
+        elif re.match(r"^----+\s*$", line):
+            out_lines.append("<hr>")
+            k += 1
+        elif list_re.match(line):
+            items = []
+            while k < len(lines):
+                mm = list_re.match(lines[k].rstrip())
+                if not mm:
+                    break
+                items.append((mm.group(1), mm.group(2)))
+                k += 1
+            html_list, _ = _greyhawk_build_list(items)
+            out_lines.append(html_list)
+        elif def_re.match(line):
+            ditems = []
+            while k < len(lines):
+                mm = def_re.match(lines[k].rstrip())
+                if not mm:
+                    break
+                ditems.append((mm.group(1), mm.group(2)))
+                k += 1
+            out_lines.append(_greyhawk_render_deflist(ditems))
         else:
             out_lines.append(line)
+            k += 1
     body = "\n".join(out_lines)
 
-    def _link(m):
-        target = m.group(1).strip()
-        label = (m.group(2) or target).strip()
-        anchor = target.split("#", 1)[0]
-        return (f'<a href="/greyhawk/page/{html.escape(anchor)}">'
-                f'{html.escape(label)}</a>')
+    body = _greyhawk_inline(body)
 
-    body = re.sub(r"\[\[([^\[\]|#]+)(?:#[^\[\]|]+)?(?:\|([^\[\]]+))?\]\]",
-                  _link, body)
-    body = re.sub(r"'''([^']+)'''", r"<b>\1</b>", body)
-    body = re.sub(r"''([^']+)''", r"<i>\1</i>", body)
-
+    block_starts = ("<h2>", "<h3>", "<figure", "<ul>", "<ol>", "<dl>", "<hr>")
     paragraphs = []
     for chunk in re.split(r"\n{2,}", body):
         chunk = chunk.strip()
         if not chunk:
             continue
-        if chunk.startswith(("<h2>", "<h3>", "<figure")):
+        m = re.fullmatch(r"\x00GHT(\d+)\x00", chunk)
+        if m:
+            paragraphs.append(_tables[int(m.group(1))])
+        elif chunk.startswith(block_starts):
             paragraphs.append(chunk)
         else:
             paragraphs.append(f"<p>{chunk}</p>")
@@ -9107,7 +10769,7 @@ def greyhawk_index():
         '<form method="get" action="/greyhawk" style="margin:18px 0">'
         '<input name="q" placeholder="Search pages (FTS5 — e.g. Mordenkainen, '
         '&quot;Circle of Eight&quot;, Morden*)" '
-        f'style="{INPUT_STYLE};width:100%;max-width:600px">'
+        f'style="{_INPUT_CSS};width:100%;max-width:600px">'
         '</form>'
         '<h2>Entry tables</h2>'
         '<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(200px,1fr))">'
@@ -9170,7 +10832,7 @@ def greyhawk_images():
         '<form method="get" action="/greyhawk/images" style="margin:12px 0">'
         f'<input name="q" value="{html.escape(q)}" '
         f'placeholder="Filter by filename…" '
-        f'style="{INPUT_STYLE};width:100%;max-width:480px">'
+        f'style="{_INPUT_CSS};width:100%;max-width:480px">'
         + (' <a href="/greyhawk/images" class="muted">clear</a>' if q else '')
         + '</form>'
         + (f'<div class="grid" style="grid-template-columns:'
@@ -9217,7 +10879,7 @@ def _greyhawk_search_results(conn, q: str) -> str:
         '<h1>Greyhawk Setting</h1>'
         '<form method="get" action="/greyhawk" style="margin:18px 0">'
         f'<input name="q" value="{html.escape(q)}" '
-        f'style="{INPUT_STYLE};width:100%;max-width:600px">'
+        f'style="{_INPUT_CSS};width:100%;max-width:600px">'
         ' <a href="/greyhawk" class="muted">clear</a>'
         '</form>'
         f'<h2>Search: <code>{html.escape(q)}</code> '
@@ -9644,13 +11306,43 @@ _dashboard_monsters.init(
 # Main
 # ---------------------------------------------------------------------------
 
+
+def _is_loopback(host: str) -> bool:
+    """True if binding `host` only accepts connections from this machine."""
+    if host in ("", "*", "0.0.0.0", "::"):
+        return False
+    if host in ("localhost", "localhost."):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A hostname we cannot classify -- assume it is externally routable.
+        return False
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Campaign dashboard web app."
     )
     parser.add_argument("--campaign", help="Campaign name (default: active campaign)")
     parser.add_argument("--port", type=int, default=5000, help="Port to listen on (default: 5000)")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Address to bind (default: 127.0.0.1, loopback only). "
+             "Use 0.0.0.0 to accept connections from the network.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Force the Werkzeug debugger/reloader on. Enabled by default for "
+             "loopback binds; on a non-loopback bind this exposes remote code "
+             "execution to anyone who can reach the port.",
+    )
     args = parser.parse_args()
+
+    loopback = _is_loopback(args.host)
+    debug = args.debug or loopback
 
     try:
         cfg = _c.load_campaign(args.campaign or None)
@@ -9660,5 +11352,18 @@ if __name__ == "__main__":
 
     print(f"Campaign: {cfg.get('name', cfg['_name'])}")
     print(f"Data dir: {cfg['_data_dir']}")
-    print(f"Starting dashboard at http://localhost:{args.port}")
-    app.run(debug=True, port=args.port)
+    display_host = "localhost" if loopback else args.host
+    print(f"Starting dashboard at http://{display_host}:{args.port}")
+    if not loopback:
+        print(
+            f"Listening on {args.host} -- reachable from the network. "
+            "There is no authentication on this dashboard.",
+            file=sys.stderr,
+        )
+        if debug:
+            print(
+                "WARNING: --debug on a non-loopback bind exposes the Werkzeug "
+                "debugger, which allows remote code execution.",
+                file=sys.stderr,
+            )
+    app.run(debug=debug, host=args.host, port=args.port)
