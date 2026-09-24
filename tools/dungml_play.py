@@ -386,6 +386,53 @@ def render_current(cfg: dict, scope: str | None = None) -> tuple[bytes, dict]:
     return svg, meta
 
 
+def use_locale(cfg: dict, name_or_id: str) -> dict:
+    """Point the campaign's dungml link at an authored map as the current
+    locale. Body of the `dungml_use_locale` tool, callable directly (e.g. by
+    `move_party`'s `map=` argument) without going through the registered
+    tool function.
+
+    `name_or_id` is a map id or a case-insensitive substring of its name,
+    from `dungml_locales`/`campaign_maps`. Pass "combat" to go back to
+    whatever `create_map` last pushed.
+    """
+    ext = external_id(cfg)
+    if name_or_id.strip().lower() == "combat":
+        save_link_state(cfg, source="combat", map_id=None, map_name=None)
+        probe(cfg)
+        return {"source": "combat", "note": "showing the pushed combat map"}
+    try:
+        maps = campaign_maps(ext)
+    except DungmlUnavailable as e:
+        return {"error": str(e)}
+    if not maps:
+        return {"error": f"campaign '{ext}' has no authored maps linked in dungml."}
+    low = name_or_id.strip().lower()
+    hit = next((m for m in maps if str(m.get("id")) == name_or_id), None)
+    if hit is None:
+        hits = [m for m in maps if low in str(m.get("name", "")).lower()]
+        if not hits:
+            return {
+                "error": f"no locale matching '{name_or_id}'",
+                "available": [m.get("name") for m in maps],
+            }
+        if len(hits) > 1:
+            return {
+                "error": f"'{name_or_id}' matches {len(hits)} locales — be more specific",
+                "matches": [m.get("name") for m in hits],
+            }
+        hit = hits[0]
+    save_link_state(cfg, source="campaign", map_id=hit["id"], map_name=hit.get("name"))
+    link = probe(cfg)
+    return {
+        "source": "campaign",
+        "map_id": hit["id"],
+        "map_name": hit.get("name"),
+        "size": f"{link.get('width')}×{link.get('height')}" if link.get("width") else None,
+        "scope": link.get("scope"),
+    }
+
+
 def probe(cfg: dict) -> dict:
     """Refresh the cached geometry on the stored link by rendering once.
 
@@ -562,51 +609,16 @@ def register(mcp):
 
         Pass "combat" to go back to whatever `create_map` last pushed.
         """
-        cfg = _c.load_campaign()
-        ext = external_id(cfg)
-        if name_or_id.strip().lower() == "combat":
-            link = save_link_state(cfg, source="combat", map_id=None, map_name=None)
-            probe(cfg)
-            return {"source": "combat", "note": "showing the pushed combat map"}
-        try:
-            maps = campaign_maps(ext)
-        except DungmlUnavailable as e:
-            return {"error": str(e)}
-        if not maps:
-            return {"error": f"campaign '{ext}' has no authored maps linked in dungml."}
-        low = name_or_id.strip().lower()
-        hit = next((m for m in maps if str(m.get("id")) == name_or_id), None)
-        if hit is None:
-            hits = [m for m in maps if low in str(m.get("name", "")).lower()]
-            if not hits:
-                return {
-                    "error": f"no locale matching '{name_or_id}'",
-                    "available": [m.get("name") for m in maps],
-                }
-            if len(hits) > 1:
-                return {
-                    "error": f"'{name_or_id}' matches {len(hits)} locales — be more specific",
-                    "matches": [m.get("name") for m in hits],
-                }
-            hit = hits[0]
-        save_link_state(cfg, source="campaign", map_id=hit["id"], map_name=hit.get("name"))
-        link = probe(cfg)
-        return {
-            "source": "campaign",
-            "map_id": hit["id"],
-            "map_name": hit.get("name"),
-            "size": f"{link['width']}×{link['height']}" if link["width"] else None,
-            "scope": link["scope"],
-        }
+        return use_locale(_c.load_campaign(), name_or_id)
 
     @mcp.tool()
     def dungml_rooms() -> dict:
         """List the node ids of the map the `/map` tab is showing.
 
         These ids (`room.antechamber`, `corridor.spine`, …) are what
-        `dungml_party_at` and `dungml_reveal` take. `exits` gives the nodes
-        each one connects to, so you can follow the party's route without
-        re-reading the DSL.
+        `move_party` and `dungml_reveal` take; labels work too. `exits`
+        gives the nodes each one connects to, so you can follow the party's
+        route without re-reading the DSL.
         """
         cfg = _c.load_campaign()
         link = link_state(cfg)
@@ -615,42 +627,15 @@ def register(mcp):
             if not map_id:
                 return {"error": "no dungml map for this campaign yet"}
             rooms = map_rooms(map_id)
+            party_node = (campaign_known(external_id(cfg), map_id).get("party_location")
+                          if link["source"] == "campaign" and link["map_id"]
+                          else link["party_node"])
         except DungmlUnavailable as e:
             return {"error": str(e)}
         return {
             "map_id": map_id,
-            "party_node": link["party_node"],
+            "party_node": party_node,
             "rooms": rooms,
-        }
-
-    @mcp.tool()
-    def dungml_party_at(room: str) -> dict:
-        """Move the party marker to a node, revealing it and its visible doors.
-
-        This is the fog-of-war advance: call it when the party enters a new
-        room or corridor. The node id comes from `dungml_rooms`. Unknown nodes
-        are a no-op, so a typo costs nothing.
-
-        Only the node moved into (and the doors visible from it) is revealed —
-        what lies beyond stays fogged, which is the point.
-        """
-        cfg = _c.load_campaign()
-        ext = external_id(cfg)
-        link = link_state(cfg)
-        try:
-            if link["source"] == "campaign" and link["map_id"]:
-                campaign_set_party(ext, link["map_id"], room)
-            else:
-                set_party(ext, room)
-        except DungmlUnavailable as e:
-            return {"error": str(e)}
-        link = probe(cfg)
-        return {
-            "party_node": link["party_node"] or room,
-            "requested": room,
-            "note": None if link["party_node"] == room else
-                    f"dungml did not place the party at '{room}' — check "
-                    f"`dungml_rooms` for the exact node id",
         }
 
     @mcp.tool()
@@ -659,19 +644,19 @@ def register(mcp):
 
         For what the party can see into but hasn't entered — the room beyond
         an opened door, a chamber lit by a spell, the corridor a thief scouted
-        ahead. Unknown nodes are a no-op.
+        ahead. Unknown rooms return an error with candidates.
         """
         cfg = _c.load_campaign()
         ext = external_id(cfg)
         link = link_state(cfg)
         try:
             if link["source"] == "campaign" and link["map_id"]:
-                campaign_reveal(ext, link["map_id"], room)
+                res = campaign_reveal(ext, link["map_id"], room)
             else:
-                reveal(ext, room)
+                res = reveal(ext, room)
         except DungmlUnavailable as e:
-            return {"error": str(e)}
-        return {"revealed": room}
+            return describe_error(e)
+        return {"revealed": res.get("revealed", room), "room": res.get("room")}
 
     @mcp.tool()
     def dungml_view(scope: str = "fog") -> dict:

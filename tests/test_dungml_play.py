@@ -400,29 +400,6 @@ class ToolTests(BridgeTestCase):
         current = [loc for loc in out["locales"] if loc["current"]]
         self.assertEqual([c["map_id"] for c in current], ["m2"])
 
-    def test_party_at_warns_when_the_node_did_not_take(self):
-        """An unknown node is a graceful no-op server-side, so the tool has to
-        notice the marker didn't move rather than report success."""
-        self.stub(responses={
-            ("POST", "/maps/test-camp/tokens"): {"token": "t"},
-            ("GET", "/maps/test-camp/render"): SVG_FOG,  # says room.entry
-        })
-        out = self.tools["dungml_party_at"](room="room.nowhere")
-        self.assertEqual(out["requested"], "room.nowhere")
-        self.assertIsNotNone(out["note"])
-
-    def test_party_at_is_clean_when_it_takes(self):
-        self.stub(responses={
-            ("POST", "/maps/test-camp/tokens"): {"token": "t"},
-            ("GET", "/maps/test-camp/render"): SVG_FOG,
-        })
-        out = self.tools["dungml_party_at"](room="room.entry")
-        self.assertIsNone(out["note"])
-
-    def test_party_at_reports_an_outage(self):
-        self.stub(fail=True)
-        self.assertIn("error", self.tools["dungml_party_at"](room="room.entry"))
-
     def test_rooms_errors_without_a_map(self):
         self.stub(responses={("GET", "/maps/test-camp/info"): {}})
         self.assertIn("error", self.tools["dungml_rooms"]())
