@@ -55,3 +55,22 @@ class ModuleLookupTests(unittest.TestCase):
 
     def test_bad_fts_syntax_is_quoted_not_raised(self):
         self.assertIsInstance(self.lookup('beetles"')["results"], list)
+
+    def test_section_filter_applies_before_limit(self):
+        # 30 "the"-matching chunks outside the target section, then 8 inside
+        # it. If the section filter runs after `LIMIT limit*4` (5*4=20), the
+        # in-section rows never make it into the pre-filter window and all
+        # of them get dropped. The filter must narrow the SQL match itself.
+        noise = "\n\n".join(f"the quiet corridor stretches on, marker {i}."
+                             for i in range(30))
+        five = "\n\n".join(f"the crypt chamber {i} holds old bones."
+                            for i in range(8))
+        text = f"# Level One\n\n{noise}\n\n# Level Five\n\n{five}\n"
+        self.camp.write("reference/06-level-5.md", text)
+        self.lookup = TempCampaign.register(module_ref)["module_lookup"]
+
+        out = self.lookup("the", section="Level Five")
+        self.assertEqual(len(out["results"]), 5)
+        for hit in out["results"]:
+            self.assertEqual(hit["path"], "Level Five")
+            self.assertIn("crypt chamber", hit["text"])

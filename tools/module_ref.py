@@ -81,6 +81,13 @@ def _fts_query(q: str) -> str:
     return " ".join('"' + w.replace('"', "") + '"' for w in words)
 
 
+def _like_pattern(section: str) -> str:
+    """A `%section%` LIKE pattern with %, _ and \\ escaped so section text
+    is never LIKE syntax."""
+    escaped = section.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return "%" + escaped + "%"
+
+
 def register(mcp):
 
     @mcp.tool()
@@ -101,14 +108,20 @@ def register(mcp):
         fts = _fts_query(query)
         if not fts:
             return {"results": []}
+        n = max(1, int(limit))
         try:
-            rows = con.execute(
-                "SELECT file, path, text FROM chunks WHERE chunks MATCH ? ORDER BY rank LIMIT ?",
-                (fts, max(1, int(limit)) * 4)).fetchall()
+            if section:
+                rows = con.execute(
+                    "SELECT file, path, text FROM chunks "
+                    "WHERE chunks MATCH ? AND path LIKE ? ESCAPE '\\' "
+                    "ORDER BY rank LIMIT ?",
+                    (fts, _like_pattern(section), n)).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT file, path, text FROM chunks WHERE chunks MATCH ? "
+                    "ORDER BY rank LIMIT ?",
+                    (fts, n)).fetchall()
         except sqlite3.OperationalError:
             return {"results": []}
-        if section:
-            low = section.lower()
-            rows = [r for r in rows if low in r[1].lower()]
         return {"results": [{"file": f, "path": p, "text": t}
-                            for f, p, t in rows[:max(1, int(limit))]]}
+                            for f, p, t in rows]}
