@@ -503,6 +503,7 @@ room returns `candidates`; nothing moved. Record door changes with
 `door(...)` and what the party changed in a room with `note_room(...)` — they
 come back next time the party is there, including after a reset. `room(query)`
 re-reads a room without moving.
+An exit whose far side is unexplored has no `to_label` in `perceived` — describe the door, not what lies beyond.
 
 - `dungml_rooms()` — the node ids of the current map (`room.entry`,
   `corridor.spine`, …). These are what `move_party`/`room`/`dungml_reveal` take.
@@ -595,9 +596,9 @@ Tests: `python3 -m unittest discover -s tests` — run before committing.
 Tactical maps and fog of war are rendered by **dungml**, a separate repo at
 `~/claude/dungml` (see its own CLAUDE.md). It is a service, not a library —
 this repo only ever talks HTTP to it. The line of development is
-`summersong-main`; the contract endpoints this repo's fog tools need are on
-`feat/ttrpg2-combat-fog`, so that is the branch `dmap-server` should be
-running for fog of war to work.
+`summersong-main`; the contract endpoints this repo's fog and room tools
+need (`move_party`, `room`, `door`, fog of war) are on `feat/room-context`,
+so that is the branch `dmap-server` should be running.
 
 | Variable | Default | Used by |
 |---|---|---|

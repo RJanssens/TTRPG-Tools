@@ -5472,20 +5472,74 @@ _PLAY_HTML = """
     return JSON.stringify(blockContent, null, 2);
   }
 
+  // ---- redact:begin ----
+  // The transcript's tool rows are on screen, and players may be watching
+  // it. DM-only material is stripped from every tool row before it is
+  // drawn; the raw events stay untouched in the debug dialog (a DM tool).
+  const DM_ONLY_KEYS = ['dm_only', 'secret_exits', 'hidden_annotations', 'secret_map_exits'];
+  // Tools whose whole payload is DM-side: the row shows the tool name only,
+  // never its arguments or its result.
+  const BODYLESS_TOOLS = ['dm_secrets', 'dm_note', 'dm_secret_update', 'module_lookup', 'get_location'];
+  const HIDDEN_MARK = '[hidden]';
+
+  function isBodylessTool(name) {
+    return BODYLESS_TOOLS.indexOf(name) !== -1;
+  }
+
+  function redactDmOnly(value, toolName) {
+    if (Array.isArray(value)) {
+      return value.map(v => redactDmOnly(v, toolName));
+    }
+    if (!value || typeof value !== 'object') return value;
+    const out = {};
+    let hid = false;
+    Object.keys(value).forEach(k => {
+      if (DM_ONLY_KEYS.indexOf(k) !== -1) { hid = true; return; }
+      let v = value[k];
+      if (toolName === 'dungml_rooms' && Array.isArray(v)) {
+        const kept = v.filter(r => !(r && typeof r === 'object' && r.hidden === true));
+        if (kept.length !== v.length) hid = true;
+        v = kept;
+      }
+      out[k] = redactDmOnly(v, toolName);
+    });
+    if (hid) out.dm_only = HIDDEN_MARK;
+    return out;
+  }
+
+  // Redact a tool result's text for the transcript. JSON is parsed and
+  // cleaned; text that won't parse but names a DM-only key is withheld
+  // whole rather than guessed at.
+  function redactToolResultText(toolName, text) {
+    if (isBodylessTool(toolName)) return '(hidden: DM-only)';
+    if (!text) return text;
+    let parsed;
+    try { parsed = JSON.parse(text); } catch (e) {
+      const leaky = DM_ONLY_KEYS.some(k => text.indexOf(k) !== -1);
+      return leaky ? '(hidden: result carries DM-only material)' : text;
+    }
+    if (!parsed || typeof parsed !== 'object') return text;
+    return JSON.stringify(redactDmOnly(parsed, toolName), null, 2);
+  }
+  // ---- redact:end ----
+
   function appendToolUse(block) {
     if (firstAppend) { log.innerHTML = ''; firstAppend = false; }
     const det = document.createElement('details');
     det.className = 'turn tool';
     const name = shortToolName(block.name);
-    const inputJson = JSON.stringify(block.input || {}, null, 2);
+    const bodyless = isBodylessTool(name);
+    const inputJson = bodyless ? '(hidden: DM-only)'
+                               : JSON.stringify(block.input || {}, null, 2);
 
     // Prefer a custom pretty summary when one exists; otherwise fall back
-    // to the original name(arg-preview) layout.
-    const pretty = renderPrettySummary(name, block.input, null);
+    // to the original name(arg-preview) layout. A DM-only tool shows its
+    // name alone — a dm_note's text would otherwise preview in its args.
+    const pretty = bodyless ? null : renderPrettySummary(name, block.input, null);
     const summaryInner = pretty
       ? pretty
       : ('<span class="tool-name">' + esc(name) + '</span>'
-       + '<span class="tool-args">' + esc(summarizeArgs(block.input) ? '(' + summarizeArgs(block.input) + ')' : '()') + '</span>');
+       + '<span class="tool-args">' + (bodyless ? '' : esc(summarizeArgs(block.input) ? '(' + summarizeArgs(block.input) + ')' : '()')) + '</span>');
 
     det.innerHTML =
         '<summary>' + summaryInner + '</summary>'
@@ -5514,11 +5568,12 @@ _PLAY_HTML = """
     if (!entry) return;
     const det = entry.el;
 
-    // Body: always show the raw result text in the expandable section.
+    // Body: the result text, with DM-only material redacted (the raw
+    // event is still in the debug dialog).
     const resultEl = det.querySelector('.tool-result');
     const text = renderToolResult(content);
     if (resultEl) {
-      resultEl.textContent = text || '(empty)';
+      resultEl.textContent = redactToolResultText(entry.name, text) || '(empty)';
       if (isError) resultEl.classList.add('tool-error');
     }
 

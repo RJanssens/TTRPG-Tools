@@ -41,3 +41,78 @@ class LatestLocationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import json as _json
+import shutil as _shutil
+import subprocess as _subprocess
+
+_NODE = _shutil.which("node")
+
+_REDACT_CASES = r"""
+const out = {};
+const ctx = {room: {id: 'room.a', perceived: {exits: [{door: '1,1', to_label: null}]},
+                    dm_only: {notes: 'Ghouls sleep under the floor.', exit_labels: {'1,1': 'Vault'}}},
+             room_notes: []};
+out.move = JSON.parse(redactToolResultText('move_party', JSON.stringify(ctx)));
+out.nested = JSON.parse(redactToolResultText('batch', JSON.stringify(
+  {results: [{rooms: [{id: 'r', exits: [], secret_exits: [{door: '2,2'}]}]},
+             {hidden_annotations: [1], secret_map_exits: [2], keep: 3}]})));
+out.rooms = JSON.parse(redactToolResultText('dungml_rooms', JSON.stringify(
+  {map_id: 'm', rooms: [{id: 'room.a', hidden: false}, {id: 'room.secret', hidden: true}]})));
+out.bodyless = ['dm_secrets', 'dm_note', 'module_lookup', 'get_location']
+  .map(n => [isBodylessTool(n), redactToolResultText(n, '{"text": "the innkeeper is a spy"}')]);
+out.plain = redactToolResultText('roll', 'not json at all');
+out.leaky = redactToolResultText('room', 'garbled dm_only: Ghouls');
+out.scalar = redactToolResultText('roll', '17');
+console.log(JSON.stringify(out));
+"""
+
+
+@unittest.skipIf(dashboard is None or _NODE is None, "dashboard deps or node missing")
+class PlayTranscriptRedactionTests(unittest.TestCase):
+    """The /play transcript's tool rows never show DM-only material. The
+    redaction is inline JS in _PLAY_HTML; this runs that exact block in node."""
+
+    def run_js(self):
+        html = dashboard._PLAY_HTML
+        begin, end = "// ---- redact:begin ----", "// ---- redact:end ----"
+        self.assertIn(begin, html)
+        block = html[html.index(begin):html.index(end)]
+        proc = _subprocess.run([_NODE, "-e", block + _REDACT_CASES],
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return _json.loads(proc.stdout)
+
+    def test_dm_only_keys_are_dropped_and_marked(self):
+        out = self.run_js()
+        room = out["move"]["room"]
+        self.assertEqual(room["dm_only"], "[hidden]")
+        self.assertNotIn("Ghouls", _json.dumps(out["move"]))
+        self.assertNotIn("Vault", _json.dumps(out["move"]))
+        self.assertEqual(room["perceived"]["exits"][0]["door"], "1,1")
+
+    def test_nested_secret_keys_are_dropped(self):
+        out = self.run_js()
+        r0 = out["nested"]["results"][0]["rooms"][0]
+        self.assertNotIn("secret_exits", r0)
+        self.assertEqual(r0["dm_only"], "[hidden]")
+        r1 = out["nested"]["results"][1]
+        self.assertEqual(r1, {"keep": 3, "dm_only": "[hidden]"})
+
+    def test_hidden_rooms_are_dropped_from_dungml_rooms(self):
+        out = self.run_js()
+        self.assertEqual([r["id"] for r in out["rooms"]["rooms"]], ["room.a"])
+        self.assertEqual(out["rooms"]["dm_only"], "[hidden]")
+
+    def test_dm_side_tools_show_no_body(self):
+        out = self.run_js()
+        for is_bodyless, text in out["bodyless"]:
+            self.assertTrue(is_bodyless)
+            self.assertNotIn("spy", text)
+
+    def test_non_json_passes_unless_it_names_a_dm_key(self):
+        out = self.run_js()
+        self.assertEqual(out["plain"], "not json at all")
+        self.assertNotIn("Ghouls", out["leaky"])
+        self.assertEqual(out["scalar"], "17")

@@ -65,6 +65,26 @@ class PreTurnCheckTests(unittest.TestCase):
         self.assertEqual(pos["label"], "39 · L1")
         self.assertEqual(pos["exits"], [{"to_label": "37", "state": "closed", "type": "wooden"}])
 
+    def test_unexplored_exit_has_no_to_label_and_no_dm_side_name(self):
+        # dungml nulls to_label for an exit whose far side is unexplored and
+        # keeps the name only in dm_only.exit_labels; nothing of that reaches
+        # pre_turn_check's position.
+        from unittest import mock
+        from tools import dungml_play as dp
+        self.camp = TempCampaign(self, state={
+            "dungml": {"source": "campaign", "map_id": "m1"},
+            "position": {"map_id": "m1", "node": "room.a", "label": "39", "map_name": "L1"}})
+        ctx = {"id": "room.a",
+               "perceived": {"exits": [
+                   {"door": "1,1", "to": "room.b", "to_label": None, "state": "closed",
+                    "type": "wooden", "far_side_explored": False}]},
+               "dm_only": {"exit_labels": {"1,1": "Vault of Ghouls"}}}
+        with mock.patch.object(dp, "campaign_room", return_value=ctx):
+            out = TempCampaign.register(pre_check)["pre_turn_check"]("")
+        pos = out["session_state"]["position"]
+        self.assertEqual(pos["exits"], [{"to_label": None, "state": "closed", "type": "wooden"}])
+        self.assertNotIn("Vault", str(out))
+
     def test_room_lookup_uses_a_short_timeout(self):
         from unittest import mock
         from tools import dungml_play as dp
