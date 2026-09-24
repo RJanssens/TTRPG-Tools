@@ -89,6 +89,72 @@ class MovePartyTests(unittest.TestCase):
             out = self.tools["move_party"]("37")
         self.assertEqual([n["text"] for n in out["room_notes"]], ["Horse tied here."])
 
+    # ----- fix round 1 -----
+
+    def test_map_without_to_is_an_error_and_touches_nothing(self):
+        with mock.patch.object(dp, "campaign_maps") as cm:
+            out = self.tools["move_party"](map="quiet halls")
+        self.assertIn("error", out)
+        cm.assert_not_called()
+        link = dp.link_state(_c.load_campaign())
+        self.assertEqual((link["source"], link["map_id"], link["map_name"]),
+                         ("campaign", "m1", "Level 1A"))
+
+    def test_map_and_to_failure_restores_the_previous_link(self):
+        err = dp.DungmlNotFound("404", {"error": "unknown room"})
+        with mock.patch.object(dp, "campaign_maps",
+                               return_value=[{"id": "m2", "name": "Level 1B: The Quiet Halls"}]), \
+             mock.patch.object(dp, "probe", return_value={}), \
+             mock.patch.object(dp, "campaign_set_party", side_effect=err):
+            out = self.tools["move_party"]("zz", map="quiet")
+        self.assertIn("error", out)
+        link = dp.link_state(_c.load_campaign())
+        self.assertEqual((link["source"], link["map_id"], link["map_name"]),
+                         ("campaign", "m1", "Level 1A"))
+
+    def test_location_only_move_clears_the_room_half(self):
+        self.camp.write("locations/wickmere.md", "# Wickmere\n\nA market town.")
+        with mock.patch.object(dp, "campaign_set_party",
+                               return_value={"ok": True, "party_location": "room.cave_2", "room": ROOM}), \
+             mock.patch.object(dp, "probe", return_value={}):
+            self.tools["move_party"]("37")
+        self.tools["move_party"](location="wickmere")
+        pos = self.camp.read_json("state.json")["position"]
+        self.assertIsNone(pos["node"])
+        moves = [e for e in self.camp.events() if e["type"] == "location_visited"]
+        self.assertEqual(moves[-1]["name"], "Wickmere")
+
+    def test_missing_node_in_response_is_an_error_and_moves_nothing(self):
+        with mock.patch.object(dp, "campaign_set_party", return_value={"ok": True}):
+            out = self.tools["move_party"]("37")
+        self.assertIn("error", out)
+        self.assertNotIn("position", self.camp.read_json("state.json"))
+        self.assertFalse([e for e in self.camp.events() if e["type"] == "location_visited"])
+
+
+class MovePartyCombatMapTests(unittest.TestCase):
+    """The un-linked (combat-map) branch of `to` — no authored locale."""
+
+    def setUp(self):
+        self.camp = TempCampaign(self)
+        self.tools = TempCampaign.register(rooms)
+
+    def test_missing_node_is_an_error_and_moves_nothing(self):
+        with mock.patch.object(dp, "map_info", return_value={"map_id": "cm1"}) as mi, \
+             mock.patch.object(dp, "set_party", return_value={"ok": True}) as sp:
+            out = self.tools["move_party"]("1")
+        self.assertIn("error", out)
+        mi.assert_called_once()
+        sp.assert_called_once()
+        self.assertNotIn("position", self.camp.read_json("state.json"))
+
+    def test_map_info_failure_reports_unreachable_without_calling_set_party(self):
+        with mock.patch.object(dp, "map_info", side_effect=dp.DungmlUnavailable("down")), \
+             mock.patch.object(dp, "set_party") as sp:
+            out = self.tools["move_party"]("1")
+        self.assertIn("error", out)
+        sp.assert_not_called()
+
 
 class RoomAndDoorTests(unittest.TestCase):
     def setUp(self):
@@ -127,6 +193,32 @@ class RoomAndDoorTests(unittest.TestCase):
     def test_room_off_an_authored_locale_says_so(self):
         self.camp.write_json("state.json", {"dungml": {"source": "combat"}})
         out = self.tools["room"]()
+        self.assertIn("error", out)
+
+    # ----- fix round 1 -----
+
+    def test_door_with_comma_in_a_label_is_treated_as_a_room(self):
+        with mock.patch.object(dp, "campaign_door",
+                               return_value={"ok": True, "door": "1,2", "state": "open",
+                                             "discovered": True}) as cd:
+            self.tools["door"]("Hall, East", state="open")
+        cd.assert_called_once_with("test-campaign", "m1", door=None,
+                                   between=["room.cave_2", "Hall, East"],
+                                   discovered=True, state="open")
+
+    def test_note_room_without_query_errors_off_an_authored_locale(self):
+        self.camp.write_json("state.json", {"dungml": {"source": "combat"},
+                                            "position": {"map_id": "m1", "node": "room.cave_2",
+                                                         "label": "37"}})
+        out = self.tools["note_room"]("Cleared.")
+        self.assertIn("error", out)
+
+    def test_note_room_without_query_errors_if_locale_does_not_match_position(self):
+        self.camp.write_json("state.json", {"dungml": {"source": "campaign", "map_id": "m9",
+                                                        "map_name": "Other"},
+                                            "position": {"map_id": "m1", "map_name": "Level 1A",
+                                                         "node": "room.cave_2", "label": "37"}})
+        out = self.tools["note_room"]("Cleared.")
         self.assertIn("error", out)
 
 

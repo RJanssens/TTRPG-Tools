@@ -644,7 +644,8 @@ def register(mcp):
 
         For what the party can see into but hasn't entered — the room beyond
         an opened door, a chamber lit by a spell, the corridor a thief scouted
-        ahead. Unknown rooms return an error with candidates.
+        ahead. Unknown rooms return an error with candidates. The returned
+        room's `dm_only` is never narrated.
         """
         cfg = _c.load_campaign()
         ext = external_id(cfg)
