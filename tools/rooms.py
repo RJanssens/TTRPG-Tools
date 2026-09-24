@@ -104,8 +104,10 @@ def register(mcp):
         `room_notes` (what the party changed there earlier) and, when the
         location changed, the opening of its file. An unknown room returns
         `candidates` and moves nothing — a failed `map`+`to` also undoes the
-        locale switch it made. If the map service is down the location half
-        still moves and `warning` says so.
+        locale switch it made. If the map service is down (or places no
+        one) the location half still moves, the room half is cleared and
+        `warning` says so. With no locale selected and no combat map
+        pushed, `to` is read as a location slug; dungml is not called.
         """
         if map and not to:
             return {"error": "pass `to` — the room you arrive in — with `map`; "
@@ -130,50 +132,71 @@ def register(mcp):
             if "error" in switched:
                 return switched
 
+        room_moved = False
         if to:
             campaign_map_id, campaign_map_name = _campaign_map(cfg)
             is_campaign = bool(campaign_map_id)
-            try:
-                if is_campaign:
-                    map_id, map_name = campaign_map_id, campaign_map_name
-                    res = dp.campaign_set_party(ext, map_id, to)
+            if not is_campaign and not dp.link_state(cfg).get("width"):
+                # No authored locale and no combat map ever pushed: dungml has
+                # no map to put a marker on (its legacy route would provision
+                # an empty one and then refuse it as mid-edit). Don't call it.
+                if loc is not None:
+                    out["warning"] = "no map selected — party marker not moved"
                 else:
-                    # Resolved before the move, not after: a failure here is
-                    # "the marker never moved", not "it moved but we lost
-                    # track of which map" — the two must not be confused.
-                    map_id = dp.map_info(ext).get("map_id")
-                    map_name = "combat map"
-                    res = dp.set_party(ext, to)
-            except (dp.DungmlNotFound, dp.DungmlConflict) as e:
-                _restore_link(cfg, prev_link)
-                return dp.describe_error(e)
-            except dp.DungmlUnavailable as e:
-                if loc is None:
-                    _restore_link(cfg, prev_link)
-                    return {"error": f"map service unreachable — party marker not moved ({e})"}
-                out["warning"] = f"map service unreachable — party marker not moved ({e})"
+                    loc = _pos.find_location(cfg, to)
+                    if loc is None:
+                        return {"error": "no map selected for this campaign — pick one with "
+                                         "dungml_locales / dungml_use_locale, or pass location="}
             else:
-                room = res.get("room") or {}
-                node = res.get("party_location") or room.get("id")
-                if not node:
-                    # dungml accepted the call but didn't place anyone —
-                    # the old silent no-op. Nothing moves on a non-move.
+                try:
+                    if is_campaign:
+                        map_id, map_name = campaign_map_id, campaign_map_name
+                        res = dp.campaign_set_party(ext, map_id, to)
+                    else:
+                        # Resolved before the move, not after: a failure here is
+                        # "the marker never moved", not "it moved but we lost
+                        # track of which map" — the two must not be confused.
+                        map_id = dp.map_info(ext).get("map_id")
+                        map_name = "combat map"
+                        res = dp.set_party(ext, to)
+                except (dp.DungmlNotFound, dp.DungmlConflict) as e:
                     _restore_link(cfg, prev_link)
-                    return {"error": f"dungml did not place the party at '{to}' — "
-                                     f"check dungml_rooms for the exact room"}
-                changes.update(map_id=map_id, map_name=map_name, node=node,
-                               label=room.get("label") or node)
-                out["room"] = room
-                out["room_notes"] = notes_for(cfg, map_id, node)
-                dp.save_link_state(cfg, party_node=node)
+                    return dp.describe_error(e)
+                except dp.DungmlUnavailable as e:
+                    if loc is None:
+                        _restore_link(cfg, prev_link)
+                        return {"error": f"map service unreachable — party marker not moved ({e})"}
+                    out["warning"] = f"map service unreachable — party marker not moved ({e})"
+                else:
+                    room = res.get("room") or {}
+                    node = res.get("party_location") or room.get("id")
+                    if not node:
+                        # dungml accepted the call but didn't place anyone —
+                        # the old silent no-op. Nothing moves on a non-move,
+                        # unless a location was named too: that half still
+                        # moves, as when the service is down.
+                        msg = (f"dungml did not place the party at '{to}' — "
+                               f"check dungml_rooms for the exact room")
+                        if loc is None:
+                            _restore_link(cfg, prev_link)
+                            return {"error": msg}
+                        out["warning"] = msg
+                    else:
+                        changes.update(map_id=map_id, map_name=map_name, node=node,
+                                       label=room.get("label") or node)
+                        out["room"] = room
+                        out["room_notes"] = notes_for(cfg, map_id, node)
+                        dp.save_link_state(cfg, party_node=node)
+                        room_moved = True
 
         if loc is not None:
             changes.update(location=loc["slug"], area=loc["area"], name=loc["name"])
             out["location_brief"] = _brief(loc["path"])
-            if not to:
-                # Leaving by location alone abandons the room, not just the
-                # display of it — position must not go on claiming a node
-                # on a map the party has left.
+            if not room_moved:
+                # Arriving at a location without a room abandons the room,
+                # not just the display of it — position must not go on
+                # claiming a node on a map the party has left (or whose
+                # marker never moved).
                 changes.update(map_id=None, map_name=None, node=None, label=None)
 
         if not changes:
@@ -202,6 +225,8 @@ def register(mcp):
         if not map_id:
             return {"error": "room context needs an authored locale (dungml_use_locale)"}
         pos = _pos.current_position(cfg)
+        if not query and pos.get("node") and pos.get("map_id") != map_id:
+            return {"error": "the party's room is on another map — move_party first"}
         q = query or pos.get("node")
         if not q:
             return {"error": "the party isn't in a room yet — move_party first"}
@@ -222,17 +247,22 @@ def register(mcp):
         map_id, _ = _campaign_map(cfg)
         if not map_id:
             return {"error": "doors are tracked on an authored locale (dungml_use_locale)"}
+        if not state and not found:
+            return {"error": "nothing to record — pass state= or found=True"}
         is_key = bool(_DOOR_KEY_RX.match(door))
         between = None
         if not is_key:
-            here = _pos.current_position(cfg).get("node")
+            pos = _pos.current_position(cfg)
+            here = pos.get("node")
             if not here:
                 return {"error": "the party isn't in a room yet — move_party first"}
+            if pos.get("map_id") != map_id:
+                return {"error": "the party's room is on another map — move_party first"}
             between = [here, door]
         try:
             return dp.campaign_door(dp.external_id(cfg), map_id,
                                     door=door if is_key else None, between=between,
-                                    discovered=True, state=state or None)
+                                    discovered=found or bool(state), state=state or None)
         except dp.DungmlUnavailable as e:
             return dp.describe_error(e)
 

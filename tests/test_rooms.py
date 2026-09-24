@@ -132,11 +132,31 @@ class MovePartyTests(unittest.TestCase):
         self.assertFalse([e for e in self.camp.events() if e["type"] == "location_visited"])
 
 
+class MovePartyNoNodeWithLocationTests(unittest.TestCase):
+    def setUp(self):
+        self.camp = TempCampaign(self, state=dict(LINKED, position={
+            "map_id": "m1", "map_name": "Level 1A", "node": "room.cave_2", "label": "37"}))
+        self.tools = TempCampaign.register(rooms)
+
+    def test_no_node_with_location_moves_location_clears_map_and_warns(self):
+        self.camp.write("locations/wickmere.md", "# Wickmere\n\nA market town.")
+        with mock.patch.object(dp, "campaign_set_party", return_value={"ok": True}):
+            out = self.tools["move_party"]("37", location="wickmere")
+        self.assertNotIn("error", out)
+        self.assertIn("warning", out)
+        pos = self.camp.read_json("state.json")["position"]
+        self.assertEqual(pos["location"], "wickmere")
+        self.assertIsNone(pos["node"])
+        self.assertIsNone(pos["map_id"])
+
+
 class MovePartyCombatMapTests(unittest.TestCase):
     """The un-linked (combat-map) branch of `to` — no authored locale."""
 
     def setUp(self):
-        self.camp = TempCampaign(self)
+        # A combat map has been pushed and probed: the link knows its size.
+        self.camp = TempCampaign(self, state={"dungml": {"source": "combat", "width": 36,
+                                                         "height": 18}})
         self.tools = TempCampaign.register(rooms)
 
     def test_missing_node_is_an_error_and_moves_nothing(self):
@@ -154,6 +174,45 @@ class MovePartyCombatMapTests(unittest.TestCase):
             out = self.tools["move_party"]("1")
         self.assertIn("error", out)
         sp.assert_not_called()
+
+
+class MovePartyNoMapTests(unittest.TestCase):
+    """No authored locale selected and no combat map ever pushed: dungml has
+    nothing to move a marker on, so it must not be called at all."""
+
+    def setUp(self):
+        self.camp = TempCampaign(self)
+        self.tools = TempCampaign.register(rooms)
+        patcher = mock.patch.object(dp, "_request",
+                                    side_effect=AssertionError("no HTTP call expected"))
+        self.req = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_to_naming_a_location_moves_the_location(self):
+        self.camp.write("locations/wickmere.md", "# Wickmere\n\nA market town.")
+        out = self.tools["move_party"]("wickmere")
+        self.req.assert_not_called()
+        self.assertNotIn("error", out)
+        pos = self.camp.read_json("state.json")["position"]
+        self.assertEqual(pos["location"], "wickmere")
+        self.assertIsNone(pos.get("node"))
+        self.assertIn("market town", out["location_brief"])
+
+    def test_to_naming_nothing_is_an_error_and_moves_nothing(self):
+        out = self.tools["move_party"]("37")
+        self.req.assert_not_called()
+        self.assertIn("no map selected", out["error"])
+        self.assertNotIn("position", self.camp.read_json("state.json"))
+        self.assertFalse([e for e in self.camp.events() if e["type"] == "location_visited"])
+
+    def test_to_with_location_moves_the_location_and_warns(self):
+        self.camp.write("locations/wickmere.md", "# Wickmere\n\nA market town.")
+        out = self.tools["move_party"]("37", location="wickmere")
+        self.req.assert_not_called()
+        self.assertIn("warning", out)
+        pos = self.camp.read_json("state.json")["position"]
+        self.assertEqual(pos["location"], "wickmere")
+        self.assertIsNone(pos.get("node"))
 
 
 class RoomAndDoorTests(unittest.TestCase):
@@ -220,6 +279,46 @@ class RoomAndDoorTests(unittest.TestCase):
                                                          "node": "room.cave_2", "label": "37"}})
         out = self.tools["note_room"]("Cleared.")
         self.assertIn("error", out)
+
+    # ----- final review -----
+
+    def _stale(self):
+        self.camp.write_json("state.json", {"dungml": {"source": "campaign", "map_id": "m9",
+                                                        "map_name": "Other"},
+                                            "position": {"map_id": "m1", "map_name": "Level 1A",
+                                                         "node": "room.cave_2", "label": "37"}})
+
+    def test_room_without_query_errors_if_locale_does_not_match_position(self):
+        self._stale()
+        with mock.patch.object(dp, "campaign_room") as cr:
+            out = self.tools["room"]()
+        cr.assert_not_called()
+        self.assertIn("another map", out["error"])
+
+    def test_room_with_query_still_works_on_another_locale(self):
+        self._stale()
+        with mock.patch.object(dp, "campaign_room", return_value=ROOM) as cr:
+            self.tools["room"]("37")
+        cr.assert_called_once_with("test-campaign", "m9", "37")
+
+    def test_door_by_neighbour_errors_if_locale_does_not_match_position(self):
+        self._stale()
+        with mock.patch.object(dp, "campaign_door") as cd:
+            out = self.tools["door"]("39", state="open")
+        cd.assert_not_called()
+        self.assertIn("another map", out["error"])
+
+    def test_bare_door_call_is_an_error(self):
+        with mock.patch.object(dp, "campaign_door") as cd:
+            out = self.tools["door"]("39")
+        cd.assert_not_called()
+        self.assertIn("error", out)
+
+    def test_found_without_state_marks_discovered(self):
+        with mock.patch.object(dp, "campaign_door", return_value={"ok": True}) as cd:
+            self.tools["door"]("39", found=True)
+        cd.assert_called_once_with("test-campaign", "m1", door=None,
+                                   between=["room.cave_2", "39"], discovered=True, state=None)
 
 
 if __name__ == "__main__":
