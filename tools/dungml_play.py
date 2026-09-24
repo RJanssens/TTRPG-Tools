@@ -23,6 +23,7 @@ Every call degrades gracefully. If `dmap-server` is unreachable the bridge
 reports `connected: False` and the tab falls back to the plain local render
 rather than erroring; the DM's game is never blocked on the map service.
 """
+import http.client
 import json
 import os
 import re
@@ -89,6 +90,7 @@ def _request(
     auth: bool = True,
     raw: bool = False,
     strict: bool = False,
+    timeout: float = _TIMEOUT_S,
 ) -> dict | bytes:
     """One call against dmap-server. Returns parsed JSON, or raw bytes when
     `raw` (the render endpoints answer `image/svg+xml`, not JSON).
@@ -109,7 +111,7 @@ def _request(
         headers["Authorization"] = f"Bearer {DUNGML_SERVICE_TOKEN}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = resp.read()
     except urllib.error.HTTPError as e:
         if e.code == 404 and method == "GET" and not strict:
@@ -135,6 +137,15 @@ def _request(
             f"dungml backend unreachable at {DUNGML_API_BASE} ({e.reason}). "
             f"Start it with `uv run dmap-server` from the dungml workspace, "
             f"or set DUNGML_API_BASE."
+        ) from e
+    except (OSError, http.client.HTTPException) as e:
+        # After HTTPError/URLError on purpose: both are OSError subclasses.
+        # What reaches here failed after the request was sent — the server
+        # closed the connection (RemoteDisconnected) or never answered
+        # (TimeoutError) — which urllib does not wrap in URLError.
+        raise DungmlUnavailable(
+            f"dungml {method} {path} → no response from {DUNGML_API_BASE} "
+            f"({type(e).__name__}: {e})"
         ) from e
     if raw:
         return payload
@@ -302,7 +313,8 @@ def campaign_set_party(ext: str, map_id: str, node: str) -> dict:
     return _request("POST", f"{_cm(ext, map_id)}/party", {"room_id": node})
 
 
-def campaign_room(ext: str, map_id: str, query: str, scope: str = "gm") -> dict:
+def campaign_room(ext: str, map_id: str, query: str, scope: str = "gm",
+                  timeout: float = _TIMEOUT_S) -> dict:
     """Look up a room by id or free-text query on an authored locale.
 
     A 404 here means the caller named something that doesn't exist — raised
@@ -310,12 +322,13 @@ def campaign_room(ext: str, map_id: str, query: str, scope: str = "gm") -> dict:
     swallowed like an ordinary GET 404.
     """
     q = urllib.parse.quote(query, safe="")
-    return _request("GET", f"{_cm(ext, map_id)}/rooms/{q}?scope={scope}", strict=True)
+    return _request("GET", f"{_cm(ext, map_id)}/rooms/{q}?scope={scope}", strict=True,
+                    timeout=timeout)
 
 
-def campaign_known(ext: str, map_id: str) -> dict:
+def campaign_known(ext: str, map_id: str, timeout: float = _TIMEOUT_S) -> dict:
     """What the party has discovered so far on this authored locale."""
-    return _request("GET", f"{_cm(ext, map_id)}/known", strict=True)
+    return _request("GET", f"{_cm(ext, map_id)}/known", strict=True, timeout=timeout)
 
 
 def campaign_door(ext: str, map_id: str, *, door: str | None = None,

@@ -144,7 +144,8 @@ def _position(cfg: dict) -> dict:
     link = dp.link_state(cfg)
     if pos.get("node") and link["source"] == "campaign" and link["map_id"] == pos.get("map_id"):
         try:
-            ctx = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"], scope="fog")
+            ctx = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"], scope="fog",
+                                   timeout=3.0)
         except dp.DungmlUnavailable:
             ctx = None
         perceived = ctx.get("perceived") if isinstance(ctx, dict) else None

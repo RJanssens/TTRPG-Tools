@@ -191,6 +191,13 @@ class PrimerPositionTests(unittest.TestCase):
         self.assertEqual(pos["room"]["id"], "room.cave_2")
         self.assertEqual(pos["room_notes"][0]["text"], "Horse tied here.")
 
+    def test_room_lookup_uses_a_short_timeout(self):
+        TempCampaign(self, state={"dungml": {"source": "campaign", "map_id": "m1"},
+                                  "position": {"map_id": "m1", "node": "room.x", "label": "1"}})
+        with mock.patch.object(dp, "campaign_room", return_value={}) as cr:
+            TempCampaign.register(lore)["session_primer"](scene=True)
+        self.assertEqual(cr.call_args.kwargs.get("timeout"), 3.0)
+
     def test_map_down_still_reports_where(self):
         TempCampaign(self, state={"dungml": {"source": "campaign", "map_id": "m1"},
                                   "position": {"map_id": "m1", "node": "room.x", "label": "1"}})

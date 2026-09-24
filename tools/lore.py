@@ -152,7 +152,8 @@ def _position_block(cfg: dict, state: dict, events: list) -> dict:
         block["room_notes"] = notes_for(cfg, pos["map_id"], pos["node"])
         if link["source"] == "campaign" and link["map_id"] == pos["map_id"]:
             try:
-                ctx = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"])
+                ctx = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"],
+                                       timeout=3.0)
             except dp.DungmlUnavailable as e:
                 block["map_error"] = dp.describe_error(e)["error"]
             else:

@@ -42,7 +42,8 @@ class _Recorder:
         self.responses = responses or {}
         self.fail = fail
 
-    def __call__(self, method, path, body=None, *, auth=True, raw=False, strict=False):
+    def __call__(self, method, path, body=None, *, auth=True, raw=False, strict=False,
+                 timeout=None):
         self.calls.append((method, path, body))
         if self.fail:
             raise dp.DungmlUnavailable("stubbed outage")
@@ -574,3 +575,53 @@ class UnparseableResponseTests(unittest.TestCase):
         ):
             with self.assertRaises(dp.DungmlUnavailable):
                 dp._request("GET", "/x")
+
+
+class ReadTimeErrorTests(unittest.TestCase):
+    """urllib only wraps send-time failures in URLError. A server that closes
+    the connection without answering (RemoteDisconnected) or accepts and
+    never answers (TimeoutError) raises raw — both must still degrade to
+    DungmlUnavailable."""
+
+    def _assert_unavailable(self, exc):
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=exc):
+            with self.assertRaises(dp.DungmlUnavailable):
+                dp._request("GET", "/x")
+
+    def test_remote_disconnected_is_unavailable(self):
+        import http.client
+        self._assert_unavailable(http.client.RemoteDisconnected("closed"))
+
+    def test_timeout_is_unavailable(self):
+        self._assert_unavailable(TimeoutError("timed out"))
+
+    def test_http_error_is_still_mapped_first(self):
+        import io, urllib.error
+        err = urllib.error.HTTPError("http://x", 409, "x", {}, io.BytesIO(b"{}"))
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(dp.DungmlConflict):
+                dp._request("POST", "/x", {})
+
+    def test_timeout_kwarg_reaches_urlopen(self):
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 side_effect=TimeoutError("t")) as uo:
+            with self.assertRaises(dp.DungmlUnavailable):
+                dp._request("GET", "/x", timeout=3.0)
+        self.assertEqual(uo.call_args.kwargs["timeout"], 3.0)
+
+    def test_default_timeout(self):
+        with unittest.mock.patch("urllib.request.urlopen",
+                                 side_effect=TimeoutError("t")) as uo:
+            with self.assertRaises(dp.DungmlUnavailable):
+                dp._request("GET", "/x")
+        self.assertEqual(uo.call_args.kwargs["timeout"], dp._TIMEOUT_S)
+
+    def test_room_and_known_pass_timeout(self):
+        seen = []
+        def fake(method, path, body=None, **kw):
+            seen.append(kw.get("timeout"))
+            return {}
+        with unittest.mock.patch.object(dp, "_request", side_effect=fake):
+            dp.campaign_room("c", "m", "39", timeout=3.0)
+            dp.campaign_known("c", "m", timeout=3.0)
+        self.assertEqual(seen, [3.0, 3.0])

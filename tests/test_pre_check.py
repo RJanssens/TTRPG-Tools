@@ -65,6 +65,16 @@ class PreTurnCheckTests(unittest.TestCase):
         self.assertEqual(pos["label"], "39 · L1")
         self.assertEqual(pos["exits"], [{"to_label": "37", "state": "closed", "type": "wooden"}])
 
+    def test_room_lookup_uses_a_short_timeout(self):
+        from unittest import mock
+        from tools import dungml_play as dp
+        self.camp = TempCampaign(self, state={
+            "dungml": {"source": "campaign", "map_id": "m1"},
+            "position": {"map_id": "m1", "node": "room.a", "label": "39"}})
+        with mock.patch.object(dp, "campaign_room", return_value={}) as cr:
+            TempCampaign.register(pre_check)["pre_turn_check"]("")
+        self.assertEqual(cr.call_args.kwargs.get("timeout"), 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()
