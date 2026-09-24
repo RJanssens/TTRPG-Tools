@@ -172,3 +172,29 @@ class PrimerContentTests(unittest.TestCase):
         out = self.primer(campaign={"characters": {"quill": {
             "label": "Quillory", "race": "satyr", "cls": "Bard", "hp_max": 7}}})
         self.assertEqual(out["party"]["quill"]["race"], "satyr")
+
+
+from unittest import mock
+from tools import dungml_play as dp, rooms as rooms_mod
+
+
+class PrimerPositionTests(unittest.TestCase):
+    def test_scene_carries_position_room_and_notes(self):
+        camp = TempCampaign(self, state={
+            "dungml": {"source": "campaign", "map_id": "m1"},
+            "position": {"map_id": "m1", "node": "room.cave_2", "label": "37", "name": "Gate"}})
+        rooms_mod.add_note(lore._c.load_campaign(), "m1", "room.cave_2", "Horse tied here.")
+        with mock.patch.object(dp, "campaign_room", return_value={"id": "room.cave_2", "label": "37"}):
+            out = TempCampaign.register(lore)["session_primer"](scene=True)
+        pos = out["scene"]["position"]
+        self.assertEqual(pos["where"]["label"], "37")
+        self.assertEqual(pos["room"]["id"], "room.cave_2")
+        self.assertEqual(pos["room_notes"][0]["text"], "Horse tied here.")
+
+    def test_map_down_still_reports_where(self):
+        TempCampaign(self, state={"dungml": {"source": "campaign", "map_id": "m1"},
+                                  "position": {"map_id": "m1", "node": "room.x", "label": "1"}})
+        with mock.patch.object(dp, "campaign_room", side_effect=dp.DungmlUnavailable("down")):
+            out = TempCampaign.register(lore)["session_primer"](scene=True)
+        self.assertEqual(out["scene"]["position"]["where"]["label"], "1")
+        self.assertIn("map_error", out["scene"]["position"])

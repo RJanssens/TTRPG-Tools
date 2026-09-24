@@ -51,6 +51,20 @@ class PreTurnCheckTests(unittest.TestCase):
         self.assertEqual([n["slug"] for n in scene], ["leoric"])
         self.assertEqual(scene[0]["disposition"], -30)
 
+    def test_reports_position_label_and_perceived_exits(self):
+        from unittest import mock
+        from tools import dungml_play as dp
+        self.camp = TempCampaign(self, state={
+            "dungml": {"source": "campaign", "map_id": "m1"},
+            "position": {"map_id": "m1", "node": "room.a", "label": "39", "map_name": "L1"}})
+        ctx = {"id": "room.a", "perceived": {"exits": [
+            {"to_label": "37", "state": "closed", "type": "wooden", "door": "1,1"}]}}
+        with mock.patch.object(dp, "campaign_room", return_value=ctx):
+            out = TempCampaign.register(pre_check)["pre_turn_check"]("")
+        pos = out["session_state"]["position"]
+        self.assertEqual(pos["label"], "39 · L1")
+        self.assertEqual(pos["exits"], [{"to_label": "37", "state": "closed", "type": "wooden"}])
+
 
 if __name__ == "__main__":
     unittest.main()

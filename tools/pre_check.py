@@ -133,6 +133,26 @@ def _combat_state(cfg: dict) -> dict:
     }
 
 
+def _position(cfg: dict) -> dict:
+    """The party's position label, plus the exits it can perceive from the
+    current room on an authored campaign map. Never raises when the map
+    service is down — `exits` is just empty."""
+    from tools import dungml_play as dp
+    from tools.position import current_position, position_label
+    pos = current_position(cfg)
+    out = {"label": position_label(pos), "exits": []}
+    link = dp.link_state(cfg)
+    if pos.get("node") and link["source"] == "campaign" and link["map_id"] == pos.get("map_id"):
+        try:
+            ctx = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"], scope="fog")
+            out["exits"] = [{"to_label": e.get("to_label"), "state": e.get("state"),
+                             "type": e.get("type")}
+                            for e in (ctx.get("perceived") or {}).get("exits", [])]
+        except dp.DungmlUnavailable:
+            pass
+    return out
+
+
 def register(mcp):
 
     @mcp.tool()
@@ -175,5 +195,6 @@ def register(mcp):
             "session_state": {
                 **npc_state,
                 "combat": combat,
+                "position": _position(cfg),
             },
         }

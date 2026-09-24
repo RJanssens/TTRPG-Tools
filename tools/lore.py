@@ -54,27 +54,25 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _current_location(cfg: dict, events: list) -> dict | None:
-    """Resolve the party's current location from the last `location_visited`
-    event, and read its file (plus the parent area file when it has one)."""
-    last = None
-    for e in reversed(events):
-        if e.get("type") == "location_visited":
-            last = e
-            break
-    if last is None:
+    """Resolve the party's current location from state.json["position"]
+    (falling back to the last `location_visited` event for campaigns that
+    predate it), and read its file (plus the parent area file when it has
+    one)."""
+    from tools.position import current_position
+    pos = current_position(cfg, events=events)
+    slug = pos.get("location", "")
+    if not slug:
         return None
 
-    slug = last.get("slug", "")
-    area = last.get("area", "") or ""
+    area = pos.get("area", "") or ""
     locs = cfg["_data_dir"] / "locations"
     path = (locs / area / f"{slug}.md") if area else (locs / f"{slug}.md")
 
     out: dict = {
         "slug":    slug,
         "area":    area,
-        "name":    last.get("name", slug),
-        "day":     last.get("day"),
-        "session": last.get("session"),
+        "name":    pos.get("name", slug),
+        "day":     (pos.get("since") or {}).get("day"),
     }
     if path.exists():
         out["content"] = _clip(_read_safe(path), _SCENE_LOCATION_CHARS)
@@ -139,6 +137,27 @@ def _combat_block(cfg: dict) -> dict | None:
     }
 
 
+def _position_block(cfg: dict, state: dict, events: list) -> dict:
+    """The party's position, plus the authored room and its notes when the
+    current locale is a campaign map. Never raises on a dead map service —
+    `where` still reports the party's location even when the room lookup
+    can't be made."""
+    from tools import dungml_play as dp
+    from tools.position import current_position
+    from tools.rooms import notes_for
+    pos = current_position(cfg, state, events)
+    block: dict = {"where": pos, "room": None, "room_notes": []}
+    link = dp.link_state(cfg)
+    if pos.get("node") and pos.get("map_id"):
+        block["room_notes"] = notes_for(cfg, pos["map_id"], pos["node"])
+        if link["source"] == "campaign" and link["map_id"] == pos["map_id"]:
+            try:
+                block["room"] = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"])
+            except dp.DungmlUnavailable as e:
+                block["map_error"] = dp.describe_error(e)["error"]
+    return block
+
+
 def _scene_block(cfg: dict, state: dict, events: list) -> dict:
     """Everything the DM needs to resume a scene without reading files."""
     log_file = cfg["_data_dir"] / cfg.get("session_log_file", "adventure_log.md")
@@ -146,6 +165,7 @@ def _scene_block(cfg: dict, state: dict, events: list) -> dict:
         "location":         _current_location(cfg, events),
         "recent_narrative": _tail(_read_safe(log_file), _SCENE_LOG_CHARS) if log_file.exists() else "",
         "light":            _light_block(state),
+        "position":         _position_block(cfg, state, events),
     }
     combat = _combat_block(cfg)
     if combat:
