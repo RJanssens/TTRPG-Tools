@@ -205,8 +205,10 @@ too.
   returns the room context or an error.
 - `dungml_rooms()` — adds `label`, drops secret doors from `exits`, adds
   `secret_exits`, and reads `party_node` live instead of from the cache.
-- `dungml_status/locales/use_locale/view` — unchanged, but every result
-  carries `warning` when a sync call was swallowed.
+- `dungml_status/locales/use_locale/view` — unchanged. (Loud failures are
+  delivered where they matter: `move_party`, `room`, `door`,
+  `dungml_reveal` and the primer's position block all report dungml
+  errors instead of swallowing them.)
 
 **Removed:** `dungml_party_at` (subsumed by `move_party`). Net, this adds
 four tools (`move_party`, `room`, `door`, `note_room`, `module_lookup`, less
