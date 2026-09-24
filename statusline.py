@@ -111,15 +111,14 @@ def main():
 
         # Current location
         location_str = ""
-        events_path = camp_dir / "events.json"
-        if events_path.exists():
-            events = json.loads(events_path.read_text())
-            for event in reversed(events):
-                if event.get("type") == "location_visited":
-                    loc_name = event.get("name") or event.get("slug", "")
-                    if loc_name:
-                        location_str = f" @ {loc_name}"
-                    break
+        try:
+            from tools.position import current_position, position_label
+            pos = current_position({"_dir": camp_dir}, state=state)
+            label = position_label(pos)
+            if label:
+                location_str = f" @ {label}"
+        except Exception:
+            location_str = ""
 
         # Alerts
         in_combat = bool(state.get("combat"))
