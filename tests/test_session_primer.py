@@ -198,3 +198,13 @@ class PrimerPositionTests(unittest.TestCase):
             out = TempCampaign.register(lore)["session_primer"](scene=True)
         self.assertEqual(out["scene"]["position"]["where"]["label"], "1")
         self.assertIn("map_error", out["scene"]["position"])
+
+    def test_room_of_unexpected_shape_does_not_crash_and_sets_map_error(self):
+        TempCampaign(self, state={"dungml": {"source": "campaign", "map_id": "m1"},
+                                  "position": {"map_id": "m1", "node": "room.x", "label": "1"}})
+        with mock.patch.object(dp, "campaign_room", return_value=["not", "a", "dict"]):
+            out = TempCampaign.register(lore)["session_primer"](scene=True)
+        pos = out["scene"]["position"]
+        self.assertEqual(pos["where"]["label"], "1")
+        self.assertFalse(pos["room"])
+        self.assertIn("map_error", pos)

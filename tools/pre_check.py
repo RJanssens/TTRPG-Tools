@@ -145,11 +145,14 @@ def _position(cfg: dict) -> dict:
     if pos.get("node") and link["source"] == "campaign" and link["map_id"] == pos.get("map_id"):
         try:
             ctx = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"], scope="fog")
+        except dp.DungmlUnavailable:
+            ctx = None
+        perceived = ctx.get("perceived") if isinstance(ctx, dict) else None
+        exits = perceived.get("exits") if isinstance(perceived, dict) else None
+        if isinstance(exits, list):
             out["exits"] = [{"to_label": e.get("to_label"), "state": e.get("state"),
                              "type": e.get("type")}
-                            for e in (ctx.get("perceived") or {}).get("exits", [])]
-        except dp.DungmlUnavailable:
-            pass
+                            for e in exits if isinstance(e, dict)]
     return out
 
 

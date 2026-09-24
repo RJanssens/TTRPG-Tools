@@ -548,3 +548,29 @@ class NewRouteClientTests(BridgeTestCase):
         with unittest.mock.patch("urllib.request.urlopen", side_effect=err):
             with self.assertRaises(dp.DungmlNotFound):
                 dp.campaign_room("c", "m", "nowhere")
+
+
+class UnparseableResponseTests(unittest.TestCase):
+    """A 200 whose body isn't JSON (a proxy error page, a truncated response)
+    must degrade to DungmlUnavailable, never a raw JSONDecodeError — every
+    caller up the stack only knows how to catch the former."""
+
+    class _FakeResponse:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def test_200_with_non_json_body_raises_unavailable(self):
+        with unittest.mock.patch(
+            "urllib.request.urlopen", return_value=self._FakeResponse(b"<html>")
+        ):
+            with self.assertRaises(dp.DungmlUnavailable):
+                dp._request("GET", "/x")

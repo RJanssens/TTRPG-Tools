@@ -152,9 +152,14 @@ def _position_block(cfg: dict, state: dict, events: list) -> dict:
         block["room_notes"] = notes_for(cfg, pos["map_id"], pos["node"])
         if link["source"] == "campaign" and link["map_id"] == pos["map_id"]:
             try:
-                block["room"] = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"])
+                ctx = dp.campaign_room(dp.external_id(cfg), pos["map_id"], pos["node"])
             except dp.DungmlUnavailable as e:
                 block["map_error"] = dp.describe_error(e)["error"]
+            else:
+                if isinstance(ctx, dict):
+                    block["room"] = ctx
+                else:
+                    block["map_error"] = f"dungml returned an unexpected room shape ({type(ctx).__name__})"
     return block
 
 

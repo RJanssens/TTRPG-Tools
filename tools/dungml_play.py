@@ -111,7 +111,6 @@ def _request(
     try:
         with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
             payload = resp.read()
-            return payload if raw else (json.loads(payload.decode("utf-8")) if payload else {})
     except urllib.error.HTTPError as e:
         if e.code == 404 and method == "GET" and not strict:
             return b"" if raw else {}
@@ -137,6 +136,14 @@ def _request(
             f"Start it with `uv run dmap-server` from the dungml workspace, "
             f"or set DUNGML_API_BASE."
         ) from e
+    if raw:
+        return payload
+    if not payload:
+        return {}
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise DungmlUnavailable(f"dungml {method} {path} → unparseable response") from e
 
 
 def health() -> bool:
