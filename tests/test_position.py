@@ -44,6 +44,23 @@ class PositionTests(unittest.TestCase):
         self.assertEqual((loc["area"], loc["name"]), ("wickmere", "The Peacock and Pike"))
         self.assertIsNone(position.find_location(_c.load_campaign(), "nowhere"))
 
+    def test_find_location_rejects_path_traversal(self):
+        camp = TempCampaign(self)
+        camp.write("characters/secret.md", "# Secret\nDM-only notes.\n")
+        # locations/ must actually exist for the traversal to be tempting at all.
+        camp.write("locations/wickmere/x.md", "# X\n")
+        self.assertIsNone(position.find_location(_c.load_campaign(), "../characters/secret"))
+        self.assertIsNone(position.find_location(_c.load_campaign(), "/etc/passwd"))
+
+    def test_find_location_area_slug_must_match_actual_area(self):
+        camp = TempCampaign(self)
+        camp.write("locations/wickmere/peacock-and-pike.md", "# The Peacock and Pike\n")
+        self.assertIsNone(
+            position.find_location(_c.load_campaign(), "otherarea/peacock-and-pike"))
+        # bare slug lookup is unaffected — it still finds it under its real area.
+        loc = position.find_location(_c.load_campaign(), "peacock-and-pike")
+        self.assertEqual(loc["area"], "wickmere")
+
     def test_label_prefers_room_then_location(self):
         self.assertEqual(position.position_label(
             {"name": "Gate", "label": "39", "map_name": "Level 1A"}), "39 · Level 1A")

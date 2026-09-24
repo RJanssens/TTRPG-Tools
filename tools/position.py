@@ -10,6 +10,8 @@ Campaigns from before this record existed fall back once to the last
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import _campaign as _c
 
 _KEYS = ("location", "area", "name", "map_id", "map_name", "node", "label")
@@ -26,16 +28,33 @@ def _title(path) -> str:
 
 
 def find_location(cfg: dict, slug: str) -> dict | None:
-    """A location file by 'area/slug' or bare slug. None if there is none."""
-    locs = cfg["_data_dir"] / "locations"
-    slug = (slug or "").strip().strip("/")
-    if not slug:
+    """A location file by 'area/slug' or bare slug. None if there is none.
+
+    Refuses anything that could escape locations/: an absolute slug, or one
+    with a '..' segment. An 'area/slug' form only ever matches that exact
+    area — no falling back to a same-named file elsewhere."""
+    raw = slug or ""
+    if Path(raw).is_absolute():
         return None
+    slug = raw.strip().strip("/")
+    if not slug or ".." in Path(slug).parts:
+        return None
+    locs = (cfg["_data_dir"] / "locations").resolve()
+    has_area = "/" in slug
     direct = locs / f"{slug}.md"
-    hits = [direct] if direct.exists() else sorted(locs.rglob(f"{slug.split('/')[-1]}.md"))
+    if direct.exists():
+        hits = [direct]
+    elif has_area:
+        hits = []
+    else:
+        hits = sorted(locs.rglob(f"{slug}.md"))
     if not hits:
         return None
-    p = hits[0]
+    p = hits[0].resolve()
+    try:
+        p.relative_to(locs)
+    except ValueError:
+        return None
     area = "" if p.parent == locs else p.parent.relative_to(locs).as_posix()
     return {"slug": p.stem, "area": area, "name": _title(p), "path": p}
 
