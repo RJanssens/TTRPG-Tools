@@ -31,6 +31,13 @@ class LatestLocationTests(unittest.TestCase):
         with mock.patch.object(dashboard, "cfg", _c.load_campaign()):
             self.assertEqual(dashboard._latest_location_name(), "Stonehell Gate")
 
+    def test_prefers_position_over_events(self):
+        TempCampaign(self, state={"position": {"name": "Wickmere", "label": "39",
+                                               "map_name": "Level 1A"}},
+                     events=[{"type": "location_visited", "slug": "x", "name": "Old"}])
+        with mock.patch.object(dashboard, "cfg", _c.load_campaign()):
+            self.assertEqual(dashboard._latest_location_name(), "39 · Level 1A")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -189,11 +189,8 @@ def register(mcp):
         # editable later via set_character_location. Best-effort.
         try:
             state = _c.load_state(cfg)
-            loc_name = ""
-            for e in reversed(_c.load_events(cfg)):
-                if e.get("type") == "location_visited":
-                    loc_name = e.get("name") or e.get("slug") or ""
-                    break
+            from tools.position import current_position, position_label
+            loc_name = position_label(current_position(cfg, state))
             _c.set_character_meta(
                 cfg, slug,
                 location=loc_name,
@@ -590,7 +587,8 @@ def register(mcp):
         """Create a top-level area (city, region, dungeon complex) and its subdirectory.
         slug: filesystem slug (e.g. 'phlan', 'dungeon-of-doom')
         name: display name (e.g. 'Phlan')
-        content: initial markdown body"""
+        content: initial markdown body
+        Creating a file does not move the party — use move_party."""
         cfg = _c.load_campaign()
         locs_dir = cfg["_data_dir"] / "locations"
         locs_dir.mkdir(parents=True, exist_ok=True)
@@ -603,13 +601,6 @@ def register(mcp):
         # Create the subdirectory for places within this area
         (locs_dir / slug).mkdir(parents=True, exist_ok=True)
 
-        _c.append_event(cfg, {
-            "type": "location_visited",
-            "slug": slug,
-            "area": "",
-            "name": name,
-        })
-
         return {"slug": slug, "path": str(area_file)}
 
     @mcp.tool()
@@ -618,7 +609,8 @@ def register(mcp):
         slug: filesystem slug (e.g. 'the-sorcerers-lair')
         name: display name
         content: initial markdown body
-        area: parent area slug, or empty for a top-level location"""
+        area: parent area slug, or empty for a top-level location
+        Creating a file does not move the party — use move_party."""
         cfg = _c.load_campaign()
         locs_dir = cfg["_data_dir"] / "locations"
 
@@ -634,13 +626,6 @@ def register(mcp):
 
         loc_file = dest_dir / f"{slug}.md"
         loc_file.write_text(content, encoding="utf-8")
-
-        _c.append_event(cfg, {
-            "type": "location_visited",
-            "slug": slug,
-            "area": area,
-            "name": name,
-        })
 
         return {"slug": slug, "area": area, "path": str(loc_file)}
 

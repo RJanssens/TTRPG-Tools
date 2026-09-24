@@ -3247,13 +3247,11 @@ def session_view(sid: str):
 # ---------------------------------------------------------------------------
 
 def _latest_location_name() -> str:
-    """Most recent location_visited event, or empty string."""
+    """Where the party is, as the sidebar's 'At' line shows it."""
     if not cfg:
         return ""
-    for ev in reversed(_c.load_events(cfg)):
-        if ev.get("type") == "location_visited":
-            return ev.get("name") or ev.get("slug") or ""
-    return ""
+    from tools.position import current_position, position_label
+    return position_label(current_position(cfg))
 
 
 def _play_state() -> dict:
