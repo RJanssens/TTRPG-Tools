@@ -455,7 +455,7 @@ Overland maps authored in a Structurizr-style DSL (`campaigns/<active>/maps/<slu
 
 ## Tactical Maps (combat_map)
 
-For tactical encounters (5 ft grid, walls, doors, rooms), `create_map(dsl, renderer=None)` delegates to **dungml**, a declarative `.dmap` DSL rendered to SVG and embedded in `combat_state.json` — shown on `/combat` with combatants as tokens. Use this when PCs are about to roll initiative; use World Maps for choosing a road on a regional view.
+For tactical encounters (5 ft grid, walls, doors, rooms), `create_map(dsl, renderer=None)` delegates to **dungml**, a declarative `.dmap` DSL rendered to SVG and embedded in `combat_state.json` — shown on the `/map` tab with combatants as tokens. Use this when PCs are about to roll initiative; use World Maps for choosing a road on a regional view.
 
 **Prerequisite — start `dmap-server` once per boot** (`uv run dmap-server` from `~/claude/dungml` → `http://127.0.0.1:8000`; see *Running the System* below). `tools/combat_map.py` honours `DUNGML_API_BASE`. If unreachable, `create_map` returns an `{"error": "dungml backend unreachable ..."}` — surface it to the user verbatim; do not invent a fallback (no hand-drawn ASCII map).
 
@@ -473,15 +473,22 @@ room "main" { rect 1,1 18 x 12  label "Tomb"  feature altar at 10,7  feature che
 door at 1,7 { connects room.main  type wooden  state closed }
 ```
 
-**After `create_map`:** `place_combatant(name, x, y)` (0 ≤ x < W, 0 ≤ y < H); `get_map_state()` → `{has_map, grid_size, scale, positions}` to sanity-check before placing tokens. The map clears on `end_combat`.
+**After `create_map`:** `place_combatant(name, x, y)` (0 ≤ x < W, 0 ≤ y < H); `get_map_state()` → `{has_map, grid_size, scale, positions}` to sanity-check before placing tokens. `end_combat` clears the tokens and the local render; the locale itself stays on the `/map` tab.
 
 **Troubleshooting:** blank map → bounds too large vs. clustered rooms (trim `bounds`); floating door → must be within ~1 unit of a wall; twisted polygon → list vertices CCW; parse error → usually a missing comma in `polygon` or a stray `{`.
 
-### Fog of war on the combat tab
+### Fog of war on the `/map` tab
 
 `create_map` also pushes its source to dungml's play-session contract, so the
-`/combat` tab draws the **fogged** view — only what the party has discovered —
+`/map` tab draws the **fogged** view — only what the party has discovered —
 instead of the whole map. The pill at the top of the tab says which it is.
+
+**The tab is the party's current locale, not a combat-only view.** Opening it
+shows whatever map dungml holds for the campaign — the selected authored
+locale, or the one `create_map` last pushed — whether or not a fight is
+running. A live combat adds the round line, the initiative sidebar and the
+tokens on top of the same render; `end_combat` takes those away and leaves the
+locale on screen.
 
 Fog does not advance on its own. Advance it as the party moves:
 
@@ -505,6 +512,29 @@ instead of a `create_map` push: link the campaign to a dungml project once
 its own fog on a shared authored map. `dungml_use_locale("combat")` goes back
 to the pushed map. The tab's dropdown does the same thing.
 
+**ttrpg2 has a real login on dungml.** The service token authenticates as an
+ordinary user, and linking a campaign makes it a member of that project — so
+maps can be read and created through dungml's normal API. There is never a
+reason to touch `dungml.db`.
+
+**Authored maps are the GM's, not the game's.** The party's *position* and
+*discovery* are session state and yours to write — `dungml_party_at`,
+`dungml_reveal`. A map's rooms, doors, bounds and descriptions are project
+state and are edited only in the dungml editor, by the GM. **Never add or
+change a room to make the map agree with the fiction** — not through the API,
+and absolutely not by writing to `dungml.db`. If the scene needs a space the
+map doesn't have, say so plainly and let the GM draw it; until then narrate
+the fiction and leave the map alone. A room you invented is invisible to the
+GM's own editing and is lost the next time they re-import the map.
+
+**The same session is visible in the dungml web GUI.** Whenever ttrpg2 renders
+an authored locale it reports that map to dungml (`PUT /campaigns/<slug>/active`),
+so the project page there lists the campaign, the map it is on, the party's
+node and how much it has uncovered, with a link into that session's play view.
+The session shows up as `ttrpg2 · <campaign-slug>` rather than one of several
+identical `party` rows. Nothing depends on the report landing — it is
+swallowed like every other call to the map service.
+
 **This is a display layer, not a fourth-wall exemption.** The fogged render is
 a convenience for the DM — and for a second screen the players can see. It
 does not license narrating what the *GM* view shows. Hard Constraint #5 still
@@ -522,11 +552,14 @@ service.
 ## Dashboard
 
 Run `python3 dashboard.py [--port 5000]` for the web interface:
-- `/` — scene image gallery
+- `/` — lands on `/play`
+- `/play` — the play page; its 🗺 button pops the current dungml map up over the transcript (shown only while dungml holds one)
+- `/gallery` — scene image gallery
 - `/party` — live party status
 - `/log` — session chronicle
 - `/characters` — NPC index with portraits
 - `/locations` — two-level location browser
+- `/map` — the party's current dungml locale (fog of war, combat tokens)
 - `/maps` — world-map index (per-slug Leaflet views with kind-toggle layers)
 - `/sheets/<slug>` — character sheet
 
@@ -539,7 +572,7 @@ Three processes, all local. Only the first is required to play.
 | Process | Start it with | Serves |
 |---|---|---|
 | **MCP server** | launched by Claude Code as the `ttrpg` server (`python3 server.py`) | every tool in this file |
-| **Dashboard** | `python3 dashboard.py [--port 5000]` | `/party`, `/combat`, `/log`, the reference browsers |
+| **Dashboard** | `python3 dashboard.py [--port 5000]` | `/party`, `/map`, `/log`, the reference browsers |
 | **dmap-server** | `uv run dmap-server` from `~/claude/dungml` | tactical map rendering + fog of war |
 
 `server.py` registers each module in `tools/` via its `register(mcp)`. A new
@@ -574,7 +607,7 @@ or the change is invisible. Symptoms of a stale or missing server:
 | Symptom | Cause |
 |---|---|
 | `create_map` → `{"error": "dungml backend unreachable …"}` | server not running — surface it verbatim, never hand-draw a map |
-| combat tab pill says `map service offline` | same |
+| `/map` tab pill says `map service offline` | same |
 | pill says `no fog session` | server is up but no map pushed yet — run `create_map`, or pick a locale |
 | `unknown feature 'chest'` diagnostics | source names a library, so the `core.dmap` auto-include stepped aside |
 | a fix to dungml appears to do nothing | server still running the old code — restart it |

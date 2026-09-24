@@ -134,6 +134,32 @@ def split_inventory_qty(raw: str) -> tuple[str, int]:
     return s[: m.start()].rstrip(" ,"), qty
 
 
+def collapse_inventory(items) -> list[str]:
+    """Collapse repeated inventory entries into 'Name x N' form.
+
+    ['Arrow'] * 24 -> ['Arrow x24']; existing suffixes are folded in, so
+    ['Torch x2', 'Torch'] -> ['Torch x3']. First-appearance order and the
+    first spelling of each item are preserved; singletons keep no suffix.
+    Matching is case- and whitespace-insensitive on the base name."""
+    order: list[str] = []
+    names: dict[str, str] = {}
+    counts: dict[str, int] = {}
+    for raw in items or []:
+        base, qty = split_inventory_qty(str(raw))
+        if not base:
+            continue
+        key = " ".join(base.lower().split())
+        if key not in counts:
+            order.append(key)
+            names[key] = base
+            counts[key] = 0
+        counts[key] += qty
+    return [
+        names[k] if counts[k] == 1 else f"{names[k]} x{counts[k]}"
+        for k in order
+    ]
+
+
 def resolve_weight(name: str, conn: sqlite3.Connection | None = None) -> dict:
     """Resolve a free-form inventory string to a weight in pounds.
 
@@ -274,8 +300,58 @@ STR_BANDS: dict[int, tuple[int, int, int, int]] = {
 }
 
 
-def str_band_for(strength: int) -> tuple[int, int, int, int]:
-    """Return (light, moderate, heavy, severe) upper bounds for a STR score."""
+# Exceptional-strength Weight Allowances (PHB Table 1), as (percentile ceiling,
+# allowance). 18/00 is stored as percentile 100 so the ranges sort naturally.
+# Bands follow the same +39 lb stride as the whole-score rows above.
+STR_PCT_ALLOWANCE: tuple[tuple[int, int], ...] = (
+    (50,  135),
+    (75,  160),
+    (90,  185),
+    (99,  235),
+    (100, 335),
+)
+
+
+def parse_strength(raw, pct=None) -> tuple[int, int]:
+    """Normalise a STR score to (score, percentile).
+
+    Accepts a plain number, or the exceptional-strength forms sheets use:
+    ``"18/00"`` → ``(18, 100)``, ``"18/76"`` → ``(18, 76)``. An explicit
+    ``pct`` (from an ``ability_scores["str_pct"]`` field) wins when the score
+    itself carries no percentile."""
+    score, parsed_pct = 10, 0
+    text = str(raw).strip()
+    if "/" in text:
+        head, _, tail = text.partition("/")
+        try:
+            score = int(head)
+            parsed_pct = int(tail) or 100
+        except ValueError:
+            pass
+    else:
+        try:
+            score = int(float(text))
+        except ValueError:
+            pass
+    if not parsed_pct and pct is not None:
+        try:
+            parsed_pct = int(pct) or 100
+        except (TypeError, ValueError):
+            parsed_pct = 0
+    if score != 18:
+        parsed_pct = 0
+    return score, parsed_pct
+
+
+def str_band_for(strength: int, pct: int = 0) -> tuple[int, int, int, int]:
+    """Return (light, moderate, heavy, severe) upper bounds for a STR score.
+
+    ``pct`` is the exceptional-strength percentile (1–100, where 100 is 18/00);
+    it applies only at STR 18 and overrides the whole-score row."""
+    if strength == 18 and pct:
+        for ceiling, allowance in STR_PCT_ALLOWANCE:
+            if pct <= ceiling:
+                return (allowance, allowance + 39, allowance + 78, allowance + 117)
     keys = sorted(STR_BANDS.keys())
     pick = keys[0]
     for k in keys:
@@ -303,7 +379,7 @@ def compute_encumbrance(char: dict, state: dict, key: str,
         'band':     'light'|'moderate'|'heavy'|'severe'|'overloaded',
         'weight':   float (lb, rounded to 1 decimal),
         'penalty':  int (movement penalty, 0/-3/-6/-9/-12),
-        'strength': int,
+        'strength': int, or 'NN/PP' for exceptional strength,
         'thresholds': {'light': int, 'moderate': int, 'heavy': int, 'severe': int},
         'items':    [{'item','qty','unit_lb','weight_lb','source','origin'}, ...],
       }
@@ -312,7 +388,7 @@ def compute_encumbrance(char: dict, state: dict, key: str,
     they stay in lockstep. Pass a sqlite connection to amortize lookups.
     """
     ab = char.get("ability_scores") or {}
-    strength = int(ab.get("str", 10))
+    strength, str_pct = parse_strength(ab.get("str", 10), ab.get("str_pct"))
 
     items: list[dict] = []
     total = 0.0
@@ -343,7 +419,7 @@ def compute_encumbrance(char: dict, state: dict, key: str,
         if own_conn:
             conn.close()
 
-    light, moderate, heavy, severe = str_band_for(strength)
+    light, moderate, heavy, severe = str_band_for(strength, str_pct)
     if total <= light:
         band = "light"
     elif total <= moderate:
@@ -359,7 +435,7 @@ def compute_encumbrance(char: dict, state: dict, key: str,
         "band":       band,
         "weight":     round(total, 1),
         "penalty":    _BAND_PENALTIES[band],
-        "strength":   strength,
+        "strength":   f"{strength}/{str_pct % 100:02d}" if str_pct else strength,
         "thresholds": {"light": light, "moderate": moderate,
                        "heavy": heavy, "severe": severe},
         "items":      items,

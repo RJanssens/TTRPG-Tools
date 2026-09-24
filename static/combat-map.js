@@ -30,34 +30,83 @@ class CombatMap {
         this._pendingRAF = 0;     // rAF handle; coalesces multiple render requests per frame
         this._wrapW      = 0;     // cached wrapper size, updated on ResizeObserver
         this._wrapH      = 0;
+        this._pointers   = new Map();  // live pointerId -> client coords
+        this._pinchDist  = 0;          // finger separation when the pinch began
+        this._pinchZoom0 = 1;          // zoom level when the pinch began
 
         var self = this;
 
-        // ── Drag to pan ───────────────────────────────────────────────────────
-        canvas.addEventListener('mousedown', function(e) {
-            if (e.button !== 0) return;
-            self._dragging   = true;
-            self._dragMoved  = false;
-            self._dragStartX = e.clientX;
-            self._dragStartY = e.clientY;
-            self._dragOffX0  = self._offsetX;
-            self._dragOffY0  = self._offsetY;
-            canvas.style.cursor = 'grabbing';
-            e.preventDefault();
+        // The browser must not pan/zoom the page from gestures over the map —
+        // one finger pans the map, two pinch it. Set here rather than in each
+        // page's CSS so every embedding gets it.
+        canvas.style.touchAction = 'none';
+        canvas.style.userSelect  = 'none';
+
+        // ── Pan and pinch ─────────────────────────────────────────────────────
+        // Pointer events, so mouse, touch and pen all take the same path. Note
+        // there is no preventDefault on pointerdown: it would suppress the
+        // synthesized `click` that the token hit-test below relies on. Scroll
+        // suppression is `touch-action` above.
+        function trackFrom(e) {
+            self._pointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+        }
+
+        canvas.addEventListener('pointerdown', function(e) {
+            if (e.pointerType === 'mouse' && e.button !== 0) return;
+            try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+            trackFrom(e);
+            if (self._pointers.size === 1) {
+                self._dragging   = true;
+                self._dragMoved  = false;
+                self._dragStartX = e.clientX;
+                self._dragStartY = e.clientY;
+                self._dragOffX0  = self._offsetX;
+                self._dragOffY0  = self._offsetY;
+                canvas.style.cursor = 'grabbing';
+            } else if (self._pointers.size === 2) {
+                // Second finger down: stop panning, start pinching.
+                self._dragging  = false;
+                self._dragMoved = true;   // suppress the tap hit-test
+                var p = Array.from(self._pointers.values());
+                self._pinchDist  = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+                self._pinchZoom0 = self.zoom;
+            }
         });
 
-        canvas.addEventListener('mousemove', function(e) {
+        canvas.addEventListener('pointermove', function(e) {
+            var known = self._pointers.has(e.pointerId);
+            if (known) trackFrom(e);
+
+            if (known && self._pointers.size >= 2) {
+                var p = Array.from(self._pointers.values());
+                var d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+                if (self._pinchDist > 0 && d > 0) {
+                    var rect = canvas.getBoundingClientRect();
+                    self._zoomAt(self._pinchZoom0 * (d / self._pinchDist),
+                                 (p[0].x + p[1].x) / 2 - rect.left,
+                                 (p[0].y + p[1].y) / 2 - rect.top);
+                }
+                self._dragMoved = true;
+                return;
+            }
+
             if (self._dragging) {
                 var dx = e.clientX - self._dragStartX;
                 var dy = e.clientY - self._dragStartY;
-                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) self._dragMoved = true;
+                // A touch never holds as still as a mouse, so the slop that
+                // separates a tap from a drag is a little wider than 3px.
+                var slop = e.pointerType === 'mouse' ? 3 : 6;
+                if (Math.abs(dx) > slop || Math.abs(dy) > slop) self._dragMoved = true;
                 self._offsetX = self._dragOffX0 - dx;
                 self._offsetY = self._dragOffY0 - dy;
                 if (self._last && self._last.grid) self._clampOffset(self._last.grid, self._C());
                 self._scheduleRender();
                 return;
             }
-            // Hover: terrain label lookup in world coords
+
+            // Hover: terrain label lookup in world coords. Mouse only — a
+            // finger would leave the readout stuck wherever it last touched.
+            if (e.pointerType !== 'mouse') return;
             var rect  = canvas.getBoundingClientRect();
             var C     = self._C();
             var mx    = Math.floor((e.clientX - rect.left + self._offsetX) / C);
@@ -75,8 +124,18 @@ class CombatMap {
             if (self.onHover) self.onHover(mx, my, label);
         });
 
-        canvas.addEventListener('mouseup',    function() { self._dragging = false; canvas.style.cursor = 'grab'; });
-        canvas.addEventListener('mouseleave', function() { self._dragging = false; canvas.style.cursor = 'grab'; });
+        function endPointer(e) {
+            self._pointers.delete(e.pointerId);
+            if (self._pointers.size < 2) self._pinchDist = 0;
+            if (self._pointers.size === 0) {
+                self._dragging = false;
+                canvas.style.cursor = 'grab';
+            }
+        }
+        // pointerup / pointercancel only: with pointer capture these are
+        // guaranteed, and a `pointerleave` in the mix can cut a pinch short.
+        canvas.addEventListener('pointerup',     endPointer);
+        canvas.addEventListener('pointercancel', endPointer);
 
         // ── Click: token hit-test or cell ─────────────────────────────────────
         canvas.addEventListener('click', function(e) {
@@ -115,25 +174,17 @@ class CombatMap {
         // ── Zoom toward cursor ────────────────────────────────────────────────
         canvas.addEventListener('wheel', function(e) {
             e.preventDefault();
-            var rect   = canvas.getBoundingClientRect();
-            var cx     = e.clientX - rect.left;
-            var cy     = e.clientY - rect.top;
-            var oldC   = self._C();
-            // World point under cursor
-            var wx     = (cx + self._offsetX) / oldC;
-            var wy     = (cy + self._offsetY) / oldC;
-            self.zoom  = Math.max(0.25, Math.min(5.0, self.zoom * (e.deltaY < 0 ? 1.15 : 0.87)));
-            var newC   = self._C();
-            self._offsetX = wx * newC - cx;
-            self._offsetY = wy * newC - cy;
-            if (self._last && self._last.grid) self._clampOffset(self._last.grid, newC);
-            if (self._last) self.render(self._last);
-            if (self.onZoom) self.onZoom(self.zoom);
+            var rect = canvas.getBoundingClientRect();
+            self._zoomAt(self.zoom * (e.deltaY < 0 ? 1.15 : 0.87),
+                         e.clientX - rect.left, e.clientY - rect.top);
         }, { passive: false });
 
         // ── Arrow keys to scroll ──────────────────────────────────────────────
         document.addEventListener('keydown', function(e) {
             if (!self._last || !self._last.grid) return;
+            // An instance inside a closed <dialog> has no offsetParent. It
+            // must not swallow arrow keys from the page behind it.
+            if (canvas.offsetParent === null) return;
             var tag = document.activeElement && document.activeElement.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA') return;
             var step  = self._C();
@@ -151,6 +202,31 @@ class CombatMap {
         });
     }
 
+    /**
+     * Merge a dungml connection block into a /combat-state payload so the
+     * background comes from dmap-server (fogged to what the party has
+     * discovered) instead of the flat render create_map cached locally.
+     * Geometry still comes from the session block, so tokens land on the
+     * same cells either way. Returns `data` untouched when no session is
+     * connected.
+     */
+    static fogState(data, dm) {
+        if (!dm || !dm.connected || !dm.width || !dm.height) return data;
+        var base = (data && data.grid) || {};
+        var g = {};
+        for (var k in base) g[k] = base[k];
+        g.width  = dm.width;
+        g.height = dm.height;
+        g.scale  = base.scale || '5ft';
+        // ?v= is the render fingerprint: it changes when fog burns off, the
+        // party moves, or the scope flips, and only then.
+        g.svg_url = dm.render_url + '?v=' + encodeURIComponent(dm.version || '0');
+        var out = {};
+        for (var k2 in (data || {})) out[k2] = data[k2];
+        out.grid = g;
+        return out;
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     _C() { return Math.max(8, Math.round(this.cellPx * this.zoom)); }
@@ -162,20 +238,54 @@ class CombatMap {
         this._offsetY = Math.max(0, Math.min(this._offsetY, Math.max(0, mapH - this.canvas.height)));
     }
 
+    /**
+     * Re-measure the wrapper and repaint. An instance living inside a
+     * <dialog> is measured at zero while closed, so the ResizeObserver
+     * leaves a stale minimum behind; call this right after showing it.
+     */
+    resize() {
+        this._measureWrap();
+        if (this._last) this.render(this._last);
+    }
+
     setZoom(z) {
-        // Zoom toward center of viewport
-        var cx    = this.canvas.width  / 2;
-        var cy    = this.canvas.height / 2;
-        var oldC  = this._C();
-        var wx    = (cx + this._offsetX) / oldC;
-        var wy    = (cy + this._offsetY) / oldC;
+        this._zoomAt(z, this.canvas.width / 2, this.canvas.height / 2);
+    }
+
+    /**
+     * Zoom to `z`, keeping the world point under the viewport coordinate
+     * (cx, cy) fixed. Shared by the wheel, the pinch gesture and the
+     * zoom buttons so all three behave identically.
+     */
+    _zoomAt(z, cx, cy) {
+        var oldC = this._C();
+        var wx   = (cx + this._offsetX) / oldC;
+        var wy   = (cy + this._offsetY) / oldC;
         this.zoom = Math.max(0.25, Math.min(5.0, z));
-        var newC  = this._C();
+        var newC = this._C();
         this._offsetX = wx * newC - cx;
         this._offsetY = wy * newC - cy;
         if (this._last && this._last.grid) this._clampOffset(this._last.grid, newC);
-        if (this._last) this.render(this._last);
+        this._scheduleRender();
         if (this.onZoom) this.onZoom(this.zoom);
+    }
+
+    /**
+     * Blank the viewport and forget the last state. Used when there is
+     * nothing to draw at all — no fight and no dungml map — so a stale
+     * render doesn't linger as if it were the party's current location.
+     */
+    clear() {
+        this._last = null;
+        this._selectedToken = null;
+        if (!this._wrapW || !this._wrapH) this._measureWrap();
+        var vw = this._wrapW, vh = this._wrapH;
+        if (this.canvas.width !== vw || this.canvas.height !== vh) {
+            this.canvas.width  = vw;
+            this.canvas.height = vh;
+        }
+        this.ctx.fillStyle = '#1a1510';
+        this.ctx.fillRect(0, 0, vw, vh);
     }
 
     render(state) {

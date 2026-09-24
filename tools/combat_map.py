@@ -507,7 +507,7 @@ def register(mcp):
         session["grid"] = grid
         save_combat_state(cfg, session)
 
-        # Hand the same source to the play-session contract so the combat tab
+        # Hand the same source to the play-session contract so the `/map` tab
         # can draw it fogged. Best-effort: a map service that's down costs the
         # fog view, not the map.
         link = dungml_play.sync_combat_map(cfg, dsl)
@@ -521,7 +521,7 @@ def register(mcp):
             out["fog"] = {
                 "scope": link.get("scope"),
                 "party_node": link.get("party_node"),
-                "note": "combat tab draws the fogged view — advance it with "
+                "note": "the /map tab draws the fogged view — advance it with "
                         "dungml_party_at / dungml_reveal",
             }
         return out

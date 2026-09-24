@@ -57,6 +57,7 @@ app = Flask(__name__)
 
 
 _cfg_mtime: float = 0.0
+_cfg_pinned: bool = False   # True when started with an explicit --campaign
 
 
 def _reload_cfg() -> None:
@@ -66,6 +67,23 @@ def _reload_cfg() -> None:
     global _cfg_mtime
     if not cfg:
         return
+    # Follow .active: create_campaign / switch_campaign run in the MCP
+    # process and only rewrite .active, so without this the dashboard stays
+    # bound to whatever campaign it booted with. A --campaign pin opts out.
+    if not _cfg_pinned:
+        try:
+            active = _c.get_active_name()
+        except RuntimeError:
+            active = cfg["_name"]
+        if active != cfg["_name"]:
+            try:
+                fresh = _c.load_campaign(active)
+            except FileNotFoundError:
+                fresh = None
+            if fresh is not None:
+                cfg.clear()
+                cfg.update(fresh)
+                _cfg_mtime = 0.0
     p = cfg["_dir"] / "campaign.json"
     try:
         m = p.stat().st_mtime
@@ -373,6 +391,35 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     left: 14px; right: 14px; bottom: -16px;
     height: 2px;
     background: var(--accent-gold);
+  }}
+
+  /* Phones: twelve links at this tracking wrap to five or six rows, which on
+     /play ate most of the screen. One row that scrolls sideways instead, with
+     taps grown to a thumb-sized target. */
+  @media (max-width: 700px) {{
+    nav {{
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      overscroll-behavior-x: contain;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      padding: 4px 10px;
+      gap: 2px;
+    }}
+    nav::-webkit-scrollbar {{ display: none; }}
+    nav a {{
+      flex: 0 0 auto;
+      white-space: nowrap;
+      padding: 11px 12px;
+      letter-spacing: 0.12em;
+    }}
+    /* The separators and the active underline are positioned against a
+       single-row nav; both look wrong once it scrolls. */
+    nav a:not(:last-of-type)::after {{ display: none; }}
+    nav a.is-active {{ color: var(--accent-gold-hi); }}
+    nav a.is-active::before {{ left: 8px; right: 8px; bottom: 2px; }}
+    .nav-play-toggles {{ position: sticky; right: 0; padding-left: 6px; background: var(--bg-nav); }}
+    .nav-icon-btn {{ padding: 8px 11px; }}
   }}
 
   /* ---- Typography ---- */
@@ -1163,7 +1210,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <nav>
   <a href="/play">Play</a>
-  <a href="/">Gallery</a>
+  <a href="/gallery">Gallery</a>
   <a href="/world">World</a>
   <a href="/quests">Quests</a>
   <a href="/log">Chronicle</a>
@@ -1171,7 +1218,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/characters">Cast</a>
   <a href="/locations">Locations</a>
   <a href="/reference">Reference</a>
-  <a href="/combat">Combat</a>
+  <a href="/map">Map</a>
   <a href="/maps">Maps</a>
   <a href="/campaigns">Campaigns</a>
   <span class="nav-play-toggles">
@@ -1197,7 +1244,9 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   var p = location.pathname;
   document.querySelectorAll('nav a').forEach(function(a){{
     var href = a.getAttribute('href');
-    if (href === '/' ? p === '/' : p.indexOf(href) === 0) a.classList.add('is-active');
+    // Segment match, not prefix match: /maps must not light up /map.
+    if (href === '/' ? p === '/' : (p === href || p.indexOf(href + '/') === 0))
+      a.classList.add('is-active');
   }});
 }})();
 </script>
@@ -1575,6 +1624,12 @@ def _monster_portraits_dict() -> dict:
 # ---------------------------------------------------------------------------
 
 @app.route("/")
+def home():
+    """Opening the dashboard lands on the play page, not the gallery."""
+    return redirect("/play")
+
+
+@app.route("/gallery")
 def gallery():
     index = _load_image_index()
     scenes = [e for e in index if e.get("type") == "scene"]
@@ -3274,6 +3329,26 @@ def _play_state() -> dict:
         "in_combat": bool(state.get("combat")),
         "coin": " · ".join(coin_parts) if coin_parts else "0 gp",
         "characters": chars,
+        "map": _play_map_block(),
+    }
+
+
+def _play_map_block() -> dict:
+    """Whether the play page should offer its map button, and how to label it.
+
+    Active means dungml is holding a renderable map for this campaign — the
+    selected authored locale, or the one `create_map` last pushed. The button
+    stays hidden otherwise rather than popping open an empty grid.
+    """
+    try:
+        dm = _dungml_block()
+    except Exception:
+        return {"active": False}
+    return {
+        "active":     bool(dm.get("connected")),
+        "name":       dm.get("map_name"),
+        "party_node": dm.get("party_node"),
+        "scope":      dm.get("scope"),
     }
 
 
@@ -3282,17 +3357,30 @@ _PLAY_HTML = """
   /* Take the entire viewport on /play — narrative window grows to fill all
      remaining width to the left of the sidebar. The :has() check scopes this
      to the play page so other routes keep the standard 980px container. */
+  /* The play page is a fixed-height app view, so the body itself becomes the
+     flex column: the narrative window then sizes itself from whatever height
+     the nav actually takes. The old `calc(100vh - 50px)` assumed a one-line
+     nav and ran off the bottom of the screen as soon as it wrapped.
+     dvh, not vh: on mobile `100vh` is the *large* viewport, so the input box
+     would sit behind the browser's own chrome. */
+  body:has(.play-shell) {
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;      /* body's global min-height: 100vh would beat 100dvh */
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;   /* the chat log owns its own scroll */
+  }
+  body:has(.play-shell) nav { flex: 0 0 auto; }
   .container:has(.play-shell) {
     max-width: none;
     width: 100%;
     padding: 20px 28px;
-    height: calc(100vh - 50px);   /* viewport minus sticky nav */
+    flex: 1 1 auto;
+    min-height: 0;
     display: flex;
     flex-direction: column;
   }
-  /* Suppress the page-level scrollbar on /play — the chat log owns its
-     own scroll. */
-  body:has(.play-shell) { overflow: hidden; }
   .play-shell {
     display: grid;
     grid-template-columns: minmax(0, 1fr) 320px;
@@ -3331,10 +3419,14 @@ _PLAY_HTML = """
   .jump-btn:hover { color: var(--accent-gold-hi); border-color: var(--accent-gold-hi); }
   .play-side { min-width: 0; min-height: 0; overflow-y: auto; }
 
+  /* Wraps rather than overflowing: the narrative column is a grid track
+     next to the party sidebar, so an unwrapped row of buttons paints over
+     it. Anything that doesn't fit drops onto a second row underneath. */
   .play-toolbar {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
-    gap: 14px;
+    gap: 8px 14px;
     margin-bottom: 14px;
   }
   .play-toolbar h1 {
@@ -3425,7 +3517,7 @@ _PLAY_HTML = """
 
   /* Toolbar view-controls: filter pills + font-size buttons clustered
      together, with a small gap between the two groups. */
-  .view-controls { display: inline-flex; align-items: center; gap: 10px; }
+  .view-controls { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
   .filter-group, .font-group { display: inline-flex; gap: 4px; }
   /* Session id + new-session button hug together on the left. */
   .session-group { display: inline-flex; align-items: baseline; gap: 6px; }
@@ -3448,6 +3540,11 @@ _PLAY_HTML = """
     display: inline-flex;
     align-items: center;
     justify-content: center;
+  }
+  @media (max-width: 700px) {
+    /* Thumb-sized: 30x26 is a mouse target, not a finger one. */
+    .icon-btn { min-width: 40px; height: 36px; }
+    .play-toolbar { gap: 10px 12px; }
   }
   .icon-btn:hover { color: var(--accent-gold); border-color: var(--rule-hi); }
   .icon-btn:active { background: rgba(200,169,110,0.12); }
@@ -3589,7 +3686,7 @@ _PLAY_HTML = """
   dialog.voice-dialog {
     background: var(--bg-rec); color: var(--ink-body);
     border: 1px solid var(--rule); border-radius: 4px;
-    padding: 18px 22px; min-width: 360px; max-width: 520px;
+    padding: 18px 22px; width: min(520px, calc(100vw - 24px)); max-width: 520px;
   }
   dialog.voice-dialog::backdrop { background: rgba(0,0,0,0.55); }
   dialog.voice-dialog h3 { margin: 0 0 12px; font-family: var(--font-display); }
@@ -4197,22 +4294,6 @@ _PLAY_HTML = """
     box-shadow: var(--inset-warm), var(--shadow-card);
   }
 
-  /* Campaign banner at the very top of the sidebar. */
-  .side-camp {
-    font-family: var(--font-display);
-    color: var(--accent-gold-hi);
-    text-transform: uppercase;
-    letter-spacing: 0.18em;
-    text-align: center;
-    font-size: 0.82em;
-    font-weight: 500;
-    line-height: 1.35;
-    padding-bottom: 12px;
-    margin-bottom: 12px;
-    border-bottom: 1px solid var(--rule);
-  }
-  .side-camp:empty { display: none; }
-
   /* Stats rows: session/day/time, weather/gold, location, combat. */
   .side-stats { display: flex; flex-direction: column; gap: 9px; margin-bottom: 12px; }
   .side-row {
@@ -4267,32 +4348,12 @@ _PLAY_HTML = """
     letter-spacing: 0;
   }
 
-  .side-title {
-    font-family: var(--font-display);
-    color: var(--accent-gold);
-    text-transform: uppercase;
-    letter-spacing: 0.26em;
-    font-size: 0.74em;
-    text-align: center;
-    margin: 0 0 14px;
-    padding: 10px 0;
+  /* The stats/party divider the dropped "The Party" title used to carry. */
+  .party-list {
+    display: flex; flex-direction: column; gap: 16px;
+    padding-top: 14px;
     border-top: 1px solid var(--rule);
-    border-bottom: 1px solid var(--rule);
-    position: relative;
   }
-  .side-title::after {
-    content: '◆';
-    position: absolute;
-    left: 50%;
-    bottom: -7px;
-    transform: translateX(-50%);
-    background: var(--bg-card-hi);
-    color: var(--accent-gold);
-    padding: 0 6px;
-    font-size: 0.6em;
-    letter-spacing: 0;
-  }
-  .party-list { display: flex; flex-direction: column; gap: 16px; }
   .party-mini { display: flex; gap: 12px; align-items: flex-start; }
 
   /* ---- Party reorder handles ---- */
@@ -4346,6 +4407,26 @@ _PLAY_HTML = """
   .audit-btn-pip.has-warning {{ background: #d4a14a; box-shadow: 0 0 4px #d4a14a; }}
 
   .audit-dialog {{ max-width: 720px; }}
+  /* Map popup: the canvas owns the height so the fogged render gets as much
+     room as the dialog allows, and the bar/actions stay pinned around it. */
+  .map-dialog { width: min(1100px, 94vw); }
+  .map-dialog .map-dlg-bar {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+    font-size: 0.8em;
+  }
+  .map-dialog .map-dlg-bar .spacer { flex: 1; }
+  .map-dialog .map-dlg-canvas {
+    flex: 1 1 auto; min-height: 320px; height: 60vh;
+    overflow: hidden;
+    border: 1px solid var(--rule); border-radius: 3px;
+    background: #1a1510;
+  }
+  .map-dialog #map-dlg-cmap { display: block; cursor: grab; }
+  .map-dialog .actions a {
+    margin-right: auto; color: var(--ink-dim, #8a7a60);
+    font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.12em;
+  }
+  .map-dialog .actions a:hover { color: var(--accent-gold); }
   .audit-toggle {{
     display: flex; align-items: flex-start; gap: 10px;
     padding: 10px 12px;
@@ -4512,12 +4593,44 @@ _PLAY_HTML = """
     border-radius: 1px;
   }
 
+  /* Phone / narrow tablet: a fixed-height two-column app view cannot work,
+     so the page scrolls normally and the three blocks stack — transcript,
+     input, party. The log keeps its own scroller (the auto-scroll-to-bottom
+     logic scrolls that element, not the page), but everything else is
+     reachable by scrolling the document. */
   @media (max-width: 900px) {
+    body:has(.play-shell) {
+      height: auto;
+      display: block;
+      overflow: visible;
+    }
+    .container:has(.play-shell) {
+      display: block;
+      padding: 14px 16px 40px;
+    }
     .play-shell {
-      grid-template-columns: 1fr;
+      display: block;
       height: auto;
     }
-    .play-side { max-height: 480px; }
+    .play-main { display: block; }
+    /* flex: 1 1 0 would collapse to nothing once the parent is auto-height. */
+    .play-log {
+      flex: 0 0 auto;
+      height: 62vh;
+      height: 62dvh;
+      padding: 16px 16px;
+    }
+    .play-side {
+      max-height: none;
+      overflow-y: visible;
+      margin-top: 18px;
+    }
+  }
+  @media (max-width: 700px) {
+    /* Declared here rather than beside the other phone rules: the textarea's
+       own font-size comes later in this sheet, and a media query carries no
+       extra specificity. */
+    .play-form textarea { font-size: 1em; min-height: 56px; padding: 11px 12px; }
   }
 </style>
 
@@ -4580,6 +4693,9 @@ _PLAY_HTML = """
         <button id="play-suggest" type="button" class="icon-btn" title="Suggest 2-4 next actions after each DM reply" aria-label="Toggle suggested actions">💡</button>
         <button id="play-bell" type="button" class="icon-btn" title="Play a chime when the DM finishes a response" aria-label="Toggle response chime">🔔</button>
       </span>
+      <span class="icon-group" role="group" aria-label="Tactical map">
+        <button id="play-map" type="button" class="icon-btn" title="Show the party's current map" aria-label="Show map" hidden>🗺</button>
+      </span>
       <span class="icon-group" role="group" aria-label="Recovery and debug">
         <button id="play-fetch-last" type="button" class="icon-btn" title="Fetch the last DM reply from the transcript (recovers a response if the SSE stream dropped)" aria-label="Fetch last DM reply">↻</button>
         <button id="play-audit" type="button" class="icon-btn audit-btn" title="View procedural-fairness audit findings (toggle DM nudge from inside)" aria-label="Open audit panel">
@@ -4628,6 +4744,22 @@ _PLAY_HTML = """
         <button type="button" id="audit-close">Close</button>
       </div>
     </dialog>
+    <dialog id="map-dialog" class="debug-dialog map-dialog">
+      <h3>Map <span class="muted" id="map-dlg-name"></span></h3>
+      <div class="map-dlg-bar">
+        <span class="muted" id="map-dlg-sub"></span>
+        <span class="muted" id="map-dlg-coords"></span>
+        <span class="spacer"></span>
+        <button type="button" id="map-dlg-out" title="Zoom out">−</button>
+        <button type="button" id="map-dlg-reset" title="Reset zoom">□</button>
+        <button type="button" id="map-dlg-in" title="Zoom in">+</button>
+      </div>
+      <div class="map-dlg-canvas"><canvas id="map-dlg-cmap"></canvas></div>
+      <div class="actions">
+        <a id="map-dlg-tab" href="/map" target="_blank" rel="noopener">Open in tab ↗</a>
+        <button type="button" id="map-dlg-close">Close</button>
+      </div>
+    </dialog>
     <dialog id="debug-dialog" class="debug-dialog">
       <h3>Stream-JSON events <span class="muted" id="debug-count">(0)</span></h3>
       <p class="muted">Last 200 events from <code>claude -p</code>. Per-turn token + cost are inside each <code>result</code> event's <code>usage</code> field.</p>
@@ -4659,15 +4791,16 @@ _PLAY_HTML = """
   </section>
 
   <aside class="play-side">
-    <div class="side-camp" id="side-camp"></div>
     <div class="side-stats" id="side-stats"></div>
-    <div class="side-title">The Party</div>
     <div class="party-list" id="party-list">
       <div class="muted" style="text-align:center; font-size:0.84em; font-style:italic">…</div>
     </div>
   </aside>
 </div>
 
+<!-- Same renderer the /map tab uses: the map popup draws the fogged dungml
+     render with combatant tokens on top. -->
+<script src="/static/combat-map.js"></script>
 <script>
 (function(){
   const log = document.getElementById('play-log');
@@ -4858,7 +4991,6 @@ _PLAY_HTML = """
   const statusEl = document.getElementById('play-status');
   const resetBtn = document.getElementById('play-reset');
   const partyList = document.getElementById('party-list');
-  const sideCamp = document.getElementById('side-camp');
   const sideStats = document.getElementById('side-stats');
   const makePicBtn = document.getElementById('play-make-pic');
   const jumpBtn = document.getElementById('jump-to-bottom');
@@ -5977,7 +6109,6 @@ _PLAY_HTML = """
   }
 
   function renderSidebarStats(s) {
-    sideCamp.innerHTML = (s.campaign && s.campaign.name) ? esc(s.campaign.name) : '';
     const rows = [];
     const r1 = [];
     if (s.session) r1.push(pip('Sess', s.session));
@@ -6004,6 +6135,7 @@ _PLAY_HTML = """
       const s = await r.json();
       renderParty(s.characters);
       renderSidebarStats(s);
+      renderMapButton(s.map);
     } catch (e) {
       // best-effort: leave existing render in place
     }
@@ -6040,8 +6172,12 @@ _PLAY_HTML = """
     input.value = '';
     submitTurn(text);
   });
+  // Enter sends only where there is a real keyboard. On a touch keyboard it
+  // would steal the only reachable newline — Shift+Enter is not an option —
+  // so there the send button is the way.
+  const finePointer = window.matchMedia && window.matchMedia('(pointer: fine)').matches;
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && finePointer) {
       e.preventDefault();
       form.requestSubmit();
     }
@@ -6231,6 +6367,78 @@ _PLAY_HTML = """
     } catch (err) {
       alert('Save failed: ' + err.message);
     }
+  });
+
+  // --- Map dialog (the party's current dungml locale) ---
+  // The button only exists while dungml is holding a renderable map: with no
+  // map there is nothing to pop up, and the play page should not advertise a
+  // view it cannot draw. Polling runs only while the dialog is open.
+  const mapBtn      = document.getElementById('play-map');
+  const mapDialog   = document.getElementById('map-dialog');
+  const mapDlgName  = document.getElementById('map-dlg-name');
+  const mapDlgSub   = document.getElementById('map-dlg-sub');
+  const mapDlgCoords= document.getElementById('map-dlg-coords');
+  const mapDlgClose = document.getElementById('map-dlg-close');
+  let mapView  = null;   // CombatMap, built on first open (needs a laid-out canvas)
+  let mapTimer = null;
+
+  function renderMapButton(m) {
+    const active = !!(m && m.active);
+    mapBtn.hidden = !active;
+    if (!active) {
+      if (mapDialog.open) mapDialog.close();
+      return;
+    }
+    mapBtn.title = m.name ? 'Show map \u2014 ' + m.name : "Show the party's current map";
+  }
+
+  async function refreshMapDialog() {
+    if (!mapDialog.open || !mapView) return;
+    try {
+      const r = await fetch('/combat-state');
+      const data = await r.json();
+      const dm = data.dungml || {};
+      if (!dm.connected) {
+        mapDlgSub.textContent = dm.reachable ? (dm.detail || 'no map') : 'map service offline';
+        return;
+      }
+      mapDlgName.textContent = dm.map_name ? '\u2014 ' + dm.map_name : '';
+      const bits = [];
+      if (dm.scope === 'gm') bits.push('GM view');
+      else bits.push('fog of war');
+      if (dm.party_node) bits.push('party at ' + dm.party_node);
+      if (data.active && data.grid) {
+        bits.push('Round ' + data.round + (data.current ? ' \u00b7 \u25b6 ' + data.current : ''));
+      }
+      mapDlgSub.textContent = bits.join(' \u00b7 ');
+      mapView.render(CombatMap.fogState(data, dm));
+    } catch (e) { /* leave the last render in place */ }
+  }
+
+  mapBtn.addEventListener('click', () => {
+    if (typeof mapDialog.showModal !== 'function') { window.open('/map', '_blank'); return; }
+    mapDialog.showModal();
+    // Build after showModal: the canvas measures its wrapper, which has no
+    // size while the dialog is closed.
+    if (!mapView) {
+      mapView = new CombatMap(document.getElementById('map-dlg-cmap'), {cellPx: 32});
+      mapView.onHover = (x, y, label) => {
+        mapDlgCoords.textContent = '(' + x + ', ' + y + ')' + (label ? ' \u2014 ' + label : '');
+      };
+      document.getElementById('map-dlg-in').addEventListener('click',
+        () => mapView.setZoom(mapView.zoom * 1.25));
+      document.getElementById('map-dlg-out').addEventListener('click',
+        () => mapView.setZoom(mapView.zoom * 0.8));
+      document.getElementById('map-dlg-reset').addEventListener('click',
+        () => mapView.setZoom(1));
+    }
+    mapView.resize();
+    refreshMapDialog();
+    if (!mapTimer) mapTimer = setInterval(refreshMapDialog, 2000);
+  });
+  mapDlgClose.addEventListener('click', () => mapDialog.close());
+  mapDialog.addEventListener('close', () => {
+    if (mapTimer) { clearInterval(mapTimer); mapTimer = null; }
   });
 
   // --- Debug dialog ---
@@ -9043,6 +9251,13 @@ _COMBAT_CSS_BASE = """
 .init-name{font-size:.88em;color:#d4c5a9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .init-current .init-name{color:#c8a96e;font-weight:bold}
 .init-val{color:#8a7a60;font-size:.85em;font-family:monospace;margin-left:6px;flex-shrink:0}
+/* Phones: a 210px initiative column beside the map leaves the map about
+   160px wide. Map first at full width, initiative underneath it. */
+@media (max-width: 760px) {
+  .combat-layout{flex-wrap:wrap}
+  .combat-canvas-wrap{flex:1 1 100%;order:1;height:58vh;height:58dvh}
+  .combat-sidebar{flex:1 1 100%;width:auto;order:2}
+}
 </style>
 """
 
@@ -9051,6 +9266,8 @@ _COMBAT_CSS = _COMBAT_CSS + _COMBAT_CSS_BASE
 _COMBAT_JS = (
     'var map = new CombatMap(document.getElementById("cmap"), {cellPx: 36});\n'
     'var initListEl = document.getElementById("init-list");\n'
+    'var partyWrapEl = document.getElementById("party-wrap");\n'
+    'var partyListEl = document.getElementById("map-party-list");\n'
     '\n'
     'map.onZoom = function(z) {\n'
     '  var el = document.getElementById("zoom-label");\n'
@@ -9121,22 +9338,9 @@ _COMBAT_JS = (
     'var _fogLocale = document.getElementById("fog-locale");\n'
     'var _localesLoaded = false;\n'
     '\n'
-    'function fogState(data, dm) {\n'
-    '  if (!dm || !dm.connected || !dm.width || !dm.height) return data;\n'
-    '  var base = data.grid || {};\n'
-    '  var g = {};\n'
-    '  for (var k in base) g[k] = base[k];\n'
-    '  g.width   = dm.width;\n'
-    '  g.height  = dm.height;\n'
-    '  g.scale   = base.scale || "5ft";\n'
-    '  // ?v= is the render fingerprint: it changes when fog burns off, the\n'
-    '  // party moves, or the scope flips, and only then.\n'
-    '  g.svg_url = dm.render_url + "?v=" + encodeURIComponent(dm.version || "0");\n'
-    '  var out = {};\n'
-    '  for (var k2 in data) out[k2] = data[k2];\n'
-    '  out.grid = g;\n'
-    '  return out;\n'
-    '}\n'
+    '// Geometry + fogged background merge lives on CombatMap so this tab and\n'
+    '// the play page\'s map dialog draw from the same rules.\n'
+    'var fogState = CombatMap.fogState;\n'
     '\n'
     'function updateFogUi(dm) {\n'
     '  if (!_fogPill) return;\n'
@@ -9144,8 +9348,7 @@ _COMBAT_JS = (
     '  var gm = on && dm.scope === "gm";\n'
     '  _fogPill.className = "fog-pill " + (gm ? "fog-gm" : on ? "fog-on" : "fog-off");\n'
     '  if (on) {\n'
-    '    var where = dm.map_name || "combat map";\n'
-    '    _fogPill.textContent = (gm ? "GM view" : "fog of war") + " · " + where;\n'
+    '    _fogPill.textContent = gm ? "GM view" : "fog of war";\n'
     '    _fogPill.title = dm.party_node\n'
     '      ? "party at " + dm.party_node\n'
     '      : "no party marker set — use dungml_party_at";\n'
@@ -9200,6 +9403,12 @@ _COMBAT_JS = (
     '  });\n'
     '}\n'
     '\n'
+    '// Empty-state line: why there is nothing to draw, and what fixes it.\n'
+    'function emptyHint(dm) {\n'
+    '  if (!dm || !dm.reachable) return "map service offline — start dmap-server";\n'
+    '  return dm.detail || "no map yet — push one with create_map, or pick a locale";\n'
+    '}\n'
+    '\n'
     'async function refresh() {\n'
     '  try {\n'
     '    var r = await fetch("/combat-state");\n'
@@ -9207,28 +9416,32 @@ _COMBAT_JS = (
     '    var dm = data.dungml || {};\n'
     '    updateFogUi(dm);\n'
     '    var hasCombat = !!(data.active && data.grid);\n'
+    '    var locEl  = document.getElementById("loc-info");\n'
+    '    var cmbEl  = document.getElementById("combat-info");\n'
+    '    var sideEl = document.getElementById("init-wrap");\n'
+    '\n'
+    '    // Location first, fight second: this tab draws whatever locale dungml\n'
+    '    // holds for the campaign, in or out of combat. A live fight only adds\n'
+    '    // the round line, the initiative sidebar and the tokens.\n'
+    '    _currentDsl = hasCombat ? ((data.grid && data.grid.dsl) || null) : null;\n'
+    '    if (copyBtn) copyBtn.disabled = !_currentDsl;\n'
+    '    if (sideEl) sideEl.style.display = hasCombat ? "" : "none";\n'
+    '    cmbEl.textContent = hasCombat\n'
+    '      ? "Round " + data.round + (data.current ? " · ▶ " + data.current : "")\n'
+    '      : (dm.party_node ? "party at " + dm.party_node : "");\n'
+    '\n'
     '    if (!hasCombat && !dm.connected) {\n'
-    '      document.getElementById("round-info").textContent = "No active combat map";\n'
-    '      document.getElementById("turn-info").textContent = "";\n'
-    '      initListEl.innerHTML = \'<p class="muted" style="font-size:.85em">No combat active</p>\';\n'
+    '      locEl.textContent = "No map";\n'
+    '      cmbEl.textContent = emptyHint(dm);\n'
+    '      initListEl.innerHTML = "";\n'
     '      document.getElementById("unplaced").innerHTML = "";\n'
-    '      _currentDsl = null;\n'
-    '      if (copyBtn) copyBtn.disabled = true;\n'
+    '      map.clear();\n'
     '      return;\n'
     '    }\n'
-    '    if (hasCombat) {\n'
-    '      document.getElementById("round-info").textContent = "Round " + data.round;\n'
-    '      document.getElementById("turn-info").textContent = "▶ " + (data.current || "");\n'
-    '      _currentDsl = (data.grid && data.grid.dsl) || null;\n'
-    '    } else {\n'
-    '      // Session connected between fights: the tab is a live locale view.\n'
-    '      document.getElementById("round-info").textContent = dm.map_name || "Current locale";\n'
-    '      document.getElementById("turn-info").textContent =\n'
-    '        dm.party_node ? "party at " + dm.party_node : "";\n'
-    '      initListEl.innerHTML = \'<p class="muted" style="font-size:.85em">No combat active</p>\';\n'
-    '      _currentDsl = null;\n'
-    '    }\n'
-    '    if (copyBtn) copyBtn.disabled = !_currentDsl;\n'
+    '    locEl.textContent = dm.connected ? (dm.map_name || "Pushed map")\n'
+    '                                     : "Battlemap (local render)";\n'
+    '    locEl.title = dm.party_node ? "party at " + dm.party_node\n'
+    '                                : "no party marker set — use dungml_party_at";\n'
     '    map.render(fogState(data, dm));\n'
     '    map.renderInitList(initListEl, hasCombat ? (data.combatants || []) : []);\n'
     '    var unplaced = (hasCombat ? (data.combatants || []) : []).filter(function(c){\n'
@@ -9240,18 +9453,70 @@ _COMBAT_JS = (
     '        + \'</span>\'\n'
     '      : "";\n'
     '  } catch(e) {\n'
-    '    document.getElementById("round-info").textContent = "Waiting for combat…";\n'
+    '    document.getElementById("loc-info").textContent = "Loading…";\n'
     '  }\n'
     '}\n'
+    '\n'
+    '// The party roster, same source the /play sidebar reads. Independent of\n'
+    '// combat state: the tab is the party\'s locale first, so who is standing\n'
+    '// in it is always worth showing.\n'
+    'function escHtml(s) {\n'
+    '  return String(s == null ? "" : s).replace(/[&<>"\']/g, function(c) {\n'
+    '    return {"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","\'":"&#39;"}[c];\n'
+    '  });\n'
+    '}\n'
+    '\n'
+    'function renderMapParty(chars) {\n'
+    '  if (!partyListEl || !partyWrapEl) return;\n'
+    '  if (!chars || !chars.length) {\n'
+    '    partyWrapEl.style.display = "none";\n'
+    '    partyListEl.innerHTML = "";\n'
+    '    return;\n'
+    '  }\n'
+    '  partyWrapEl.style.display = "";\n'
+    '  partyListEl.innerHTML = chars.map(function(c) {\n'
+    '    var ko = (c.hp || 0) <= 0;\n'
+    '    var name = escHtml(c.label || "?");\n'
+    '    var pic = c.portrait\n'
+    '      ? \'<img src="\' + escHtml(c.portrait) + \'" alt="\' + name + \'">\'\n'
+    '      : "<span>" + name.slice(0, 1).toUpperCase() + "</span>";\n'
+    '    var conds = (c.conditions || []).join(", ");\n'
+    '    var title = [c.cls, c.level ? "level " + c.level : "", conds]\n'
+    '      .filter(Boolean).join(" \\u00b7 ");\n'
+    '    return \'<div class="init-row party" title="\' + escHtml(title) + \'"\'\n'
+    '      + (ko ? \' style="opacity:.55"\' : "") + ">"\n'
+    '      + \'<div class="init-portrait">\' + pic + "</div>"\n'
+    '      + \'<div class="init-info">\'\n'
+    '      +   \'<a class="init-name" href="/sheets/\'\n'
+    '      +     encodeURIComponent(c.key || "") + \'" style="text-decoration:none">\'\n'
+    '      +     name + "</a>"\n'
+    '      +   \'<span class="init-val">\' + escHtml(c.hp) + "/" + escHtml(c.hp_max)\n'
+    '      +     (c.ac === undefined || c.ac === null ? "" : " \\u00b7 AC" + escHtml(c.ac))\n'
+    '      +   "</span>"\n'
+    '      + "</div></div>";\n'
+    '  }).join("");\n'
+    '}\n'
+    '\n'
+    'async function refreshParty() {\n'
+    '  try {\n'
+    '    var r = await fetch("/api/play_state.json");\n'
+    '    if (!r.ok) return;\n'
+    '    var s = await r.json();\n'
+    '    renderMapParty(s.characters);\n'
+    '  } catch(e) { /* leave the last render in place */ }\n'
+    '}\n'
+    '\n'
     'refresh();\n'
+    'refreshParty();\n'
     'setInterval(refresh, 2000);\n'
+    'setInterval(refreshParty, 5000);\n'
 )
 
 
 # ---------------------------------------------------------------------------
 # dungml fog-of-war bridge
 #
-# When a dungml play session is connected, the combat tab draws the *fogged*
+# When a dungml play session is connected, the `/map` tab draws the *fogged*
 # render of the party's current locale instead of the flat local one. The SVG
 # comes from dmap-server, so it is cached briefly here: the tab polls
 # /combat-state every 2s, and both that poll (for the version fingerprint)
@@ -9261,8 +9526,15 @@ _COMBAT_JS = (
 _DUNGML_SVG_TTL_S   = 1.5
 _DUNGML_BLOCK_TTL_S = 2.0
 
+# How often to re-probe when dungml has a session but ttrpg2 never learned the
+# map's geometry. The tab cannot lay out tokens without width/height, so
+# without this it would stay blank until the next create_map — throttled well
+# above the 2s poll so an idle tab costs nothing.
+_DUNGML_PROBE_TTL_S = 30.0
+
 _dungml_svg_cache: dict = {"key": None, "svg": b"", "etag": "", "meta": {}, "ts": 0.0}
 _dungml_block_cache: dict = {"block": None, "ts": 0.0}
+_dungml_probe_ts: float = 0.0
 
 
 def _dungml_fog_svg(scope: str | None = None) -> tuple[bytes | None, str, dict]:
@@ -9301,7 +9573,7 @@ def _dungml_block() -> dict:
         return c["block"]
     try:
         block = _dungml.connection_block(cfg)
-    except Exception as e:  # never let the map service break the combat tab
+    except Exception as e:  # never let the map service break the /map tab
         block = {"connected": False, "reachable": False, "detail": str(e)}
     if block.get("connected"):
         _svg, etag, meta = _dungml_fog_svg()
@@ -9319,6 +9591,28 @@ def _dungml_block() -> dict:
             # connected so the tab shows the local map rather than a blank.
             block["connected"] = False
             block.setdefault("detail", "map not ready")
+    elif block.get("session_id") and not block.get("width"):
+        # dungml is holding a map for this campaign but the cached link has no
+        # geometry — state.json was reset, or the source was pushed from
+        # elsewhere. Probe (throttled) so the tab heals itself on the next poll
+        # instead of showing an empty grid until the next create_map.
+        global _dungml_probe_ts
+        if (now - _dungml_probe_ts) >= _DUNGML_PROBE_TTL_S:
+            _dungml_probe_ts = now
+            try:
+                link = _dungml.probe(cfg)
+            except Exception:
+                link = None
+            if link and link.get("width"):
+                block["width"] = link["width"]
+                block["height"] = link["height"]
+                block["party_node"] = link["party_node"]
+                block["connected"] = True
+                _svg, etag, _meta = _dungml_fog_svg()
+                if etag:
+                    block["version"] = etag
+                else:
+                    block["connected"] = False
     c.update(block=block, ts=now)
     return block
 
@@ -9347,7 +9641,7 @@ def combat_fog_svg():
 
 @app.route("/combat-fog-view", methods=["POST"])
 def combat_fog_view():
-    """Flip the combat tab between the players' fogged view and the GM view.
+    """Flip the `/map` tab between the players' fogged view and the GM view.
 
     A display setting only — it reveals nothing and does not touch what the
     party has discovered.
@@ -9381,7 +9675,7 @@ def combat_fog_locales():
 
 @app.route("/combat-fog-locale", methods=["POST"])
 def combat_fog_locale():
-    """Select which map the combat tab draws: an authored locale, or the map
+    """Select which map the `/map` tab draws: an authored locale, or the map
     `create_map` last pushed (`map_id` omitted / "combat")."""
     body = request.get_json(silent=True) or {}
     map_id = (body.get("map_id") or "").strip()
@@ -9409,38 +9703,54 @@ def combat_fog_locale():
                     "width": link["width"], "height": link["height"]})
 
 
-@app.route("/combat")
-def combat_view():
+@app.route("/map")
+def locale_map_view():
+    """The party's current locale, drawn by dungml.
+
+    Location first, fight second: the tab shows whatever map dungml holds for
+    this campaign — the selected authored locale, or the one `create_map` last
+    pushed — whether or not a fight is running. A live combat adds the round
+    line, the initiative sidebar and the tokens on top of the same render.
+    """
     name = html.escape(cfg.get("name", "Campaign"))
     body = (
         _COMBAT_CSS
-        + f'<h1>Combat Map</h1>'
+        + '<h1>Map</h1>'
         + '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px">'
-        + '  <span id="round-info" style="color:#c8a96e;font-weight:bold">Loading…</span>'
-        + '  <span id="turn-info" style="color:#d4c5a9"></span>'
+        + '  <span id="loc-info" style="color:#c8a96e;font-weight:bold">Loading\u2026</span>'
+        + '  <span id="combat-info" style="color:#d4c5a9"></span>'
         + '  <span id="fog-pill" class="fog-pill fog-off" title="dungml play-session status">map service offline</span>'
-        + '  <select id="fog-locale" class="fog-select" title="Which map the tab draws — an authored dungml locale, or the map create_map last pushed" style="display:none">'
+        + '  <select id="fog-locale" class="fog-select" title="Which map the tab draws \u2014 an authored dungml locale, or the map create_map last pushed" style="display:none">'
         + '    <option value="combat">Combat map (pushed)</option>'
         + '  </select>'
         + '  <span id="fog-view" class="fog-toggle" style="display:none">'
-        + '    <button type="button" class="zoom-btn" data-scope="fog" title="Players\' view — only what the party has discovered">Fog</button>'
-        + '    <button type="button" class="zoom-btn" data-scope="gm" title="GM view — the whole map with the party marker">GM</button>'
+        + '    <button type="button" class="zoom-btn" data-scope="fog" title="Players\' view \u2014 only what the party has discovered">Fog</button>'
+        + '    <button type="button" class="zoom-btn" data-scope="gm" title="GM view \u2014 the whole map with the party marker">GM</button>'
         + '  </span>'
         + '  <span style="margin-left:auto;display:flex;gap:5px;align-items:center">'
         + '    <button class="zoom-btn" id="copy-dsl-btn" title="Copy current map DSL to clipboard (paste into the dungml editor to persist)">Copy DSL</button>'
         + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*1.25)">+</button>'
-        + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*0.8)">−</button>'
-        + '    <button class="zoom-btn" onclick="map.setZoom(1)" title="Reset zoom">□</button>'
+        + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*0.8)">\u2212</button>'
+        + '    <button class="zoom-btn" onclick="map.setZoom(1)" title="Reset zoom">\u25a1</button>'
         + '    <span id="zoom-label" style="color:#8a7a60;font-size:.8em;min-width:36px;text-align:right">100%</span>'
         + '  </span>'
         + '</div>'
         + '<div style="color:#8a7a60;font-size:.8em;margin-bottom:8px">'
-        + '  <span id="coords">hover map for coordinates · scroll to zoom</span>'
+        + '  <span id="coords">hover map for coordinates \u00b7 scroll to zoom</span>'
         + '</div>'
         + '<div class="combat-layout">'
+        # The sidebar stands whether or not a fight is running: the party
+        # roster is always there, and initiative is combat-only furniture
+        # stacked above it.
         + '  <div class="combat-sidebar">'
-        + '    <h3 style="margin:0 0 8px;font-size:.95em;color:#c8a96e">Initiative Order</h3>'
-        + '    <div id="init-list"></div>'
+        + '    <div id="init-wrap" style="display:none">'
+        + '      <h3 style="margin:0 0 8px;font-size:.95em;color:#c8a96e">Initiative Order</h3>'
+        + '      <div id="init-list"></div>'
+        + '    </div>'
+        + '    <div id="party-wrap" style="display:none">'
+        + '      <h3 style="margin:14px 0 8px;font-size:.95em;color:#c8a96e">Party</h3>'
+        + '      <div id="map-party-list"></div>'
+        + '    </div>'
         + '  </div>'
         + '  <div class="combat-canvas-wrap">'
         + '    <canvas id="cmap"></canvas>'
@@ -9450,7 +9760,13 @@ def combat_view():
         + '<script src="/static/combat-map.js"></script>'
         + '<script>' + _COMBAT_JS + '</script>'
     )
-    return render(f"Combat — {name}", body)
+    return render(f"Map \u2014 {name}", body)
+
+
+@app.route("/combat")
+def combat_view():
+    """Kept for old links and session logs: the tab used to live here."""
+    return redirect("/map")
 
 
 @app.route("/combat-state")
@@ -11346,6 +11662,7 @@ if __name__ == "__main__":
 
     try:
         cfg = _c.load_campaign(args.campaign or None)
+        _cfg_pinned = bool(args.campaign)
     except (FileNotFoundError, RuntimeError) as exc:
         print(f"Error loading campaign: {exc}", file=sys.stderr)
         sys.exit(1)

@@ -436,3 +436,87 @@ class ToolTests(BridgeTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActiveMapReportTests(BridgeTestCase):
+    """dungml can't know which locale the party is on — ttrpg2 owns that
+    choice and has to tell it, or the web GUI has no way to point the GM at
+    the live session."""
+
+    def test_probe_reports_the_active_map(self):
+        dp.save_link_state(self.cfg, source="campaign", map_id="m9")
+        rec = self.stub(responses={
+            ("POST", "/campaigns/test-camp/maps/m9/tokens"): {"token": "t"},
+            ("GET", "/campaigns/test-camp/maps/m9/render"): SVG_FOG,
+        })
+        dp.probe(self.cfg)
+        self.assertEqual(
+            rec.body_for("PUT", "/campaigns/test-camp/active"), {"map_id": "m9"}
+        )
+
+    def test_combat_mode_reports_no_active_map(self):
+        rec = self.stub(responses={
+            ("POST", "/maps/test-camp/tokens"): {"token": "t"},
+            ("GET", "/maps/test-camp/render"): SVG_FOG,
+        })
+        dp.probe(self.cfg)
+        self.assertNotIn("/campaigns/test-camp/active", rec.paths("PUT"))
+
+    def test_a_placeholder_render_reports_nothing(self):
+        """Nothing is in play yet, so there's no live locale to advertise."""
+        dp.save_link_state(self.cfg, source="campaign", map_id="m9")
+        rec = self.stub(responses={
+            ("POST", "/campaigns/test-camp/maps/m9/tokens"): {"token": "t"},
+            ("GET", "/campaigns/test-camp/maps/m9/render"): SVG_PLACEHOLDER,
+        })
+        dp.probe(self.cfg)
+        self.assertNotIn("/campaigns/test-camp/active", rec.paths("PUT"))
+
+    def test_an_outage_while_reporting_does_not_break_the_probe(self):
+        dp.save_link_state(self.cfg, source="campaign", map_id="m9")
+        self.stub(responses={
+            ("POST", "/campaigns/test-camp/maps/m9/tokens"): {"token": "t"},
+            ("GET", "/campaigns/test-camp/maps/m9/render"): SVG_FOG,
+        })
+        orig = dp.set_active_map
+
+        def boom(ext, map_id):
+            raise dp.DungmlUnavailable("stubbed outage")
+
+        dp.set_active_map = boom
+        try:
+            link = dp.probe(self.cfg)
+        finally:
+            dp.set_active_map = orig
+        # Geometry still cached — the report is advisory, not load-bearing.
+        self.assertEqual(link["width"], 36)
+
+    def test_use_locale_reports_the_chosen_map(self):
+        rec = self.stub(responses={
+            ("GET", "/campaigns/test-camp/maps"): [
+                {"id": "m1", "name": "Upper Halls"},
+                {"id": "m2", "name": "Deep Cells"},
+            ],
+            ("POST", "/campaigns/test-camp/maps/m2/tokens"): {"token": "t"},
+            ("GET", "/campaigns/test-camp/maps/m2/render"): SVG_FOG,
+        })
+
+        class _FakeMcp:
+            def __init__(self): self.registered = {}
+            def tool(self, *a, **kw):
+                def deco(fn):
+                    self.registered[fn.__name__] = fn
+                    return fn
+                return deco
+
+        mcp = _FakeMcp()
+        dp.register(mcp)
+        orig_load = dp._c.load_campaign
+        dp._c.load_campaign = lambda *a, **kw: self.cfg
+        try:
+            mcp.registered["dungml_use_locale"](name_or_id="deep")
+        finally:
+            dp._c.load_campaign = orig_load
+        self.assertEqual(
+            rec.body_for("PUT", "/campaigns/test-camp/active"), {"map_id": "m2"}
+        )

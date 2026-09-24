@@ -1,4 +1,4 @@
-"""dungml play-session bridge — fog-of-war for the combat tab.
+"""dungml play-session bridge — fog-of-war for the dashboard's `/map` tab.
 
 Two contracts, both served by `dmap-server` at `DUNGML_API_BASE`:
 
@@ -13,8 +13,9 @@ Two contracts, both served by `dmap-server` at `DUNGML_API_BASE`:
                                 the GM's own token); ttrpg2 then picks which of
                                 that project's maps is the current locale.
 
-The combat tab prefers a selected campaign locale and falls back to whatever
-`create_map` last pushed. Fog state (which nodes the party has discovered,
+The `/map` tab prefers a selected campaign locale and falls back to whatever
+`create_map` last pushed. It draws that locale in or out of combat — the tab
+is the party's current location, not a combat-only view. Fog state (which nodes the party has discovered,
 where it stands) lives on dungml's PlaySession, keyed per campaign — ttrpg2
 stores only the link: which contract, which map, which view scope.
 
@@ -229,6 +230,21 @@ def campaign_render(ext: str, map_id: str, token: str) -> bytes:
     )
 
 
+def set_active_map(ext: str, map_id: str) -> None:
+    """Tell dungml which of the linked project's maps the party is on.
+
+    dungml can't work this out for itself — the choice of locale lives in
+    ttrpg2's own state — and without it the web GUI has no way to point the
+    GM at the session this campaign is actually driving. Advisory only:
+    nothing here depends on it landing.
+    """
+    _request(
+        "PUT",
+        f"/campaigns/{urllib.parse.quote(ext)}/active",
+        {"map_id": map_id},
+    )
+
+
 def campaign_reveal(ext: str, map_id: str, node: str) -> None:
     _request(
         "POST",
@@ -256,7 +272,7 @@ def map_rooms(map_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Resolution — what the combat tab should actually draw
+# Resolution — what the `/map` tab should actually draw
 # ---------------------------------------------------------------------------
 
 _VIEWBOX_RX = re.compile(r'viewBox="0\s+0\s+([\d.]+)\s+([\d.]+)"')
@@ -264,7 +280,7 @@ _PARTY_NODE_RX = re.compile(r'data-party-node="([^"]*)"')
 
 
 def render_current(cfg: dict, scope: str | None = None) -> tuple[bytes, dict]:
-    """Fetch the SVG the combat tab should show, plus its metadata.
+    """Fetch the SVG the `/map` tab should show, plus its metadata.
 
     Returns `(svg_bytes, meta)` where meta carries `width`/`height` in grid
     cells (from the SVG's viewBox, which dungml sets from `grid { bounds }`)
@@ -295,7 +311,7 @@ def render_current(cfg: dict, scope: str | None = None) -> tuple[bytes, dict]:
 def probe(cfg: dict) -> dict:
     """Refresh the cached geometry on the stored link by rendering once.
 
-    The combat tab needs `width`/`height` before it can lay out tokens, and it
+    The `/map` tab needs `width`/`height` before it can lay out tokens, and it
     learns them from `/combat-state` — which is served before the image
     loads. Geometry doesn't change as fog burns off, so caching it on the link
     is enough; this is called whenever the map itself changes.
@@ -306,6 +322,15 @@ def probe(cfg: dict) -> dict:
         return link_state(cfg)
     if meta.get("placeholder"):
         return link_state(cfg)
+    link = link_state(cfg)
+    if link["source"] == "campaign" and link["map_id"]:
+        # Re-reported on every probe rather than only on a locale switch, so
+        # a campaign that chose its locale before dungml tracked this still
+        # shows up in the GUI. Swallowed like every other call here.
+        try:
+            set_active_map(external_id(cfg), link["map_id"])
+        except DungmlUnavailable:
+            pass
     return save_link_state(
         cfg,
         width=meta.get("width"),
@@ -317,7 +342,7 @@ def probe(cfg: dict) -> dict:
 def connection_block(cfg: dict) -> dict:
     """The `dungml` block for combat_state.json / `/combat-state`.
 
-    This is what tells the combat tab whether a session is connected and
+    This is what tells the `/map` tab whether a session is connected and
     therefore whether to draw the fogged render instead of the plain local
     one. Deliberately cheap — no render, no token mint — because the tab polls
     it every couple of seconds; it reports the *stored* link plus a liveness
@@ -392,10 +417,10 @@ def register(mcp):
     def dungml_status() -> dict:
         """Report whether a dungml play session is connected to this campaign.
 
-        Shows which map the combat tab is drawing (the pushed combat map, or a
+        Shows which map the `/map` tab is drawing (the pushed combat map, or a
         selected authored locale), the current view scope (`fog` = players'
         view, `gm` = whole map), the party's node, and how many nodes have
-        been discovered. Use it when the combat tab looks wrong or empty.
+        been discovered. Use it when the `/map` tab looks wrong or empty.
         """
         cfg = _c.load_campaign()
         block = connection_block(cfg)
@@ -420,7 +445,7 @@ def register(mcp):
 
         These come from the dungml project linked to this campaign — maps the
         GM drew in the dungml editor. Empty if the campaign isn't linked, in
-        which case the combat tab uses whatever `create_map` last pushed.
+        which case the `/map` tab uses whatever `create_map` last pushed.
         Select one with `dungml_use_locale`.
         """
         cfg = _c.load_campaign()
@@ -451,7 +476,7 @@ def register(mcp):
 
     @mcp.tool()
     def dungml_use_locale(name_or_id: str) -> dict:
-        """Point the combat tab at an authored map as the current locale.
+        """Point the `/map` tab at an authored map as the current locale.
 
         `name_or_id` is a map id or a case-insensitive substring of its name,
         from `dungml_locales`. The map's own fog is per-campaign, so each
@@ -498,7 +523,7 @@ def register(mcp):
 
     @mcp.tool()
     def dungml_rooms() -> dict:
-        """List the node ids of the map the combat tab is showing.
+        """List the node ids of the map the `/map` tab is showing.
 
         These ids (`room.antechamber`, `corridor.spine`, …) are what
         `dungml_party_at` and `dungml_reveal` take. `exits` gives the nodes
@@ -572,7 +597,7 @@ def register(mcp):
 
     @mcp.tool()
     def dungml_view(scope: str = "fog") -> dict:
-        """Set what the combat tab draws: `fog` or `gm`.
+        """Set what the `/map` tab draws: `fog` or `gm`.
 
         `fog` is the players' view — only discovered geometry, with unexplored
         corridors fading out at the boundary. `gm` is the whole map with the

@@ -383,5 +383,81 @@ class ResidentSignatureTests(unittest.TestCase):
         self.assertNotEqual(base, dm_session._turn_signature(False, "low"))
 
 
+class AutoResetTests(unittest.TestCase):
+    """Auto-reset must never cut a running turn short, and must hand the
+    fresh session a summary of what only the old context knew."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self._session_path = self.dir / ".dm_session"
+        self._session_path.write_text("old-sid")
+        self.sent: list[tuple[str, str | None]] = []
+        self.reply = "HANDOVER: Brakka the paladin, STR 17, not yet saved."
+
+        def fake_turn_events(message, sid, rehydrate, effort):
+            self.sent.append((message, sid))
+            yield {"type": "result", "result": self.reply}
+
+        self._saved = {
+            name: getattr(dm_session, name) for name in (
+                "_active_session_file", "_session_context_tokens",
+                "_combat_active", "_turn_events", "_kill_resident",
+                "_AUTO_RESET_ENABLED",
+            )
+        }
+        dm_session._active_session_file = lambda: self._session_path
+        dm_session._session_context_tokens = lambda sid: 10**6
+        dm_session._combat_active = lambda: False
+        dm_session._turn_events = fake_turn_events
+        dm_session._kill_resident = lambda: None
+        dm_session._AUTO_RESET_ENABLED = True
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(dm_session, name, value)
+
+    def test_reset_waits_for_the_turn_in_flight(self):
+        import threading
+        calls = []
+        orig = dm_session._maybe_auto_reset
+        dm_session._maybe_auto_reset = lambda effort=None: calls.append(1) or False
+        self.addCleanup(setattr, dm_session, "_maybe_auto_reset", orig)
+
+        dm_session._turn_lock.acquire()  # a turn is running
+        t = threading.Thread(target=lambda: list(dm_session.stream_turn("next")))
+        t.start()
+        try:
+            t.join(0.3)
+            self.assertEqual(calls, [], "reset check ran while a turn held the lock")
+        finally:
+            dm_session._turn_lock.release()
+        t.join(5)
+        self.assertEqual(calls, [1])
+
+    def test_handover_is_written_by_the_old_session_before_reset(self):
+        self.assertTrue(dm_session._maybe_auto_reset(None))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][1], "old-sid")
+        self.assertEqual(
+            (self.dir / "_handover.md").read_text(encoding="utf-8"), self.reply)
+        self.assertIsNone(dm_session.session_id())
+
+    def test_failed_handover_still_resets_and_drops_a_stale_note(self):
+        (self.dir / "_handover.md").write_text("stale note from last reset")
+        self.reply = ""
+        self.assertTrue(dm_session._maybe_auto_reset(None))
+        self.assertFalse((self.dir / "_handover.md").exists())
+        self.assertIsNone(dm_session.session_id())
+
+    def test_handover_reaches_only_the_rehydrate_prompt(self):
+        (self.dir / "_handover.md").write_text("PARTY: six rolled, unsaved.")
+        self.assertIn("PARTY: six rolled, unsaved.",
+                      "\n\n".join(dm_session._system_prompt_parts(True)))
+        self.assertNotIn("PARTY: six rolled, unsaved.",
+                         "\n\n".join(dm_session._system_prompt_parts(False)))
+
+
 if __name__ == "__main__":
     unittest.main()

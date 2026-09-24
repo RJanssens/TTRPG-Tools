@@ -637,12 +637,12 @@ _ALLOWED_TOOLS = "mcp__ttrpg__*,Read,Write,Edit,Bash"
 # files via ``session_primer()`` — the system is designed to rehydrate that
 # way. ``DM_AUTO_RESET=0`` disables; ``DM_AUTO_RESET_TOKENS`` tunes the trigger.
 _AUTO_RESET_ENABLED = os.environ.get("DM_AUTO_RESET", "1") != "0"
-# 90k, not 150k: measured round-trip cost is ~2.6 s at 42-66k of context, 3.0 s
-# at 107k and 3.5 s at 150k, and a turn spends that on every one of its 5-20
-# round trips. Resetting earlier keeps the whole back half of a session on the
-# cheap end of that curve, and rehydration is now a single session_primer()
-# call (it returns the scene, so the DM no longer reads campaign files by hand).
-_AUTO_RESET_TOKENS = int(os.environ.get("DM_AUTO_RESET_TOKENS", "90000"))
+# 250k. Round trips do get slower with context (~2.6 s at 42-66k, 3.0 s at
+# 107k, 3.5 s at 150k), which once argued for resetting at 90k. But a single
+# setup turn — loading a module, rolling a party — routinely passes 150k, and
+# a reset throws away everything not yet written to the state files, which
+# session_primer() cannot rehydrate. Losing work costs more than the latency.
+_AUTO_RESET_TOKENS = int(os.environ.get("DM_AUTO_RESET_TOKENS", "250000"))
 
 # One-shot system-prompt note injected on the first turn after an auto-reset.
 # It tells the (now context-free) DM that this is the SAME ongoing scene and to
@@ -661,6 +661,31 @@ _REHYDRATE_ADDENDUM = (
     "next action. Do NOT announce a reset, do NOT greet the player, do NOT "
     "re-introduce the setting or summarise 'previously' — just carry on the "
     "narrative exactly as if nothing changed."
+)
+
+# Hidden last turn sent to the outgoing session before an auto-reset. Its reply
+# becomes _handover.md and is appended to the fresh session's rehydration
+# prompt — carrying what the state files don't hold yet.
+_HANDOVER_PROMPT = (
+    "[SYSTEM — NOT FROM THE PLAYER. The player never sees this turn or your "
+    "reply.] Your context is about to be cleared; a fresh DM session will "
+    "take over with only session_primer() and the note you write now. Do "
+    "not call any tools and do not narrate. Reply with a handover note in "
+    "terse markdown covering ONLY what the campaign files do not already "
+    "record:\n"
+    "- Work in progress not yet saved (e.g. rolled ability scores, races, "
+    "names, gold, spells, rumours assigned during character creation), with "
+    "the exact numbers.\n"
+    "- The player's standing instructions and house rules for this campaign "
+    "(e.g. generation method, banned races, requested classes).\n"
+    "- What the player last asked for and what you were in the middle of "
+    "doing.\n"
+    "- Decisions made and promises given to the player; open questions put "
+    "to them.\n"
+    "- Source material you read that the next session must re-read (file "
+    "paths), and what mattered in it.\n"
+    "- DM-side facts you were tracking but had not stored with dm_note.\n"
+    "Omit anything session_primer() already returns. No preamble."
 )
 
 # Single-flight: the CLI mutates state under ``.claude/projects/`` and
@@ -1077,6 +1102,9 @@ def _system_prompt_parts(rehydrate: bool) -> list[str]:
     parts = []
     if rehydrate:
         parts.append(_REHYDRATE_ADDENDUM)
+        handover = _handover_addendum()
+        if handover:
+            parts.append(handover)
     tone = _tone_addendum()
     if tone:
         parts.append(tone)
@@ -1200,15 +1228,70 @@ def _combat_active() -> bool:
     return False
 
 
-def _maybe_auto_reset() -> bool:
+def _handover_path() -> Path | None:
+    """Where the outgoing session's handover note lives: ``_handover.md``
+    beside the campaign's ``.dm_session``. DM-side only."""
+    p = _active_session_file()
+    return p.parent / "_handover.md" if p is not None else None
+
+
+def _write_handover(sid: str, effort: str | None) -> None:
+    """Ask the outgoing session — the only thing that still holds the full
+    context — for a handover note, and save its reply to ``_handover.md``.
+
+    Runs as a hidden turn on the old session (the resident is still bound to
+    it, so the prompt cache is warm). A failed or empty reply removes any
+    stale note, so the next session is never primed with an older handover."""
+    path = _handover_path()
+    if path is None:
+        return
+    text = ""
+    try:
+        for evt in _turn_events(_HANDOVER_PROMPT, sid, False, effort):
+            if evt.get("type") == "result" and isinstance(evt.get("result"), str):
+                text = evt["result"].strip()
+    except Exception:
+        text = ""
+    try:
+        if text:
+            path.write_text(text, encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _handover_addendum() -> str | None:
+    """The saved handover note, wrapped for the rehydration system prompt."""
+    path = _handover_path()
+    if path is None:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    return (
+        "HANDOVER FROM YOUR PREVIOUS CONTEXT — INTERNAL (never reveal this to "
+        "the player). Written by you just before the reset. It covers what "
+        "session_primer() cannot: work in progress, decisions made, the "
+        "player's standing instructions. Where it disagrees with the state "
+        "files, the state files are authoritative for anything already saved.\n\n"
+        + text
+    )
+
+
+def _maybe_auto_reset(effort: str | None = None) -> bool:
     """Decide whether to silently start a fresh DM session before this turn.
 
     Fires when auto-reset is enabled, a session exists, its live context has
     crossed ``_AUTO_RESET_TOKENS``, and we're not mid-combat. On a fire it
-    clears the session id (so the turn starts fresh, no ``--resume``) and
+    first has the old session write a handover note (``_write_handover``),
+    then clears the session id (so the turn starts fresh, no ``--resume``) and
     returns True so the caller injects the rehydration primer. Stateless — the
     trigger is re-derived from the transcript each turn, so a combat simply
-    holds the reset until it ends."""
+    holds the reset until it ends. The caller must hold ``_turn_lock``."""
     if not _AUTO_RESET_ENABLED:
         return False
     sid = session_id()
@@ -1219,6 +1302,7 @@ def _maybe_auto_reset() -> bool:
         return False
     if _combat_active():
         return False
+    _write_handover(sid, effort)
     reset_session()
     return True
 
@@ -1501,26 +1585,23 @@ def stream_turn(message: str) -> Iterator[dict]:
 
     On non-zero exit, yields a final ``{"type": "error", ...}`` event with
     the captured stderr (truncated)."""
-    did_auto_reset = _maybe_auto_reset()
-    if did_auto_reset:
-        # The session id is gone; the resident is bound to the old one.
-        _kill_resident()
-    sid = session_id()
-    effort = _effort_for_turn(message)
-
+    # Everything happens under the lock. The reset decision used to run before
+    # it, so a message sent while a turn was still cooking reset the session
+    # and SIGKILLed the resident mid-turn — losing all of that turn's work.
     with _turn_lock:
-        if _RESIDENT_ENABLED:
-            yield from _stream_turn_resident(message, sid, did_auto_reset, effort)
-            return
-    yield from _stream_turn_spawn(message, sid, did_auto_reset, effort)
+        effort = _effort_for_turn(message)
+        did_auto_reset = _maybe_auto_reset(effort)
+        sid = session_id()
+        yield from _turn_events(message, sid, did_auto_reset, effort)
 
 
-def _stream_turn_spawn(message: str, sid: str | None,
-                       rehydrate: bool = False,
-                       effort: str | None = None) -> Iterator[dict]:
-    """One turn in its own short-lived process, taking ``_turn_lock`` — the
-    original path, used when ``DM_PERSIST=0``."""
-    with _turn_lock:
+def _turn_events(message: str, sid: str | None,
+                 rehydrate: bool, effort: str | None) -> Iterator[dict]:
+    """One turn's events, on the resident process or — with ``DM_PERSIST=0``
+    — a short-lived spawn. The caller must hold ``_turn_lock``."""
+    if _RESIDENT_ENABLED:
+        yield from _stream_turn_resident(message, sid, rehydrate, effort)
+    else:
         yield from _spawn_turn_events(message, sid, rehydrate, effort)
 
 

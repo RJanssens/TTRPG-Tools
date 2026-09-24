@@ -10,13 +10,18 @@ Design (agreed):
   * Each terrain has one entry-table per band. ``determine_encounter`` derives a
     base band from party level, then rolls 2d6 for drift (2 -> step down,
     12 -> step up), and rolls on the resulting band's table.
-  * A monster lands in a band by its Hit Dice, in one or more terrains by its
-    climate/terrain string. Broad "any/any land/temperate/..." monsters are
-    spread across land terrains so every terrain has variety.
-  * Within a band, each monster's die-range width is weighted by frequency
-    (Common rarer-to-roll? no — Common = widest), so common monsters come up
-    more often. Number-appearing is parsed and capped per band so a high-HD
-    result doesn't arrive in swarm numbers.
+  * A monster lands in a band by the HARSHER of its Hit Dice and its XP value
+    (XP is where 2e prices in nasty specials, so it can promote but never
+    demote), and in one or more terrains by its climate/terrain string. Broad
+    "any/any land/temperate/..." monsters are spread across land terrains so
+    every terrain has variety; "any" is matched as a whole word, or region
+    names like "Rift Canyon" spread their natives over the whole map.
+  * Within a band, each monster's die-range width is
+    ``frequency x source x terrain-fit``: rarity is the dominant lever (Common
+    = widest, 64:1 over Very rare), the core 2e bestiary outweighs the obscure
+    tail, and terrain fit only orders peers. Number-appearing is rolled out
+    from dice notation ('2d6' -> 2-12) and capped per band so a high-HD result
+    doesn't arrive in swarm numbers.
 
 Usage:
     python3 tools/build_encounter_tables.py [--db PATH] [--out PATH]
@@ -80,8 +85,15 @@ _CLIMATE_TERRAINS = {
     "tropical":    ["jungle", "swamp", "desert"],
     "warm":        ["desert", "jungle", "plains"],
 }
-# Truly-anywhere tokens — spread across every land terrain.
-_ANY_TOKENS = ["any", "wilderness", "remote", "non-arctic", "non-mountainous"]
+# Truly-anywhere tokens — spread across every land terrain. Matched as WHOLE
+# WORDS: "any" as a bare substring also hides inside 'canyon', 'company',
+# 'botany', which sprayed region-locked creatures (the Hound of Kyuss, climate
+# "Empire of Iuz, Rift Canyon") across every terrain on the map.
+_ANY_TOKENS = ["any", "anywhere", "wilderness", "remote",
+               "non-arctic", "non-mountainous"]
+_ANY_RE = re.compile(r"(?<![a-z])(?:" +
+                     "|".join(re.escape(t) for t in _ANY_TOKENS) +
+                     r")(?![a-z])")
 
 # "Very exotic" markers — creatures native to other planes or non-core
 # campaign settings (Spelljammer, Ravenloft, Dark Sun) don't belong in
@@ -210,9 +222,64 @@ def is_exotic_by_category(categories) -> bool:
     allow = any(any(m in c for m in _ALLOW_CATEGORIES) for c in low)
     return not allow
 
-# Frequency -> die-range weight (Common comes up most often).
-_FREQ_WEIGHT = [("very rare", 1), ("rare", 2), ("uncommon", 4), ("common", 8)]
-_DEFAULT_WEIGHT = 3
+# Frequency -> die-range weight (Common comes up most often). The spread is
+# deliberately steep (64:1 common-to-very-rare): a terrain's low tier holds a
+# handful of Commons against a hundred-odd Rare/Very-rare obscurities, so a
+# gentle spread let the rare tail collectively own the table. Each tier also
+# exceeds the one below it by more than the terrain-fit multiplier can bridge
+# (see _SPECIFICITY_MULT), which keeps rarity the dominant lever.
+_FREQ_WEIGHT = [("very rare", 1), ("rare", 4), ("uncommon", 16), ("common", 64)]
+_DEFAULT_WEIGHT = 4      # unlabelled frequency: treat as Rare, not as average
+
+# Source -> die-range multiplier. "Traditional" D&D monsters — the core 2e
+# bestiary (Monstrous Manual, the two Monstrous Compendium volumes, Fiend
+# Folio) — should be what a wandering-monster roll usually produces; the
+# official setting appendices sit a step below; Dragon/Dungeon/Polyhedron
+# one-offs and the long obscure tail get no boost.
+#
+# monsters.db is two disjoint imports, and provenance is legible from the
+# categories field alone:
+#   * ids 1-560   — a curated core bestiary, `categories` EMPTY. This is where
+#                   orc, goblin, kobold, wolf, skeleton, ogre, gnoll live, so
+#                   an empty categories field is the strongest "traditional"
+#                   signal in the DB, not a missing-data case.
+#   * ids 900000+ — the bulk wiki import, always categorised; graded below by
+#                   the source appendix it names. "Creatures" sits on 2,252 of
+#                   those rows and carries no signal.
+_CORE_SOURCE_CATEGORIES = [
+    "monstrous manual", "compendium volume one", "compendium volume two",
+    "fiend folio",
+]
+_OFFICIAL_SOURCE_CATEGORIES = [
+    "greyhawk appendix", "forgotten realms appendix", "annual volume",
+    "sentient creatures", "psionic creatures",
+]
+_CORE_SOURCE_MULT = 4
+_OFFICIAL_SOURCE_MULT = 2
+
+
+def source_weight(categories) -> int:
+    """How characteristic of traditional AD&D this monster's source is (4 = core
+    bestiary, 2 = official setting appendix, 1 = everything else).
+
+    `categories` may be a JSON-encoded list (as stored in monsters.db), a list
+    of strings, or None — and absent categories mean the curated core import,
+    not unknown provenance."""
+    if not categories:
+        return _CORE_SOURCE_MULT      # curated core import — see note above
+    if isinstance(categories, str):
+        try:
+            categories = json.loads(categories)
+        except (ValueError, TypeError):
+            return 1
+    if not categories:
+        return _CORE_SOURCE_MULT
+    blob = " | ".join(str(c).lower() for c in categories)
+    if any(m in blob for m in _CORE_SOURCE_CATEGORIES):
+        return _CORE_SOURCE_MULT
+    if any(m in blob for m in _OFFICIAL_SOURCE_CATEGORIES):
+        return _OFFICIAL_SOURCE_MULT
+    return 1
 
 # All terrains we emit (land + dungeon/ocean/urban + generic wilderness/road).
 ALL_TERRAINS = list(_TERRAIN_KEYWORDS.keys()) + ["wilderness", "road"]
@@ -225,15 +292,28 @@ def _first_int(s: str | None, default: int = 1) -> int:
     return int(m.group(0)) if m else default
 
 
+# Hit-*point* stat lines masquerading as hit dice: '1 hp', '1-4 hp',
+# '1d8+76 hp', '(1d4 hp)'. Taking the first integer of those reads a death kiss
+# ('1d8+76 hp', 8,000 XP) as a 1-HD creature and files it under the low tier.
+# Anchored, so a genuine HD line with a sample-hp aside ('3+1 (hp 27)',
+# '1 (4hp)') still parses as hit dice.
+_HP_FIELD_RE = re.compile(
+    r"^\(?\s*\d+(?:\s*[-\u2013]\s*\d+)?(?:d\d+)?(?:\s*[+-]\s*\d+)?\s*hp\b", re.I)
+
+
 def parse_hd(s: str | None) -> int | None:
-    """Hit Dice as an int, or None when the field is prose ('See below',
-    'As per dragon', 'Varies', None). Fractional HD (½, ¼, '1/2') -> 0 so weak
-    creatures (kobolds, molds, sprites) still band as low."""
+    """Hit Dice as an int, or None when the field carries no usable HD — prose
+    ('See below', 'As per dragon', 'Varies', None) or a hit-point line
+    ('1 hp', '1d8+76 hp'). A None sends the caller to the XP fallback in
+    `band_for`. Fractional HD (½, ¼, '1/2') -> 0 so weak creatures (kobolds,
+    molds, sprites) still band as low."""
     if not s:
         return None
     t = s.strip()
     if t[:1] in ("½", "¼", "⅓", "⅛", "⅔", "¾") or re.match(r"^\s*1\s*/\s*[2-9]", t):
         return 0
+    if _HP_FIELD_RE.match(t):
+        return None
     m = re.search(r"\d+", t)
     return int(m.group(0)) if m else None
 
@@ -265,6 +345,26 @@ def xp_to_band(xp: int) -> int:
     if xp <= 6000:
         return 2   # high
     return 3       # epic
+
+
+def band_for(hit_dice: str | None, xp_value: str | None) -> tuple[int, int] | None:
+    """(band index, HD to display) for a monster, or None when it can be banded
+    by neither hit dice nor XP (a generic stub: bird/fish/'golem, general').
+
+    Hit dice alone understate a monster whose threat lives in its special
+    attacks. The Hound of Kyuss is HD 2+2 — low tier, party L1-4 — but 650 XP,
+    and in 2e the XP value is precisely where a confusion aura, regeneration,
+    egg implantation and CON-draining vermin are priced in. So the band is the
+    HARSHER of the two reads; XP can promote a monster but never demote one.
+    """
+    hd = parse_hd(hit_dice)
+    xp = parse_xp(xp_value)
+    if hd is None and xp is None:
+        return None
+    bands = [b for b in (hd_to_band(hd) if hd is not None else None,
+                         xp_to_band(xp) if xp is not None else None)
+             if b is not None]
+    return max(bands), (hd if hd is not None else 0)
 
 
 def freq_weight(freq: str | None) -> int:
@@ -317,7 +417,7 @@ def terrains_for(climate: str | None) -> dict[str, int]:
             if clim in c_pos:
                 for t in terrs:
                     add(t, 2)
-        if not c_pos.strip() or any(tok in c_pos for tok in _ANY_TOKENS):
+        if not c_pos.strip() or _ANY_RE.search(c_pos):
             for t in _LAND_TERRAINS:
                 add(t, 1)
 
@@ -334,14 +434,26 @@ def terrains_for(climate: str | None) -> dict[str, int]:
     return out
 
 
+_DICE_RE = re.compile(r"(\d+)\s*d\s*(\d+)")
+
+
 def number_appearing(no_app: str | None, band: int) -> str:
-    """Cleaned, band-capped number-appearing prefix, e.g. '2-12' or '1'."""
-    cap = _COUNT_CAP[band]
-    nums = [int(n) for n in re.findall(r"\d+", no_app or "")]
-    if not nums:
+    """Cleaned, band-capped number-appearing prefix, e.g. '2-12' or '1'.
+
+    MM number-appearing fields are dice notation, so the span has to be rolled
+    out, not read off the digits: '2d6' is 2-12, and taking min/max of the
+    integers present printed it as '2-6'. '3d4' was '3-4' (really 3-12)."""
+    src = no_app or ""
+    spans: list[tuple[int, int]] = [(int(n), int(n) * int(x))
+                                    for n, x in _DICE_RE.findall(src)]
+    # Bare integers, ignoring the digits already consumed as dice notation.
+    plain = [int(n) for n in re.findall(r"\d+", _DICE_RE.sub(" ", src))]
+    spans += [(n, n) for n in plain]
+    if not spans:
         return "1"
-    lo = min(nums)
-    hi = min(max(nums), cap)
+    cap = _COUNT_CAP[band]
+    lo = min(s[0] for s in spans)
+    hi = min(max(s[1] for s in spans), cap)
     lo = min(lo, hi)
     return f"{lo}-{hi}" if hi > lo else f"{lo}"
 
@@ -420,6 +532,12 @@ _CURATED: dict[str, dict[int, list[tuple[int, str, str]]]] = {
 # (terrain -> set of band indices) where curated entries fully replace auto ones.
 _CURATED_REPLACE_BANDS: dict[str, set[int]] = {"urban": {0, 1}}
 
+# Curated entries above are weighted 1-8 (the original rarity scale); rarity
+# weights now run to 64 with source and terrain multipliers on top. Scaling the
+# curated block keeps its entries proportionate in bands it shares with
+# auto-generated monsters.
+_CURATED_WEIGHT_SCALE = 16
+
 
 def build(db_path: Path, max_per_table: int) -> dict:
     conn = sqlite3.connect(str(db_path))
@@ -453,21 +571,18 @@ def build(db_path: Path, max_per_table: int) -> dict:
                 or is_exotic_by_category(r["categories"])):
             skipped_exotic += 1
             continue
-        # Band from HD; if HD is prose, fall back to XP; if neither is usable
-        # the row is a generic stub (bird/fish/golem,general/…) — skip it.
-        hd = parse_hd(r["hit_dice"])
-        if hd is not None:
-            band, hd_disp = hd_to_band(hd), hd
-        else:
-            xp = parse_xp(r["xp_value"])
-            if xp is None:
-                skipped_no_band += 1
-                continue
-            band, hd_disp = xp_to_band(xp), 0
+        # Band from the harsher of hit dice and XP; if neither is usable the
+        # row is a generic stub (bird/fish/golem,general/…) — skip it.
+        banded = band_for(r["hit_dice"], r["xp_value"])
+        if banded is None:
+            skipped_no_band += 1
+            continue
+        band, hd_disp = banded
         terrains = terrains_for(r["climate_terrain"])
         if not terrains:
             continue
         base_weight = freq_weight(r["frequency"])
+        src_w = source_weight(r["categories"])
         name = (r["name"] or "").strip()
         result = f'{number_appearing(r["no_appearing"], band)} {name.title()}'
         category = category_of(name, r["intelligence"], r["description"])
@@ -476,10 +591,11 @@ def build(db_path: Path, max_per_table: int) -> dict:
                 "result": result,
                 "monster": name,
                 "hd": hd_disp,
-                # frequency × how characteristic this monster is of the terrain
-                "weight": base_weight * _SPECIFICITY_MULT[spec],
+                # rarity × how traditional the source is × terrain fit
+                "weight": base_weight * src_w * _SPECIFICITY_MULT[spec],
                 "freq_w": base_weight,   # rarity alone — drives table inclusion
-                "spec": spec,            # terrain fit — secondary ordering
+                "src_w": src_w,          # core bestiary first within a tier
+                "spec": spec,            # terrain fit — last ordering key
                 "category": category,
             })
 
@@ -489,9 +605,12 @@ def build(db_path: Path, max_per_table: int) -> dict:
         tiers = []
         for band_idx, cands in enumerate(bands):
             # Curated overlay entries for this terrain/band, if any.
+            # Curated weights are authored on the old 1-8 rarity scale; scale
+            # them onto the current one so a hand-written entry keeps roughly
+            # the share of the table it was written to have.
             curated = [
-                {"result": res, "monster": "", "hd": 0, "weight": w,
-                 "category": cat}
+                {"result": res, "monster": "", "hd": 0,
+                 "weight": w * _CURATED_WEIGHT_SCALE, "category": cat}
                 for (w, res, cat) in _CURATED.get(terrain, {}).get(band_idx, [])
             ]
             if band_idx in _CURATED_REPLACE_BANDS.get(terrain, set()):
@@ -500,10 +619,12 @@ def build(db_path: Path, max_per_table: int) -> dict:
             # auto entries. Selection is FREQUENCY-FIRST: every Common that
             # maps to the terrain is kept, then Uncommon, then rarer fill the
             # remaining slots — so common staples (orcs, goblins) can't be
-            # evicted by a flood of terrain-specific rarities. Terrain fit and
-            # combined weight only break ties within a frequency tier.
+            # evicted by a flood of terrain-specific rarities. Within a
+            # frequency tier the core bestiary goes in ahead of the obscure
+            # tail; terrain fit and combined weight only break the remaining ties.
             cands = curated + sorted(
-                cands, key=lambda c: (-c["freq_w"], -c["spec"], -c["weight"], c["monster"])
+                cands, key=lambda c: (-c["freq_w"], -c["src_w"], -c["spec"],
+                                      -c["weight"], c["monster"])
             )
             cands = cands[:max_per_table]
             entries, cursor = [], 1
@@ -524,7 +645,8 @@ def build(db_path: Path, max_per_table: int) -> dict:
     return {
         "meta": {
             "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "source": str(db_path.relative_to(_REPO_ROOT)),
+            "source": str(db_path.relative_to(_REPO_ROOT)
+                          if db_path.is_relative_to(_REPO_ROOT) else db_path),
             "monsters_scanned": len(rows),
             "skipped_stubs": skipped_no_band,
             "skipped_exotic": skipped_exotic,

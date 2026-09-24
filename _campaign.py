@@ -144,9 +144,26 @@ def load_campaign(name: str | None = None) -> dict:
     return cfg
 
 
+_INVENTORY_OWNERS = ("characters", "npcs", "houses", "mounts")
+
+
+def _collapse_inventories(clean: dict):
+    """Fold repeated inventory entries into 'Name x N' in place.
+
+    Sheets accumulate one line per arrow otherwise. Done here, at the single
+    write chokepoint, so every writer (add_character, set_npc_stats,
+    claim_loot, hand edits) is normalized on the next save."""
+    from tools.item_weights import collapse_inventory
+    for section in _INVENTORY_OWNERS:
+        for rec in (clean.get(section) or {}).values():
+            if isinstance(rec, dict) and rec.get("inventory"):
+                rec["inventory"] = collapse_inventory(rec["inventory"])
+
+
 def save_campaign(cfg: dict):
     """Write campaign.json, stripping private _ keys."""
     clean = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    _collapse_inventories(clean)
     atomic_write_text(cfg["_dir"] / "campaign.json", json.dumps(clean, indent=2))
 
 
