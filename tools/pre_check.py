@@ -21,6 +21,7 @@ Do NOT fire on:
   - Atmospheric or transitional beats with no uncertainty to resolve
 """
 import json
+import re
 from pathlib import Path
 
 import _campaign as _c
@@ -38,7 +39,21 @@ _CHECKLIST = [
 ]
 
 
-def _recent_npc_state(cfg: dict, current_session: int) -> dict:
+def _npcs_named_in(cfg: dict, text: str) -> list[str]:
+    """Slugs of known NPCs whose label (or first name) appears in `text`."""
+    if not text:
+        return []
+    low = text.lower()
+    found = []
+    for slug, d in (cfg.get("npcs") or {}).items():
+        label = str(d.get("label") or slug)
+        names = {label.lower(), label.split()[0].lower(), slug.replace("-", " ").lower()}
+        if any(len(n) >= 3 and re.search(rf"\b{re.escape(n)}\b", low) for n in names):
+            found.append(slug)
+    return found
+
+
+def _recent_npc_state(cfg: dict, current_session: int, situation: str = "") -> dict:
     """Walk the session's events to find: NPCs recently in scene, and which
     of them have had a reaction_roll logged this session."""
     events = _c.load_events(cfg)
@@ -52,6 +67,12 @@ def _recent_npc_state(cfg: dict, current_session: int) -> dict:
         if not slug:
             continue
         if e.get("type") in ("npc_met", "npc_interaction") and slug not in recent_slugs:
+            recent_slugs.append(slug)
+
+    # NPCs the DM names in the situation are in scene too — including ones
+    # met in an earlier session, who have no npc_met event in this one.
+    for slug in _npcs_named_in(cfg, situation):
+        if slug not in recent_slugs:
             recent_slugs.append(slug)
 
     # Reactions rolled across the whole session — once rolled, an NPC's
@@ -80,29 +101,34 @@ def _recent_npc_state(cfg: dict, current_session: int) -> dict:
 
 def _combat_state(cfg: dict) -> dict:
     """Return active-combat snapshot — round number, current actor, and any
-    durational effects on combatants. Empty when no combat is in flight."""
-    path = cfg["_data_dir"] / "combat_state.json"
+    durational effects on combatants. Empty when no combat is in flight.
+
+    Reads combat_session.json, the tracker's authoritative copy:
+    combat_state.json is the dashboard's view and carries no effects."""
+    path = cfg["_dir"] / "combat_session.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"in_combat": False}
-
-    if not data.get("active"):
+    combatants = data.get("combatants") if isinstance(data, dict) else None
+    if not isinstance(combatants, list):
         return {"in_combat": False}
 
     effects = []
-    for c in data.get("combatants", []) or []:
+    for c in combatants:
         for fx in c.get("effects", []) or []:
             effects.append({
                 "target":       c.get("name"),
                 "name":         fx.get("name"),
-                "rounds_left":  fx.get("duration_rounds"),
+                "rounds_left":  fx.get("duration"),
             })
 
+    idx = data.get("current_idx", 0)
+    current = combatants[idx].get("name") if 0 <= idx < len(combatants) else None
     return {
         "in_combat": True,
         "round":     data.get("round"),
-        "current":   data.get("current"),
+        "current":   current,
         "active_effects": effects,
     }
 
@@ -132,12 +158,14 @@ def register(mcp):
                      ("council vote on flood plan", "Pippa scouts the
                      wall", "first contact with the bishop"). Stored on
                      the response so the next audit can correlate.
+                     Known NPCs named here are counted as in scene, so
+                     name the ones present.
         """
         cfg     = _c.load_campaign()
         state   = _c.load_state(cfg)
         current = int(state.get("current_session", 1))
 
-        npc_state = _recent_npc_state(cfg, current)
+        npc_state = _recent_npc_state(cfg, current, situation)
         combat    = _combat_state(cfg)
 
         return {

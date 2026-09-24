@@ -23,7 +23,7 @@ _MAX_STEPS = 25
 _BATCH_DENY = {"batch", "pre_turn_check"}
 
 
-async def call_tool(mcp, name: str, **kwargs) -> Any:
+async def call_tool(mcp, tool_name: str, /, **kwargs) -> Any:
     """Invoke another registered MCP tool by name.
 
     Composite tools routinely span modules — setup_combat lives in tools.combat
@@ -31,7 +31,7 @@ async def call_tool(mcp, name: str, **kwargs) -> Any:
     manager rather than duplicating logic. The single implementation, event
     logging included, stays the only one.
     """
-    return await mcp._tool_manager.call_tool(name, kwargs)
+    return await mcp._tool_manager.call_tool(tool_name, kwargs)
 
 
 def register(mcp):

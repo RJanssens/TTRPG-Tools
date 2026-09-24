@@ -201,6 +201,31 @@ def register(mcp):
         return result
 
     @mcp.tool()
+    def set_marching_order(order: list[str]) -> dict:
+        """Set the party's marching order, front to back.
+
+        order: character names or keys. Anyone left out falls in behind, in
+        their current order. The marching order is the roster order — the
+        same sequence the /play sidebar shows and the player rearranges with
+        its ▴/▾ handles — so read it (session_primer's `marching_order`)
+        before ruling who is in front, who a trap hits first, or who a rear
+        attacker can reach."""
+        cfg = _c.load_campaign()
+        keys: list[str] = []
+        for name in order:
+            key, _ = _c.char_key_for(cfg, str(name))
+            if key is None:
+                return {"error": f"Unknown character '{name}'.",
+                        "party": [c["label"] for c in cfg.get("characters", {}).values()]}
+            keys.append(key)
+        new_order = _c.reorder_characters(cfg, keys)
+        _c.save_campaign(cfg)
+        labels = [cfg["characters"][k]["label"] for k in new_order]
+        _c.append_event(cfg, {"type": "marching_order", "order": labels,
+                              "note": "Marching order: " + ", ".join(labels)})
+        return {"marching_order": labels}
+
+    @mcp.tool()
     def character_status(character: str) -> dict:
         """Full status for one character: HP, XP, conditions, spell slots, memorized spells, saves, skills."""
         cfg = _c.load_campaign()

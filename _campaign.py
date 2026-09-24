@@ -347,6 +347,25 @@ def char_key_for(cfg: dict, label: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
+def marching_order(cfg: dict) -> list[str]:
+    """Character keys front to back.
+
+    The marching order *is* the roster order — campaign.json's `characters`
+    key order, which the /play sidebar's ▴/▾ handles and set_marching_order
+    both rewrite — so there is one sequence, not a second copy to drift."""
+    return list(cfg.get("characters", {}))
+
+
+def reorder_characters(doc: dict, keys: list[str]) -> list[str]:
+    """Put `keys` at the front of doc['characters'], the rest behind in their
+    current order. Mutates and returns the new key order; records untouched."""
+    chars = doc.get("characters") or {}
+    front = [k for k in dict.fromkeys(keys) if k in chars]
+    order = front + [k for k in chars if k not in front]
+    doc["characters"] = {k: chars[k] for k in order}
+    return order
+
+
 def default_char_key(cfg: dict) -> str:
     return cfg.get("default_character") or next(iter(cfg.get("characters", {})), "")
 

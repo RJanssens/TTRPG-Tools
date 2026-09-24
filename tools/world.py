@@ -70,8 +70,9 @@ def _mechanics_block(char: dict) -> str:
     if not ab and level is None:
         return ""
 
+    race = str(char.get("race") or "").strip()
     ident = " · ".join(p for p in [
-        cls,
+        f"{race[:1].upper()}{race[1:]} {cls}".strip() if race else cls,
         char.get("alignment") or "",
         f"Level {level}" if level is not None else "",
         f"HP {char['hp_max']}" if char.get("hp_max") is not None else "",

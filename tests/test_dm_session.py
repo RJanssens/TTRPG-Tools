@@ -15,6 +15,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import dm_session
 
+# Every test in this module runs against an empty repo root. Classes that
+# stub only _active_session_file still reach record_session_in_manifest via
+# the real .active, which used to append their fake session ids ("abc-123",
+# "ghost-session" …) to the live campaign's sessions.json.
+_module_tmp: tempfile.TemporaryDirectory | None = None
+_real_root = dm_session._REPO_ROOT
+
+
+def setUpModule():
+    global _module_tmp
+    _module_tmp = tempfile.TemporaryDirectory()
+    dm_session._REPO_ROOT = Path(_module_tmp.name)
+
+
+def tearDownModule():
+    dm_session._REPO_ROOT = _real_root
+    _module_tmp.cleanup()
+
 
 class DmSessionTests(unittest.TestCase):
     def setUp(self):

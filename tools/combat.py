@@ -549,6 +549,37 @@ def _monster_stats(name: str) -> dict | None:
     }
 
 
+def _enemy_fate(c: dict) -> str:
+    """slain (below 0 hp), down (exactly 0), fled (fleeing), or standing."""
+    hp = c.get("hp", 0)
+    if hp < 0:
+        return "slain"
+    if hp == 0:
+        return "down"
+    if "fleeing" in (c.get("conditions") or []):
+        return "fled"
+    return "standing"
+
+
+def _enemy_record(combatants: list[dict]) -> tuple[list[dict], dict]:
+    """Per-enemy fate plus a count of defeated (slain or down) by kind.
+
+    Kind is the name with its setup_combat number stripped ("Goblin 3" →
+    "goblin"), which is what award_xp needs after a reset has taken the
+    fight out of context."""
+    enemies, defeated = [], {}
+    for c in combatants:
+        if c.get("side") == "party":
+            continue
+        fate = _enemy_fate(c)
+        enemies.append({"name": c["name"], "side": c.get("side", "enemy"),
+                        "hp": c.get("hp"), "hp_max": c.get("hp_max"), "fate": fate})
+        if fate in ("slain", "down"):
+            kind = re.sub(r"\s+\d+$", "", c["name"]).strip().lower()
+            defeated[kind] = defeated.get(kind, 0) + 1
+    return enemies, defeated
+
+
 def register(mcp):
 
     @mcp.tool()
@@ -1229,11 +1260,14 @@ def register(mcp):
 
         _c.save_state(cfg, state)
         pipeline = dict(_session.get("pipeline") or {})
+        enemies, defeated = _enemy_record(_session["combatants"])
         _c.append_event(cfg, {
             "type":     "combat",
             "outcome":  "ended",
             "rounds":   rounds,
             "party_hp": party_hp,
+            "enemies":  enemies,
+            "defeated": defeated,
             # What the tracker actually resolved. The audit reads this to tell
             # a real fight from one narrated freehand (Hard Constraint #8).
             "pipeline": pipeline,
@@ -1246,7 +1280,7 @@ def register(mcp):
         _clear_session_file()
 
         _session = None
-        return {"saved": saved, "rounds": rounds}
+        return {"saved": saved, "rounds": rounds, "defeated": defeated}
 
     # --- Composite pipeline tools -------------------------------------------
     # Each mandated step used to cost one model round trip (~2.6 s of prefill

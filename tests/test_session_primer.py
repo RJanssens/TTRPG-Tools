@@ -137,3 +137,38 @@ class SceneBlockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from tests._campaign_fixture import TempCampaign
+
+
+class PrimerContentTests(unittest.TestCase):
+    """End-to-end: session_primer() against a real (temporary) campaign."""
+
+    def primer(self, **camp):
+        self.camp = TempCampaign(self, **camp)
+        return TempCampaign.register(lore)["session_primer"](scene=False)
+
+    def test_structured_quests_from_add_quest_are_listed(self):
+        out = self.primer(campaign={"quests": {
+            "wickmere_road": {"title": "Clear the Wickmere road", "status": "active",
+                              "notes_log": [{"text": "Paid 20gp up front"}]},
+            "old_job": {"title": "Done", "status": "complete"},
+        }})
+        slugs = [q["slug"] for q in out["active_quests"]]
+        self.assertEqual(slugs, ["wickmere_road"])
+        self.assertEqual(out["active_quests"][0]["notes"], "Paid 20gp up front")
+
+    def test_memorized_spells_stored_as_plain_strings_are_listed(self):
+        out = self.primer(
+            campaign={"characters": {"oswin": {"label": "Oswin", "cls": "Cleric",
+                                               "hp_max": 8}}},
+            state={"characters": {"oswin": {"hp": 8,
+                                            "memorized_spells": ["Bless", "Cure Light Wounds"]}}})
+        self.assertEqual(out["party"]["oswin"]["memorized_uncast"],
+                         ["Bless", "Cure Light Wounds"])
+
+    def test_party_digest_carries_race(self):
+        out = self.primer(campaign={"characters": {"quill": {
+            "label": "Quillory", "race": "satyr", "cls": "Bard", "hp_max": 7}}})
+        self.assertEqual(out["party"]["quill"]["race"], "satyr")

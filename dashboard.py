@@ -3247,17 +3247,10 @@ def session_view(sid: str):
 # ---------------------------------------------------------------------------
 
 def _latest_location_name() -> str:
-    """Most recent location_visited from events.json, or empty string."""
+    """Most recent location_visited event, or empty string."""
     if not cfg:
         return ""
-    p = cfg["_dir"] / "events.json"
-    if not p.exists():
-        return ""
-    try:
-        events = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return ""
-    for ev in reversed(events):
+    for ev in reversed(_c.load_events(cfg)):
         if ev.get("type") == "location_visited":
             return ev.get("name") or ev.get("slug") or ""
     return ""
@@ -4356,6 +4349,26 @@ _PLAY_HTML = """
   }
   .party-mini { display: flex; gap: 12px; align-items: flex-start; }
 
+  /* ---- Marching order ---- */
+  /* The roster order is the marching order (set_marching_order rewrites the
+     same sequence), so the list is captioned as one and each card carries
+     its rank. The DM reads it from session_primer's marching_order. */
+  .march-head {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 0.72em; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink-muted);
+    margin-bottom: -6px;
+  }
+  .march-head b { color: var(--accent-gold); font-weight: normal; }
+  .march-pos {
+    flex-shrink: 0; width: 14px; padding-top: 20px;
+    text-align: right;
+    font-family: var(--font-display);
+    font-size: 0.82em;
+    color: var(--ink-muted);
+  }
+  .party-mini:first-of-type .march-pos { color: var(--accent-gold); }
+
   /* ---- Party reorder handles ---- */
   /* The party sequence *is* campaign.json's `characters` key order, which
      every surface iterates (this sidebar, the Cast page, the statusline,
@@ -4792,7 +4805,7 @@ _PLAY_HTML = """
 
   <aside class="play-side">
     <div class="side-stats" id="side-stats"></div>
-    <div class="party-list" id="party-list">
+    <div class="party-list" id="party-list" aria-label="Marching order, front to rear">
       <div class="muted" style="text-align:center; font-size:0.84em; font-style:italic">…</div>
     </div>
   </aside>
@@ -6049,7 +6062,11 @@ _PLAY_HTML = """
       partyList.innerHTML = '<div class="muted" style="text-align:center; font-size:0.82em; font-style:italic">No characters in roster.</div>';
       return;
     }
-    partyList.innerHTML = chars.map((c, i) => {
+    const n = chars.length;
+    const head = n > 1
+      ? '<div class="march-head"><b>Marching order</b><span>front ↓ rear</span></div>'
+      : '';
+    partyList.innerHTML = head + chars.map((c, i) => {
       const pct = c.hp_max > 0 ? Math.max(0, Math.min(100, (c.hp / c.hp_max) * 100)) : 0;
       const ko = (c.hp || 0) <= 0;
       const portrait = c.portrait
@@ -6085,13 +6102,14 @@ _PLAY_HTML = """
       const ordHtml = ''
         + '<div class="party-mini-order">'
         +   '<button type="button" class="ord-btn" data-key="' + ordKey + '" data-dir="up"'
-        +     (i === 0 ? ' disabled' : '') + ' title="Move up" aria-label="Move ' + ordName + ' up">▴</button>'
+        +     (i === 0 ? ' disabled' : '') + ' title="Move forward" aria-label="Move ' + ordName + ' forward in the marching order">▴</button>'
         +   '<button type="button" class="ord-btn" data-key="' + ordKey + '" data-dir="down"'
-        +     (i === chars.length - 1 ? ' disabled' : '') + ' title="Move down" aria-label="Move ' + ordName + ' down">▾</button>'
+        +     (i === chars.length - 1 ? ' disabled' : '') + ' title="Move back" aria-label="Move ' + ordName + ' back in the marching order">▾</button>'
         + '</div>';
 
       return ''
         + '<article class="party-mini">'
+        +   (n > 1 ? '<span class="march-pos" title="' + (i === 0 ? 'Front' : i === n - 1 ? 'Rear' : 'Position ' + (i + 1)) + '">' + (i + 1) + '</span>' : '')
         +   '<div class="portrait-frame ' + (ko ? 'kod ' : '') + (c.portrait ? '' : 'empty') + '"' + (c.portrait ? ' title="Click to enlarge"' : '') + '>' + portrait + '</div>'
         +   '<div class="party-mini-body">'
         +     '<a class="party-mini-name" href="' + sheetUrl + '">' + esc(c.label) + '</a>'

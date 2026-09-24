@@ -167,6 +167,13 @@ class BatchTests(unittest.TestCase):
         self.assertFalse(out["stopped_early"])
         self.assertEqual([c[1]["n"] for c in self.mcp._tool_manager.calls], [1, 2, 3])
 
+    def test_step_args_may_include_name(self):
+        # apply_combat_damage, apply_effect, create_location … all take `name`;
+        # it must reach the tool, not collide with the dispatcher's own arg.
+        out = self.run_batch(steps=[{"tool": "ok", "args": {"name": "Ruk", "amount": 3}}])
+        self.assertEqual(out["results"][0].get("result"),
+                         {"echo": {"name": "Ruk", "amount": 3}})
+
     def test_empty_and_oversized_are_rejected(self):
         self.assertIn("error", self.run_batch(steps=[]))
         too_many = [{"tool": "ok", "args": {}}] * (composites._MAX_STEPS + 1)
