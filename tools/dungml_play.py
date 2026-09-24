@@ -50,6 +50,33 @@ class DungmlUnavailable(Exception):
     """
 
 
+class DungmlNotFound(DungmlUnavailable):
+    """dungml answered 404 for something the caller named — an unknown room
+    or door. `detail` carries dungml's body (candidates for a room)."""
+
+    def __init__(self, message: str, detail=None):
+        super().__init__(message)
+        self.detail = detail
+
+
+class DungmlConflict(DungmlUnavailable):
+    """409: the map's source does not parse (being edited in dungml)."""
+
+
+def describe_error(e: DungmlUnavailable) -> dict:
+    """A tool-result dict for a dungml failure the DM can act on."""
+    if isinstance(e, DungmlConflict):
+        return {"error": "the map is mid-edit in the dungml editor and does not "
+                         "parse right now — narrate without it, try again later"}
+    if isinstance(e, DungmlNotFound):
+        d = e.detail if isinstance(e.detail, dict) else {}
+        out = {"error": d.get("error") or str(e)}
+        if d.get("candidates"):
+            out["candidates"] = d["candidates"]
+        return out
+    return {"error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -61,6 +88,7 @@ def _request(
     *,
     auth: bool = True,
     raw: bool = False,
+    strict: bool = False,
 ) -> dict | bytes:
     """One call against dmap-server. Returns parsed JSON, or raw bytes when
     `raw` (the render endpoints answer `image/svg+xml`, not JSON).
@@ -68,7 +96,9 @@ def _request(
     Raises DungmlUnavailable for anything the caller can't act on: server
     down, bad credential, unexpected status. A 404 is returned as a normal
     `{}` for GETs, because "not linked yet" is an ordinary state here, not an
-    error worth surfacing to the DM.
+    error worth surfacing to the DM — unless `strict`, which a caller passes
+    when a 404 means something it named (a room, a door) doesn't exist and
+    must be surfaced rather than swallowed.
     """
     url = f"{DUNGML_API_BASE}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
@@ -83,16 +113,24 @@ def _request(
             payload = resp.read()
             return payload if raw else (json.loads(payload.decode("utf-8")) if payload else {})
     except urllib.error.HTTPError as e:
-        if e.code == 404 and method == "GET":
+        if e.code == 404 and method == "GET" and not strict:
             return b"" if raw else {}
         detail = ""
         try:
-            detail = e.read().decode("utf-8")[:300]
+            detail = e.read().decode("utf-8")[:2000]
         except Exception:
             pass
-        raise DungmlUnavailable(
-            f"dungml {method} {path} → HTTP {e.code} {detail}".strip()
-        ) from e
+        parsed = None
+        try:
+            parsed = json.loads(detail).get("detail")
+        except Exception:
+            pass
+        msg = f"dungml {method} {path} → HTTP {e.code} {detail[:300]}".strip()
+        if e.code == 404:
+            raise DungmlNotFound(msg, parsed) from e
+        if e.code == 409:
+            raise DungmlConflict(msg) from e
+        raise DungmlUnavailable(msg) from e
     except urllib.error.URLError as e:
         raise DungmlUnavailable(
             f"dungml backend unreachable at {DUNGML_API_BASE} ({e.reason}). "
@@ -178,12 +216,12 @@ def map_info(ext: str) -> dict:
     return _request("GET", f"/maps/{urllib.parse.quote(ext)}/info") or {}
 
 
-def reveal(ext: str, node: str) -> None:
-    _request("POST", f"/maps/{urllib.parse.quote(ext)}/reveal", {"feature_id": node})
+def reveal(ext: str, node: str) -> dict:
+    return _request("POST", f"/maps/{urllib.parse.quote(ext)}/reveal", {"feature_id": node})
 
 
-def set_party(ext: str, node: str) -> None:
-    _request("POST", f"/maps/{urllib.parse.quote(ext)}/party", {"room_id": node})
+def set_party(ext: str, node: str) -> dict:
+    return _request("POST", f"/maps/{urllib.parse.quote(ext)}/party", {"room_id": node})
 
 
 def mint_token(ext: str, scope: str = "fog") -> str:
@@ -245,20 +283,60 @@ def set_active_map(ext: str, map_id: str) -> None:
     )
 
 
-def campaign_reveal(ext: str, map_id: str, node: str) -> None:
-    _request(
-        "POST",
-        f"/campaigns/{urllib.parse.quote(ext)}/maps/{urllib.parse.quote(map_id)}/reveal",
-        {"feature_id": node},
-    )
+def _cm(ext: str, map_id: str) -> str:
+    return f"/campaigns/{urllib.parse.quote(ext)}/maps/{urllib.parse.quote(map_id)}"
 
 
-def campaign_set_party(ext: str, map_id: str, node: str) -> None:
-    _request(
-        "POST",
-        f"/campaigns/{urllib.parse.quote(ext)}/maps/{urllib.parse.quote(map_id)}/party",
-        {"room_id": node},
-    )
+def campaign_reveal(ext: str, map_id: str, node: str) -> dict:
+    return _request("POST", f"{_cm(ext, map_id)}/reveal", {"feature_id": node})
+
+
+def campaign_set_party(ext: str, map_id: str, node: str) -> dict:
+    return _request("POST", f"{_cm(ext, map_id)}/party", {"room_id": node})
+
+
+def campaign_room(ext: str, map_id: str, query: str, scope: str = "gm") -> dict:
+    """Look up a room by id or free-text query on an authored locale.
+
+    A 404 here means the caller named something that doesn't exist — raised
+    as `DungmlNotFound` (with candidates, when dungml offers them) rather than
+    swallowed like an ordinary GET 404.
+    """
+    q = urllib.parse.quote(query, safe="")
+    return _request("GET", f"{_cm(ext, map_id)}/rooms/{q}?scope={scope}", strict=True)
+
+
+def campaign_known(ext: str, map_id: str) -> dict:
+    """What the party has discovered so far on this authored locale."""
+    return _request("GET", f"{_cm(ext, map_id)}/known", strict=True)
+
+
+def campaign_door(ext: str, map_id: str, *, door: str | None = None,
+                  between: list[str] | None = None, discovered: bool = True,
+                  state: str | None = None) -> dict:
+    """Mark a door discovered and/or change its state.
+
+    Identify the door either by `door` (its own id) or `between` (the two
+    rooms it connects) — dungml resolves whichever is given.
+    """
+    body: dict = {"discovered": discovered}
+    if door:
+        body["door"] = door
+    if between:
+        body["between"] = between
+    if state:
+        body["state"] = state
+    return _request("POST", f"{_cm(ext, map_id)}/doors", body)
+
+
+def active_map_id(cfg: dict) -> str | None:
+    """The dungml map id the party's current locale is on, on either
+    contract — the authored map id for a campaign locale, else the pushed
+    combat map's id."""
+    link = link_state(cfg)
+    if link["source"] == "campaign" and link["map_id"]:
+        return link["map_id"]
+    return map_info(external_id(cfg)).get("map_id")
 
 
 def map_rooms(map_id: str) -> list[dict]:

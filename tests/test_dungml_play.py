@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -41,7 +42,7 @@ class _Recorder:
         self.responses = responses or {}
         self.fail = fail
 
-    def __call__(self, method, path, body=None, *, auth=True, raw=False):
+    def __call__(self, method, path, body=None, *, auth=True, raw=False, strict=False):
         self.calls.append((method, path, body))
         if self.fail:
             raise dp.DungmlUnavailable("stubbed outage")
@@ -96,6 +97,13 @@ class BridgeTestCase(unittest.TestCase):
     def stub(self, **kw) -> _Recorder:
         rec = _Recorder(**kw)
         dp._request = rec
+        return rec
+
+    def install(self, responses=None, fail=False) -> _Recorder:
+        rec = _Recorder(responses, fail)
+        orig = dp._request
+        dp._request = rec
+        self.addCleanup(setattr, dp, "_request", orig)
         return rec
 
 
@@ -520,3 +528,46 @@ class ActiveMapReportTests(BridgeTestCase):
         self.assertEqual(
             rec.body_for("PUT", "/campaigns/test-camp/active"), {"map_id": "m2"}
         )
+
+
+class HttpErrorMappingTests(unittest.TestCase):
+    def _raise(self, code, body):
+        import io, urllib.error
+        err = urllib.error.HTTPError("http://x", code, "x", {}, io.BytesIO(body.encode()))
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=err):
+            return dp._request("POST", "/campaigns/c/maps/m/party", {"room_id": "q"})
+
+    def test_404_on_post_raises_not_found_with_detail(self):
+        with self.assertRaises(dp.DungmlNotFound) as cm:
+            self._raise(404, '{"detail": {"error": "unknown room", "candidates": [{"id": "room.a", "label": "Cpt"}]}}')
+        self.assertEqual(cm.exception.detail["candidates"][0]["id"], "room.a")
+        self.assertEqual(dp.describe_error(cm.exception)["candidates"][0]["label"], "Cpt")
+
+    def test_409_raises_conflict(self):
+        with self.assertRaises(dp.DungmlConflict):
+            self._raise(409, '{"detail": "map does not parse"}')
+        self.assertIn("mid-edit", dp.describe_error(dp.DungmlConflict("x"))["error"])
+
+    def test_not_found_is_still_unavailable_for_old_callers(self):
+        self.assertTrue(issubclass(dp.DungmlNotFound, dp.DungmlUnavailable))
+
+
+class NewRouteClientTests(BridgeTestCase):
+    def test_room_and_known_and_door_hit_the_campaign_routes(self):
+        rec = self.install({("GET", "/campaigns/"): {"id": "room.hall"},
+                            ("POST", "/campaigns/"): {"ok": True, "door": "1,2"}})
+        self.assertEqual(dp.campaign_room("c", "m", "39")["id"], "room.hall")
+        dp.campaign_known("c", "m")
+        dp.campaign_door("c", "m", between=["room.a", "room.b"], state="open")
+        self.assertTrue(any(p.startswith("/campaigns/c/maps/m/rooms/39")
+                             for p in rec.paths("GET")))
+        self.assertIn("/campaigns/c/maps/m/known", rec.paths("GET"))
+        self.assertEqual(rec.body_for("POST", "/campaigns/c/maps/m/doors"),
+                         {"between": ["room.a", "room.b"], "discovered": True, "state": "open"})
+
+    def test_room_lookup_404_is_not_swallowed(self):
+        import io, urllib.error
+        err = urllib.error.HTTPError("http://x", 404, "x", {}, io.BytesIO(b'{"detail": {"error": "unknown room"}}'))
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(dp.DungmlNotFound):
+                dp.campaign_room("c", "m", "nowhere")
