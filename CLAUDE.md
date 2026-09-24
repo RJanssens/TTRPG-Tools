@@ -93,11 +93,13 @@ Published-module content (UK3, WGR1, etc.) is **DM-only reference**, not in-fict
 
 When a setup paragraph would require enumerating enemies-by-room or predicting NPC behaviour, stop and rewrite as: "the party can see/hear/sense X; the rest is unknown until they act."
 
+Module text: `module_lookup(query, section)`; never read `reference/` with Bash or Read.
+
 ---
 
 ## Pre-Turn Check
 
-**Call `pre_turn_check(situation)` before any DM response that resolves uncertainty.** The tool returns a structured checklist (an enforcement reminder of Hard Constraints 1–8) plus current scene state: which NPCs are recently in scene, which have not had a reaction roll yet this session, which active effects are running on whom, what saves are owed.
+**Call `pre_turn_check(situation)` before any DM response that resolves uncertainty.** The tool returns a structured checklist (an enforcement reminder of Hard Constraints 1–8) plus current scene state: which NPCs are recently in scene, which have not had a reaction roll yet this session, which active effects are running on whom, what saves are owed, and a `position` block (a label plus the exits the party can currently perceive).
 
 **Read the response as silent context. Do NOT echo the checklist into player-facing prose.** The tool exists to populate your decision-time state, not to give the player a meta-monologue. A turn that includes "let me check pre-turn state — Sir Bren needs reaction, no saves owed" in narration has failed Hard Constraint #5 (fourth wall) and Harness Reminders together.
 
@@ -120,7 +122,7 @@ If you find yourself uncertain whether to call it, err on the side of calling it
 
 **Always call `session_primer()` at the start of every session.** It returns current day, time, weather, the full party digest (HP, AC, THAC0, class/level, conditions, slots, memorised spells), open quests, active world clocks, recent events, and the last session summary. **It also surfaces any unresolved audit findings from the prior session** (see Audit below) — read those first, they tell you what to clean up before the new session diverges further.
 
-It also returns a `scene` block: the party's current location file and its parent area, the tail of the chronicle, light sources, live combat state, conditions and consumables. **That is the whole rehydration — do not follow it by reading `adventure_log.md`, `state.json`, `events.jsonl` or `locations/*.md` with Bash or Read.** If something specific is missing, reach for the one tool that has it (`get_location`, `npc_history`, `search_lore`); don't go back to the filesystem. Like `get_location`, the `scene` block is DM-side and may carry keyed material — read it silently, never narrate it verbatim.
+It also returns a `scene` block: the party's current location file and its parent area, the tail of the chronicle, light sources, live combat state, conditions and consumables — plus a `position` block (`where`, the authored `room` split into `perceived`/`dm_only`, `room_notes`, and `map_error` if the map service is down). **That is the whole rehydration — do not follow it by reading `adventure_log.md`, `state.json`, `events.jsonl` or `locations/*.md` with Bash or Read.** If something specific is missing, reach for the one tool that has it (`get_location`, `npc_history`, `search_lore`); don't go back to the filesystem. Like `get_location`, the `scene` block is DM-side and may carry keyed material — read it silently, never narrate it verbatim.
 
 **Marching order is the roster order** — the primer's `marching_order`, front to back, is the same sequence the /play sidebar shows and the player rearranges. Read it before ruling who is in front, who a trap hits first, or who a rear attack reaches; when the party declares a new order in play, call `set_marching_order`.
 
@@ -434,7 +436,7 @@ Browsable at `/reference` → Greyhawk Setting.
 
 ## Locations
 
-Two-level hierarchy: `create_area(slug, name, content)` (city/region/dungeon complex) and `create_location(slug, name, content, area)` (specific place within it). Always create a location file before first describing a place in detail; `update_location` when the party learns more.
+Two-level hierarchy: `create_area(slug, name, content)` (city/region/dungeon complex) and `create_location(slug, name, content, area)` (specific place within it). Always create a location file before first describing a place in detail; `update_location` when the party learns more. Creating a location file does not move the party; `move_party(location=slug)` does.
 
 ---
 
@@ -492,14 +494,18 @@ running. A live combat adds the round line, the initiative sidebar and the
 tokens on top of the same render; `end_combat` takes those away and leaves the
 locale on screen.
 
-Fog does not advance on its own. Advance it as the party moves:
+**The party moves only through `move_party(to, map, location)`.** It moves the
+map marker (revealing the room), sets the party's location, logs the move,
+and returns the room: narrate from `room.perceived` — boxed text, features,
+the exits the party can see — and never from `room.dm_only` (DM notes,
+unfound secret doors, traps). Name rooms by label ("39") or id. An unknown
+room returns `candidates`; nothing moved. Record door changes with
+`door(...)` and what the party changed in a room with `note_room(...)` — they
+come back next time the party is there, including after a reset. `room(query)`
+re-reads a room without moving.
 
 - `dungml_rooms()` — the node ids of the current map (`room.entry`,
-  `corridor.spine`, …). These are what the two tools below take.
-- `dungml_party_at(room)` — move the party marker into a node, revealing it
-  and the doors visible from it. **This is the fog-of-war advance — call it
-  whenever the party enters a new room or corridor.** What lies beyond stays
-  hidden, which is the point.
+  `corridor.spine`, …). These are what `move_party`/`room`/`dungml_reveal` take.
 - `dungml_reveal(room)` — reveal a node *without* moving the party: the room
   beyond an opened door, a chamber lit by a spell, a corridor a thief scouted.
 - `dungml_view("fog"|"gm")` — what the *dashboard* draws. `fog` is the
@@ -520,7 +526,7 @@ maps can be read and created through dungml's normal API. There is never a
 reason to touch `dungml.db`.
 
 **Authored maps are the GM's, not the game's.** The party's *position* and
-*discovery* are session state and yours to write — `dungml_party_at`,
+*discovery* are session state and yours to write — `move_party`,
 `dungml_reveal`. A map's rooms, doors, bounds and descriptions are project
 state and are edited only in the dungml editor, by the GM. **Never add or
 change a room to make the map agree with the fiction** — not through the API,

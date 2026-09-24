@@ -522,7 +522,7 @@ def register(mcp):
                 "scope": link.get("scope"),
                 "party_node": link.get("party_node"),
                 "note": "the /map tab draws the fogged view — advance it with "
-                        "dungml_party_at / dungml_reveal",
+                        "move_party / dungml_reveal",
             }
         return out
 
