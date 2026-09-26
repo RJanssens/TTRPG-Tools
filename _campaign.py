@@ -423,7 +423,7 @@ def write_character_sheet(cfg: dict, key: str, char: dict):
     combat_parts = []
     if hp_max:
         combat_parts.append(f"**HP:** {hp_max}")
-    if ac:
+    if char.get("ac") is not None:  # AC 0 is a real AC
         combat_parts.append(f"**AC:** {ac}")
     if combat_parts:
         L += ["## Combat", "", "  ".join(combat_parts), ""]

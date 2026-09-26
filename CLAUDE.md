@@ -431,6 +431,7 @@ Browsable at `/reference` → Greyhawk Setting.
 ## Campaign Management
 
 - `campaign_info()` — active campaign details; `create_campaign(name, world, tone)` — scaffold; `switch_campaign(name)` — change active (persists); `add_character(key, label, cls, hp_max, ...)` — add a PC or major NPC.
+- `update_stats(key, ac?, thac0?, hp_max?, level?, saves?, attacks?, ..., reason)` — change a PC's (or statted NPC's) mechanics in place: new armour, level-up, a new weapon. Only the fields passed change; it rewrites the sheet, logs the change, and updates a running fight. Never hand-edit `campaign.json` and never re-run `add_character` for this — that rebuilds the whole entry. `attacks` replaces the list, and each entry carries its own THAC0, so a THAC0 change at level-up usually needs `attacks=` too.
 
 ---
 

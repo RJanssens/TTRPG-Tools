@@ -35,6 +35,42 @@ def _first_heading(path: Path) -> str:
     return name
 
 
+_STAT_LABEL = {"ac": "AC", "thac0": "THAC0", "hp_max": "HP max",
+               "level": "level", "movement_rate": "MV"}
+
+
+def _sync_combatant(key: str, char: dict, changes: dict) -> bool:
+    """Push a PC's changed stats onto their combatant in a running fight.
+    Returns True when a combatant was updated. Never raises: a tracker hiccup
+    must not undo a sheet change that has already been saved."""
+    try:
+        from tools import combat as _combat
+        sess = _combat.get_session()
+        if not sess:
+            return False
+        c = next((c for c in sess["combatants"] if c.get("_key") == key), None)
+        if c is None:
+            return False
+        if "ac" in changes:
+            c["ac"] = char["ac"]
+        if "hp_max" in changes:
+            c["hp_max"] = char["hp_max"]
+            c["hp"] = min(c["hp"], char["hp_max"])
+        if "attacks" in changes:
+            blocks, _ = _combat._normalize_attacks(char)
+            c["attack_blocks"] = blocks
+            if blocks:
+                active = next((b for b in blocks if b["name"] == c.get("weapon")), blocks[0])
+                _combat._apply_attack_block(c, active)
+        elif "thac0" in changes and not c.get("attack_blocks"):
+            # With attack blocks, THAC0 comes from the block, not the sheet.
+            c["thac0"] = char["thac0"]
+        _combat._persist_session()
+        return True
+    except Exception:
+        return False
+
+
 _ABILITY_ORDER = ["str", "dex", "con", "int", "wis", "cha"]
 _SAVE_SHORT = {
     "paralysis_poison_death": "PPD",
@@ -218,10 +254,10 @@ def register(mcp):
     def set_npc_stats(
         slug: str,
         cls: str = "",
-        level: int = 0,
-        hp: int = 0,
-        ac: int = 0,
-        thac0: int = 0,
+        level: int | None = None,
+        hp: int | None = None,
+        ac: int | None = None,
+        thac0: int | None = None,
         saves: list = None,
         attacks: list = None,
         ability_scores: dict = None,
@@ -254,10 +290,11 @@ def register(mcp):
         npc_data["slug"]  = slug
 
         if cls:             npc_data["cls"]              = cls
-        if level:           npc_data["level"]            = level
-        if hp:              npc_data["hp_max"]           = hp
-        if ac:              npc_data["ac"]               = ac
-        if thac0:           npc_data["thac0"]            = thac0
+        # `is not None`, not truthiness: AC 0 and negative AC are real values.
+        if level is not None: npc_data["level"]          = level
+        if hp is not None:  npc_data["hp_max"]           = hp
+        if ac is not None:  npc_data["ac"]               = ac
+        if thac0 is not None: npc_data["thac0"]          = thac0
         if saves:           npc_data["saves"]            = saves
         if attacks:         npc_data["attacks"]          = attacks
         if ability_scores:  npc_data["ability_scores"]   = ability_scores
@@ -273,6 +310,106 @@ def register(mcp):
         _c.write_character_sheet(cfg, slug, npc_data)
 
         return {"slug": slug, "label": label, "updated": True}
+
+    @mcp.tool()
+    def update_stats(
+        key: str,
+        ac: int | None = None,
+        thac0: int | None = None,
+        hp_max: int | None = None,
+        level: int | None = None,
+        saves: list = None,
+        attacks: list = None,
+        ability_scores: dict = None,
+        inventory: list = None,
+        weapon_profs: list = None,
+        nwps: list = None,
+        natural_abilities: list = None,
+        movement_rate: int | None = None,
+        alignment: str = "",
+        reason: str = "",
+    ) -> dict:
+        """Change a PC's or NPC's stored mechanics in place: AC after new armour,
+        THAC0/HP/saves at level-up, a rewritten attacks[] after a new weapon.
+        Only the fields you pass change; everything else on the sheet is kept.
+
+        key:    PC key or label (prefix match), else an NPC slug that already
+                has a stat block (NPCs without one use set_npc_stats first)
+        saves:  five ints in PP&D/RSW/PETR/BREATH/SPELL order, or [{type, value}]
+        attacks / inventory / lists: replace the whole list — pass the full new list
+        reason: one line for the chronicle ("plate mail and shield")
+
+        Lowering hp_max clamps current HP to it; raising it leaves current HP
+        alone (heal separately). If a fight is running, the PC's combatant
+        picks up the new AC, THAC0, HP max and attack blocks immediately.
+        Logs a `stats_update` event with each field's old and new value."""
+        cfg = _c.load_campaign()
+        pc_key, record = _c.char_key_for(cfg, key)
+        kind = "pc"
+        if record is None:
+            slug = key.lower().strip()
+            record = cfg.get("npcs", {}).get(slug)
+            pc_key, kind = slug, "npc"
+            if record is None:
+                if (cfg["_data_dir"] / "characters" / f"{slug}.md").exists():
+                    return {"error": f"NPC '{slug}' has no stat block yet — use set_npc_stats."}
+                return {"error": f"No PC or NPC '{key}' found."}
+
+        wanted: dict = {
+            "ac": ac, "thac0": thac0, "hp_max": hp_max, "level": level,
+            "attacks": attacks, "ability_scores": ability_scores,
+            "inventory": inventory, "weapon_profs": weapon_profs, "nwps": nwps,
+            "natural_abilities": natural_abilities, "movement_rate": movement_rate,
+            "alignment": alignment or None,
+        }
+        if saves is not None:
+            norm = _c.normalize_saves(saves)
+            if not norm:
+                return {"error": "saves must be five ints or a list of {type, value}."}
+            wanted["saves"] = norm
+        wanted = {k: v for k, v in wanted.items() if v is not None}
+        if not wanted:
+            return {"error": "Nothing to update — pass at least one stat."}
+
+        changes = {f: [record.get(f), v] for f, v in wanted.items() if record.get(f) != v}
+        label = record.get("label", pc_key)
+        out: dict = {"key": pc_key, "label": label, "changes": changes,
+                     "combat_synced": False}
+        if not changes:
+            return out
+
+        for f, (_, new) in changes.items():
+            record[f] = new
+        _c.save_campaign(cfg)
+        _c.write_character_sheet(cfg, pc_key, record)
+
+        if kind == "pc" and "hp_max" in changes:
+            state = _c.load_state(cfg)
+            cstate = state.setdefault("characters", {}).setdefault(pc_key, {})
+            cur = cstate.get("hp", changes["hp_max"][0] or record["hp_max"])
+            cstate["hp"] = min(cur, record["hp_max"])
+            _c.save_state(cfg, state)
+            out["hp_current"] = cstate["hp"]
+
+        if kind == "pc":
+            out["combat_synced"] = _sync_combatant(pc_key, record, changes)
+
+        if "thac0" in changes and "attacks" not in changes and any(
+                isinstance(a, dict) and a.get("thac0") is not None
+                for a in record.get("attacks") or []):
+            out["warnings"] = ["Combat takes THAC0 from each attacks[] entry, not the "
+                               "sheet's thac0 — pass attacks= with the new per-weapon THAC0 too."]
+
+        scalar = [f"{_STAT_LABEL.get(f, f)} {old} → {new}" for f, (old, new) in changes.items()
+                  if not isinstance(new, (list, dict))]
+        listed = [f for f, (_, new) in changes.items() if isinstance(new, (list, dict))]
+        summary = ", ".join(scalar + [f"{f} updated" for f in listed])
+        text = f"{label}: {summary}" + (f" ({reason})" if reason else "")
+        _c.append_event(cfg, {"type": "stats_update", "character": pc_key,
+                              "kind": kind, "changes": changes,
+                              "reason": reason, "text": text})
+        out["text"] = text
+        return out
 
     @mcp.tool()
     def quick_npc(
@@ -423,7 +560,8 @@ def register(mcp):
     def refresh_sheet(key: str) -> dict:
         """Regenerate the markdown sheet for a PC or NPC from stored campaign.json data.
         key: character key (from 'characters' or 'npcs' in campaign.json)
-        Use this after manually editing campaign.json or after a stat change."""
+        To change a stat, use update_stats — it rewrites the sheet itself.
+        This is for a sheet that has drifted from campaign.json."""
         cfg = _c.load_campaign()
         char = cfg.get("characters", {}).get(key) or cfg.get("npcs", {}).get(key)
         if not char:
