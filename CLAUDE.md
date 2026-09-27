@@ -571,6 +571,7 @@ Run `python3 dashboard.py [--port 5000]` for the web interface:
 - `/` — lands on `/play`
 - `/play` — the play page; its 🗺 button pops the current dungml map up over the transcript (shown only while dungml holds one)
 - `/gallery` — scene image gallery
+- `/reference/facts` — the "did you know" lore facts /play rotates while the DM composes; `add_lore_fact` / `add_campaign_fact` add to it
 - `/party` — live party status
 - `/log` — session chronicle
 - `/characters` — NPC index with portraits

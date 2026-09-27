@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp.server.fastmcp import FastMCP
-from tools import dice, party, combat, combat_map, dungml_play, world, world_map, lore, log, lookup, images, campaign_mgmt, secrets, rules, survival, factions, weather, travel, rumors, hirelings, quests, audit, holdings, greyhawk, wordlist, pre_check, composites, rooms, module_ref
+from tools import dice, party, combat, combat_map, dungml_play, world, world_map, lore, log, lookup, images, campaign_mgmt, secrets, rules, survival, factions, weather, travel, rumors, hirelings, quests, audit, holdings, greyhawk, wordlist, pre_check, composites, rooms, module_ref, lore_facts
 
 mcp = FastMCP("TTRPG Campaign Manager")
 
@@ -51,6 +51,7 @@ pre_check.register(mcp)
 composites.register(mcp)
 rooms.register(mcp)
 module_ref.register(mcp)
+lore_facts.register(mcp)
 
 if __name__ == "__main__":
     mcp.run()

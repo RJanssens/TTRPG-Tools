@@ -26,6 +26,7 @@ from tools import dm_session as _dm
 from tools import images as _img
 from tools import tts as _tts
 from tools import dungml_play as _dungml
+from tools import lore_facts as _facts
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -4205,6 +4206,39 @@ _PLAY_HTML = """
     white-space: nowrap;
   }
 
+  /* "Did you know" lore fact beneath the thinking row, shown only while the
+     DM is composing. Scoped to .has-dyk so the recovery indicator (which
+     reuses .turn.thinking as a plain row) is unaffected. */
+  .turn.thinking.has-dyk { flex-direction: column; align-items: stretch; gap: 10px; }
+  .turn.thinking.has-dyk .thinking-row { display: flex; align-items: center; gap: 14px; }
+  .turn.thinking .dyk {
+    border-top: 1px dotted var(--rule);
+    padding-top: 10px;
+    font-style: normal;
+    line-height: 1.55;
+    opacity: 0;
+    transition: opacity 0.55s ease;
+  }
+  .turn.thinking .dyk.show { opacity: 1; }
+  .turn.thinking .dyk-label {
+    font-family: var(--font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 0.7em;
+    color: var(--accent-gold);
+    margin-right: 9px;
+  }
+  .turn.thinking .dyk-label::before { content: '\\2726  '; }   /* ✦ */
+  .turn.thinking .dyk-fact { font-size: 0.95em; color: var(--ink-body); }
+  .turn.thinking .dyk-cat {
+    font-family: var(--font-mono);
+    font-size: 0.7em;
+    color: var(--accent-gold);
+    opacity: 0.55;
+    margin-left: 8px;
+    white-space: nowrap;
+  }
+
   /* ---- Sidebar ---- */
   .play-side {
     background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
@@ -4970,6 +5004,37 @@ _PLAY_HTML = """
   let thinkingStart = 0;
   let thinkingTimer = null;
   let thinkingTools = 0;
+
+
+  // "Did you know" lore facts — fetched once on load, then rotated with a
+  // cross-fade beneath the "DM is thinking" row during the wait for a reply.
+  let dykFacts = [];
+  let dykTimer = null;
+  let dykPos = 0;
+  const DYK_ROTATE_MS = 10000;
+  fetch('/api/facts/random?n=40')
+    .then(r => r.ok ? r.json() : null)
+    .then(d => { if (d && Array.isArray(d.facts)) dykFacts = d.facts; })
+    .catch(() => {});
+
+  function renderNextFact() {
+    if (!thinkingEl || !dykFacts.length) return;
+    const dyk = thinkingEl.querySelector('.dyk');
+    if (!dyk) return;
+    const f = dykFacts[dykPos % dykFacts.length];
+    dykPos++;
+    dyk.classList.remove('show');           // fade current out
+    setTimeout(function(){
+      if (!thinkingEl) return;              // turn ended mid-fade
+      const factSpan = dyk.querySelector('.dyk-fact');
+      const catSpan = dyk.querySelector('.dyk-cat');
+      if (factSpan) factSpan.textContent = f.text || '';
+      // Campaign facts show the campaign name; others show the category.
+      const tag = (f.category === 'campaign' && f.campaign) ? f.campaign : f.category;
+      if (catSpan) catSpan.textContent = tag ? ('— ' + tag) : '';
+      dyk.classList.add('show');            // fade next in
+    }, 280);
+  }
   // Map tool_use.id → DOM element so tool_result events can fill in the
   // result section once it lands.
   const toolElements = new Map();
@@ -5526,14 +5591,30 @@ _PLAY_HTML = """
     thinkingStart = performance.now();
     thinkingEl = document.createElement('div');
     thinkingEl.className = 'turn thinking';
-    thinkingEl.innerHTML =
+    const row =
         '<span class="thinking-glyph" aria-hidden="true"><span></span><span></span><span></span></span>'
       + '<span class="thinking-text">DM is thinking…</span>'
       + '<span class="thinking-time">0.0s</span>';
+    // With lore facts loaded, the row stacks above a rotating "did you know".
+    if (dykFacts.length) {
+      thinkingEl.classList.add('has-dyk');
+      thinkingEl.innerHTML =
+          '<div class="thinking-row">' + row + '</div>'
+        + '<div class="dyk" aria-live="polite">'
+        +   '<span class="dyk-label">Did you know</span>'
+        +   '<span class="dyk-fact"></span><span class="dyk-cat"></span>'
+        + '</div>';
+    } else {
+      thinkingEl.innerHTML = row;
+    }
     log.appendChild(thinkingEl);
     maybeScrollToBottom();
     updateThinkingTime();
     thinkingTimer = setInterval(updateThinkingTime, 200);
+    if (dykFacts.length) {
+      renderNextFact();
+      dykTimer = setInterval(renderNextFact, DYK_ROTATE_MS);
+    }
   }
 
   function updateThinkingTime() {
@@ -5548,6 +5629,7 @@ _PLAY_HTML = """
 
   function stopThinking() {
     if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
+    if (dykTimer) { clearInterval(dykTimer); dykTimer = null; }
     if (thinkingEl && thinkingEl.parentElement) thinkingEl.remove();
     thinkingEl = null;
   }
@@ -8021,6 +8103,68 @@ def api_holding_portrait(kind: str, slug: str):
     })
 
 
+# ---------------------------------------------------------------------------
+# "Did you know" lore facts — a cross-campaign trivia store shown on /play
+# during the wait for the DM's reply. Schema + CRUD live in tools/lore_facts.py
+# (shared with the MCP tools); these endpoints are thin HTTP wrappers.
+# ---------------------------------------------------------------------------
+@app.route("/api/facts", methods=["GET"])
+def api_facts_list():
+    """List facts. Optional ?category=, ?campaign=, ?enabled=0|1 filters."""
+    en = request.args.get("enabled")
+    rows = _facts.list_facts(
+        category=request.args.get("category") or None,
+        campaign=request.args.get("campaign") or None,
+        enabled=(int(en) if en in ("0", "1") else None),
+    )
+    return jsonify({"facts": rows, "count": len(rows)})
+
+
+@app.route("/api/facts/random", methods=["GET"])
+def api_facts_random():
+    """Return ?n= random enabled facts (default 1, max 100), optionally
+    filtered by ?category= / ?campaign=. This is what /play pulls on load to
+    fill the 'did you know' rotation."""
+    rows = _facts.random_facts(
+        n=request.args.get("n", 1),
+        category=request.args.get("category") or None,
+        campaign=request.args.get("campaign") or None,
+    )
+    return jsonify({"facts": rows, "count": len(rows)})
+
+
+@app.route("/api/facts", methods=["POST"])
+def api_facts_create():
+    """Create a fact. Body: {text (required), category?, source?, campaign?}."""
+    data = request.get_json(silent=True) or {}
+    res = _facts.create_fact(
+        text=data.get("text", ""),
+        category=data.get("category", ""),
+        source=data.get("source", ""),
+        campaign=data.get("campaign", ""),
+    )
+    return (jsonify(res), 400) if "error" in res else (jsonify(res), 201)
+
+
+@app.route("/api/facts/<int:fid>", methods=["PATCH", "PUT"])
+def api_facts_update(fid: int):
+    """Update a fact. Body may include text, category, source, campaign, enabled."""
+    data = request.get_json(silent=True) or {}
+    fields = {k: data[k] for k in ("text", "category", "source", "campaign", "enabled")
+              if k in data}
+    res = _facts.update_fact(fid, **fields)
+    if "error" in res:
+        return jsonify(res), 404 if res["error"].startswith("no fact") else 400
+    return jsonify(res)
+
+
+@app.route("/api/facts/<int:fid>", methods=["DELETE"])
+def api_facts_delete(fid: int):
+    """Delete a fact by id."""
+    res = _facts.delete_fact(fid)
+    return (jsonify(res), 404) if "error" in res else jsonify(res)
+
+
 @app.route("/characters")
 def characters():
     campaign_name = cfg.get("name", "Campaign")
@@ -10300,6 +10444,8 @@ _REFERENCE_SECTIONS = [
      "DMG Table 47: d20 target cross-indexed by undead type/HD and priest level. Paladins use level-2."),
     ("/greyhawk", "Greyhawk Setting",
      "Greyhawk wiki: deities, realms, characters, settlements, and full-text search."),
+    ("/reference/facts", "Lore Facts",
+     "The “did you know” trivia pool shown on /play: browse by category, add and delete entries."),
 ]
 
 
@@ -10323,6 +10469,207 @@ def reference_index():
         '</div>'
     )
     return render("Reference", body)
+
+
+@app.route("/reference/facts")
+def reference_facts():
+    """Manage the 'did you know' lore-fact pool: browse by category, add new
+    entries, delete existing ones. Add/delete go through /api/facts."""
+    facts = _facts.list_facts()                      # all, ordered by id
+    cat_names = sorted({f["category"] for f in facts if f["category"]})
+
+    # Group by category; order sections by size (largest first), then name.
+    groups: dict[str, list] = {}
+    for f in facts:
+        groups.setdefault(f["category"] or "(uncategorized)", []).append(f)
+    ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+
+    def esc(s):
+        return html.escape("" if s is None else str(s))
+
+    # Quick category jump-nav with counts.
+    nav_chips = " ".join(
+        f'<a class="tag" href="#cat-{esc(re.sub(r"[^a-z0-9]+", "-", cat.lower()))}">'
+        f'{esc(cat)} <span class="muted">{len(items)}</span></a>'
+        for cat, items in ordered
+    )
+
+    sections = []
+    for cat, items in ordered:
+        anchor = re.sub(r"[^a-z0-9]+", "-", cat.lower())
+        rows = []
+        for f in items:
+            camp = (f.get("campaign") or "").strip()
+            camp_chip = f' <span class="tag">{esc(camp)}</span>' if camp else ""
+            disabled = "" if f.get("enabled", True) else ' <span class="muted">(hidden)</span>'
+            rows.append(
+                '<tr>'
+                f'<td>{esc(f["text"])}{camp_chip}{disabled}</td>'
+                f'<td class="fact-ts">{esc(f.get("created_at") or "")}</td>'
+                f'<td class="fact-act"><button class="fact-del" type="button" '
+                f'data-id="{f["id"]}" title="Delete entry" aria-label="Delete entry">✕</button></td>'
+                '</tr>'
+            )
+        sections.append(
+            f'<h2 id="cat-{esc(anchor)}">{esc(cat)} '
+            f'<span class="muted" style="font-size:0.7em">{len(items)} entries</span></h2>'
+            '<table class="fact-table"><thead><tr>'
+            '<th>Fact</th><th>Added</th><th></th></tr></thead><tbody>'
+            + "".join(rows) +
+            '</tbody></table>'
+        )
+
+    # Category dropdown: existing categories unioned with the canonical set
+    # (so unused-but-expected ones are always offered), plus a "+ new" escape
+    # hatch that reveals a free-text field.
+    _CANON_CATS = ["greyhawk", "monster", "rules", "spell", "magic",
+                   "history", "planes", "class", "campaign"]
+    cat_options = sorted(set(cat_names) | set(_CANON_CATS))
+    cat_select_options = (
+        '<option value="" selected>— category —</option>'
+        + "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in cat_options)
+        + '<option value="__new__">+ new category…</option>'
+    )
+
+    body = f"""
+<style>
+  .fact-add {{ margin: 14px 0 26px; }}
+  .fact-add textarea {{
+    width: 100%; box-sizing: border-box;
+    background: var(--bg-rec); color: var(--ink-body);
+    border: 1px solid var(--rule); border-radius: 3px;
+    padding: 10px 12px; font-family: var(--font-body); font-size: 1em;
+    resize: vertical; min-height: 60px; line-height: 1.5;
+  }}
+  .fact-add textarea:focus {{ outline: none; border-color: var(--accent-gold); }}
+  .fact-add .row {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; align-items: center; }}
+  .fact-add input {{
+    background: var(--bg-rec); color: var(--ink-body);
+    border: 1px solid var(--rule); border-radius: 3px;
+    padding: 7px 10px; font-family: var(--font-body); font-size: 0.95em;
+  }}
+  .fact-add input:focus {{ outline: none; border-color: var(--accent-gold); }}
+  .fact-add select.cat {{
+    background: var(--bg-rec); color: var(--ink-body);
+    border: 1px solid var(--rule); border-radius: 3px;
+    padding: 7px 10px; font-family: var(--font-body); font-size: 0.95em;
+    cursor: pointer;
+  }}
+  .fact-add select.cat:focus {{ outline: none; border-color: var(--accent-gold); }}
+  .fact-add input.cat {{ width: 14ch; }}
+  .fact-add input.camp {{ width: 18ch; }}
+  .fact-add button {{
+    background: linear-gradient(to bottom, #4a3625, #2e2014);
+    color: var(--ink-display); border: 1px solid var(--rule-hi);
+    border-radius: 3px; padding: 7px 18px; cursor: pointer;
+    font-family: var(--font-display); font-size: 0.74em;
+    text-transform: uppercase; letter-spacing: 0.14em;
+    transition: all 160ms ease;
+  }}
+  .fact-add button:hover {{ border-color: var(--accent-gold); color: var(--accent-gold-hi); }}
+  .fact-add button:disabled {{ opacity: 0.5; cursor: progress; }}
+  #fact-add-status {{ margin-top: 8px; min-height: 1.2em; }}
+  .cat-nav {{ margin: 10px 0 22px; line-height: 2; }}
+  a.tag {{ text-decoration: none; }}
+  table.fact-table td {{ vertical-align: top; }}
+  table.fact-table .fact-ts {{
+    font-family: var(--font-mono); font-size: 0.8em; color: var(--ink-muted);
+    white-space: nowrap; width: 1%;
+  }}
+  table.fact-table .fact-act {{ width: 1%; text-align: center; }}
+  .fact-del {{
+    background: transparent; border: 1px solid var(--rule);
+    color: var(--ink-muted); border-radius: 3px; cursor: pointer;
+    width: 26px; height: 24px; line-height: 1; padding: 0;
+    transition: all 150ms ease;
+  }}
+  .fact-del:hover {{ border-color: var(--accent-blood, #a33); color: #e88; }}
+  .fact-del:disabled {{ opacity: 0.4; cursor: progress; }}
+</style>
+
+<h1>Lore Facts</h1>
+<p class="muted">The “did you know” trivia pool shown on <a href="/play">/play</a> while the DM
+composes a reply. {len(facts)} entries across {len(ordered)} categories.</p>
+
+<div class="card fact-add">
+  <h2 style="margin-top:0">Add an entry</h2>
+  <form id="fact-add-form">
+    <textarea id="fact-text" maxlength="600" placeholder="A short, interesting fact (one or two sentences)…"></textarea>
+    <div class="row">
+      <select id="fact-cat" class="cat">{cat_select_options}</select>
+      <input id="fact-cat-new" class="cat" type="text" placeholder="new category" autocomplete="off" hidden>
+      <input id="fact-camp" class="camp" type="text" placeholder="campaign (optional)" autocomplete="off">
+      <input id="fact-source" class="camp" type="text" placeholder="source (optional)" autocomplete="off">
+      <button type="submit" id="fact-add-btn">Add fact</button>
+    </div>
+  </form>
+  <div id="fact-add-status" class="muted"></div>
+</div>
+
+<div class="cat-nav">{nav_chips}</div>
+
+{"".join(sections) if sections else '<p class="muted">No entries yet.</p>'}
+
+<script>
+(function(){{
+  const form = document.getElementById('fact-add-form');
+  const text = document.getElementById('fact-text');
+  const cat = document.getElementById('fact-cat');
+  const catNew = document.getElementById('fact-cat-new');
+  const camp = document.getElementById('fact-camp');
+  const source = document.getElementById('fact-source');
+  const btn = document.getElementById('fact-add-btn');
+  const status = document.getElementById('fact-add-status');
+
+  // "+ new category…" reveals a free-text field for an unlisted category.
+  cat.addEventListener('change', function(){{
+    const isNew = cat.value === '__new__';
+    catNew.hidden = !isNew;
+    if (isNew) catNew.focus();
+  }});
+  function chosenCategory(){{
+    return cat.value === '__new__' ? catNew.value.trim() : cat.value.trim();
+  }}
+
+  form.addEventListener('submit', async function(e){{
+    e.preventDefault();
+    const t = (text.value || '').trim();
+    if (!t) {{ text.focus(); return; }}
+    btn.disabled = true; status.textContent = 'Adding…';
+    try {{
+      const r = await fetch('/api/facts', {{
+        method: 'POST', headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{text: t, category: chosenCategory(),
+                              campaign: camp.value.trim(), source: source.value.trim()}})
+      }});
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      location.reload();
+    }} catch (err) {{
+      status.textContent = 'Failed: ' + err.message;
+      btn.disabled = false;
+    }}
+  }});
+
+  document.querySelectorAll('.fact-del').forEach(function(b){{
+    b.addEventListener('click', async function(){{
+      if (!confirm('Delete this entry?')) return;
+      b.disabled = true;
+      try {{
+        const r = await fetch('/api/facts/' + b.dataset.id, {{method: 'DELETE'}});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        const tr = b.closest('tr'); if (tr) tr.remove();
+      }} catch (err) {{
+        alert('Delete failed: ' + err.message);
+        b.disabled = false;
+      }}
+    }});
+  }});
+}})();
+</script>
+"""
+    return render("Lore Facts", body)
 
 
 # ---------------------------------------------------------------------------
