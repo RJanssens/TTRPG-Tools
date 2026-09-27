@@ -314,6 +314,8 @@ def register(mcp):
         skills: dict = None,
         spell_slots: dict = None,
         memorized_spells: list = None,
+        size: str = "",
+        ac_vs_larger: int = 0,
     ) -> dict:
         """Add a PC to the campaign (campaign.json + state.json) and auto-generate their sheet.
 
@@ -326,6 +328,10 @@ def register(mcp):
         inventory: ["Longsword", "Chain mail", "Backpack", ...]
         portrait_prompt: canonical image-generation prompt (stored and reused for future portraits)
         skills: thief/bard skill percentages {skill_name: pct}
+        size: T/S/M/L/H/G — picks the damage die attackers roll against this PC.
+              Omitted: derived from race (pixie S, minotaur L, human M).
+        ac_vs_larger: AC bonus against attackers bigger than this PC (a pixie's
+              +2 vs Medium or larger) — applied automatically in combat.
         saves: either five ints in PP&D/RSW/PETR/BREATH/SPELL order, or a list of
                {type, value} dicts. When omitted, derived from cls + level via the
                2e DB (and equipment/level-up adjustments should be applied
@@ -358,6 +364,10 @@ def register(mcp):
             "saves":        saves,
             "skills":       skills or {},
         }
+        if "/" in cls:
+            # Multi-class: every class starts at `level`; update_stats(levels=)
+            # moves them apart as each share of the XP crosses its own table.
+            char_data["levels"] = {c.strip().lower(): level for c in cls.split("/") if c.strip()}
         if alignment:           char_data["alignment"]         = alignment
         if ability_scores:      char_data["ability_scores"]    = ability_scores
         if background:          char_data["background"]        = background
@@ -368,6 +378,8 @@ def register(mcp):
         if inventory:           char_data["inventory"]         = inventory
         if spell_slots_cfg:     char_data["spell_slots"]       = spell_slots_cfg
         if memorized_spells:    char_data["memorized_spells"]  = memorized_spells
+        if size:                char_data["size"]              = size.strip()[:1].upper()
+        if ac_vs_larger:        char_data["ac_vs_larger"]      = int(ac_vs_larger)
 
         # Build and store portrait prompt (explicit > auto-generated)
         from tools.images import _portrait_prompt_for

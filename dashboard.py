@@ -21,6 +21,7 @@ from tools import campaign_archive as _arch
 from tools import export_session as _export
 from tools import item_weights as _iw
 from tools import homebrew_classes as _hb
+from tools import class_xp as _xp
 from tools import dm_session as _dm
 from tools import images as _img
 from tools import tts as _tts
@@ -161,75 +162,11 @@ def _combat_effects_overrides() -> dict:
     return out
 
 
-_class_xp_cache: dict[str, list[int]] = {}
-
-# 2e kits and common synonyms map onto their PHB base class for XP-table
-# lookup. The kits use the base class's progression in the published rules.
-_CLASS_ALIASES: dict[str, str] = {
-    "barbarian":   "Fighter",   # Complete Barbarian's Handbook (Fighter kit)
-    "berserker":   "Fighter",
-    "cavalier":    "Fighter",
-    "gladiator":   "Fighter",
-    "samurai":     "Fighter",
-    "wizard":      "Mage",
-    "necromancer": "Specialist Mage",
-    "abjurer":     "Specialist Mage",
-    "conjurer":    "Specialist Mage",
-    "diviner":     "Specialist Mage",
-    "enchanter":   "Specialist Mage",
-    "illusionist": "Specialist Mage",
-    "invoker":     "Specialist Mage",
-    "transmuter":  "Specialist Mage",
-    "monk":        "Cleric",    # Scarlet Brotherhood / OA-style monk uses Priest table
-    "assassin":    "Thief",     # 2e: Assassin kit of Thief
-    "swashbuckler":"Thief",
-}
-
-
 def _class_xp_table(cls: str) -> list[int]:
-    """Return [xp_required at level 1, level 2, ...] for a class.
-
-    Resolution order:
-      1. Homebrew classes (global/homebrew/classes/*.json) — preferred so
-         home-brewed entries win over aliases.
-      2. PHB classes (global/2e.db).
-      3. Kit→base alias fallback (legacy; will be empty for classes whose
-         homebrew JSON has been authored).
-    Empty list if nothing matches. Process-cached."""
-    key = (cls or "").strip().lower()
-    if not key:
-        return []
-    if key in _class_xp_cache:
-        return _class_xp_cache[key]
-
-    table: list[int] = _hb.homebrew_xp_table(key)
-    if not table:
-        candidates = [key]
-        if key in _CLASS_ALIASES:
-            candidates.append(_CLASS_ALIASES[key].lower())
-        try:
-            conn = _db(_2E_DB)
-            for candidate in candidates:
-                row = conn.execute(
-                    "SELECT id FROM classes WHERE lower(name) = ? LIMIT 1", (candidate,),
-                ).fetchone()
-                if row is None:
-                    row = conn.execute(
-                        "SELECT id FROM classes WHERE lower(name) LIKE ? LIMIT 1",
-                        (candidate + "%",),
-                    ).fetchone()
-                if row is not None:
-                    for r in conn.execute(
-                        "SELECT xp_required FROM class_levels WHERE class_id=? ORDER BY level",
-                        (row["id"],),
-                    ).fetchall():
-                        table.append(int(r["xp_required"]))
-                    break
-        except sqlite3.Error:
-            table = []
-
-    _class_xp_cache[key] = table
-    return table
+    """[xp_required at level 1, level 2, ...] for one class (homebrew, then
+    PHB, then kit alias) — see tools/class_xp.py. Empty for a multi-class
+    string; those go through _xp.progress / _xp.bar."""
+    return _xp.xp_table(cls)
 
 
 # Encumbrance bands (PHB Table 47) and computation live in tools/item_weights.py.
@@ -1779,7 +1716,7 @@ def _party_body(heading_tag: str = "h1", heading_text: str | None = None) -> str
         # Class line: "Cleric 3"
         cls_line = html.escape(cls)
         if cls and level:
-            cls_line = f"{html.escape(cls)} {level}"
+            cls_line = f"{html.escape(cls)} {html.escape(_xp.level_label(char) or str(level))}"
 
         # Combat stats line
         stats_parts = []
@@ -1792,14 +1729,12 @@ def _party_body(heading_tag: str = "h1", heading_text: str | None = None) -> str
             stats_html = "<p>" + " &nbsp;·&nbsp; ".join(stats_parts) + "</p>"
 
         # XP / next-level threshold
-        xp_table = _class_xp_table(cls)
+        _, next_xp = _xp.bar(char, xp)
         next_xp_str = ""
-        if xp_table and level < len(xp_table):
-            next_xp = xp_table[level]   # xp_required for (level+1) — table is 0-indexed by level
-            if next_xp > xp:
-                next_xp_str = f' <span class="muted">/ {next_xp:,}</span>'
-            else:
-                next_xp_str = ' <span class="tag" style="background:#1a3a18;color:#6db86d">level up</span>'
+        if any(r["ready"] for r in _xp.progress(char, xp)):
+            next_xp_str = ' <span class="tag" style="background:#1a3a18;color:#6db86d">level up</span>'
+        elif next_xp is not None:
+            next_xp_str = f' <span class="muted">/ {next_xp:,}</span>'
 
         # Active effects (combat-only)
         effects = combat_effects.get(key, [])
@@ -3275,19 +3210,13 @@ def _play_state() -> dict:
         portrait = _find_portrait(char.get("label", key), image_index, key)
         level = int(char.get("level", 1) or 1)
         xp = int(cstate.get("xp", 0) or 0)
-        xp_table = _class_xp_table(char.get("cls", ""))
-        xp_floor = 0
-        xp_next = None
-        if xp_table and 1 <= level <= len(xp_table):
-            xp_floor = xp_table[level - 1]
-            if level < len(xp_table):
-                xp_next = xp_table[level]
+        xp_floor, xp_next = _xp.bar(char, xp)
         chars.append({
             "key": key,
             "label": char.get("label", key),
             "cls": char.get("cls", ""),
             "alignment": _alignment_abbrev(char.get("alignment") or ""),
-            "level": level,
+            "level": _xp.level_label(char) or level,
             "hp": hp_cur,
             "hp_max": hp_max,
             "ac": char.get("ac"),
@@ -7587,16 +7516,14 @@ def _vitals_row(char: dict, cstate: dict) -> str:
                 f'<div class="vital"><span class="vital-label">{label}</span>'
                 f'<span class="vital-value">{html.escape(str(v))}</span></div>'
             )
-    level = int(char.get("level", 1) or 1)
     items.append(
         f'<div class="vital"><span class="vital-label">Level</span>'
-        f'<span class="vital-value">{level}</span></div>'
+        f'<span class="vital-value">{html.escape(_xp.level_label(char) or "1")}</span></div>'
     )
     xp = int(cstate.get("xp", 0) or 0)
-    xp_table = _class_xp_table(char.get("cls", ""))
+    _, next_xp = _xp.bar(char, xp)
     next_xp_html = ""
-    if xp_table and level < len(xp_table):
-        next_xp = xp_table[level]
+    if next_xp is not None:
         next_xp_html = f' <span class="xp-next">/ {next_xp:,}</span>'
     items.append(
         f'<div class="vital"><span class="vital-label">XP</span>'

@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import _campaign as _c
+from tools import class_xp as _xp
 
 _2E_DB = Path(__file__).resolve().parent.parent / "global" / "2e.db"
 
@@ -132,32 +133,6 @@ def _normalize_memorized(spells: list, caster_kind: str = "") -> list:
             level = _spell_level(name, caster_kind) or 0
         result.append({"name": name, "level": level, "cast": cast})
     return result
-
-
-# Rough XP thresholds per class keyword → list of (threshold, level)
-_XP_THRESHOLDS = {
-    "fighter":  [(2000, 2), (4000, 3), (8000, 4)],
-    "paladin":  [(2750, 2), (5500, 3), (12000, 4)],
-    "ranger":   [(2250, 2), (4500, 3), (10000, 4)],
-    "thief":    [(1250, 2), (2500, 3), (5000, 4)],
-    "assassin": [(1500, 2), (3000, 3), (6000, 4)],
-    "mage":     [(2500, 2), (5000, 3), (10000, 4)],
-    "wizard":   [(2500, 2), (5000, 3), (10000, 4)],
-    "illusionist": [(2250, 2), (4500, 3), (9000, 4)],
-    "cleric":   [(1500, 2), (3000, 3), (6000, 4)],
-    "druid":    [(2000, 2), (4000, 3), (7500, 4)],
-    "bard":     [(1333, 2), (2666, 3), (5332, 4)],
-}
-
-
-def _level_up_hint(char: dict, xp_before: int, xp_after: int) -> str:
-    cls_str = char.get("cls", "").lower()
-    for kw, thresholds in _XP_THRESHOLDS.items():
-        if kw in cls_str:
-            for threshold, level in thresholds:
-                if xp_before < threshold <= xp_after:
-                    return f"Level up! {char.get('label', '?')} has reached {threshold} XP — eligible for level {level} ({kw.capitalize()})."
-    return ""
 
 
 def register(mcp):
@@ -698,7 +673,12 @@ def register(mcp):
 
     @mcp.tool()
     def award_xp(character: str, amount: int) -> dict:
-        """Add XP to a character. Includes a level-up hint if a threshold is crossed."""
+        """Add XP to a character. Includes a level-up hint if a threshold is crossed.
+
+        A multi-class character ("Fighter/Thief") has the award split evenly
+        between their classes (PHB): `xp_by_class` shows each class's share,
+        level and next threshold, and the hint names the class that levels.
+        Levelling is still update_stats(levels={...}) — this only tells you."""
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
@@ -713,14 +693,20 @@ def register(mcp):
         cstate["xp"] = xp_after
         _c.save_state(cfg, state)
 
-        hint = _level_up_hint(char, xp_before, xp_after)
+        hints = _xp.level_up_hints(char, xp_before, xp_after)
 
-        return {
+        out = {
             "character": char.get("label", key),
             "xp_gained": amount,
             "xp_total": xp_after,
-            "level_up_hint": hint,
+            "level_up_hint": " ".join(hints),
         }
+        if _xp.is_multiclass(char):
+            out["xp_by_class"] = [
+                {f: r[f] for f in ("class", "level", "xp", "xp_next", "ready")}
+                for r in _xp.progress(char, xp_after)
+            ]
+        return out
 
     @mcp.tool()
     def update_coin(delta: str) -> dict:

@@ -1,6 +1,7 @@
 """Monster lookup, spell lookup, class lookup, and treasure generation tools."""
 import io
 import json
+import re
 import sqlite3
 import sys
 from contextlib import redirect_stdout
@@ -32,6 +33,62 @@ def _has(row, col) -> bool:
     return col in row.keys()
 
 
+def active_monster_clause(conn) -> str:
+    """SQL condition that hides soft-deleted monsters (joke entries and the
+    like, marked with a `deleted_at` stamp rather than removed). A DB that
+    predates the column has nothing deleted."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(monsters)")}
+    return "deleted_at IS NULL" if "deleted_at" in cols else "1=1"
+
+
+def find_monster_rows(conn, name: str, limit: int = 10) -> list:
+    """Monsters matching `name`, best match first.
+
+    A bare substring match returned whichever row came first by id, which is
+    how "bat" produced the werebat. Ranking, in order: exact name; the
+    ", common" entry of that family ("bat, common"); the family's own entries
+    ("bat, large", "bat (ravenloft)"); names that start with it; names with it
+    as a whole word; any substring. Within a rank, rows that carry stats come
+    before stat-less family rows, then shorter names first."""
+    q = (name or "").strip().lower()
+    if not q:
+        return []
+    active = active_monster_clause(conn)
+    rows = conn.execute(
+        f"""SELECT * FROM monsters
+            WHERE {active} AND name LIKE ? COLLATE NOCASE
+            ORDER BY
+              CASE
+                WHEN lower(name) = ? THEN 0
+                WHEN lower(name) = ? || ', common' THEN 1
+                WHEN lower(name) LIKE ? || ', %' OR lower(name) LIKE ? || ' (%' THEN 2
+                WHEN lower(name) LIKE ? || '%' THEN 3
+                WHEN (' ' || replace(replace(replace(lower(name), ',', ' '),
+                                             '(', ' '), ')', ' ') || ' ')
+                     LIKE '% ' || ? || ' %' THEN 4
+                ELSE 5
+              END,
+              CASE WHEN coalesce(trim(hit_dice), '') = '' THEN 1 ELSE 0 END,
+              length(name), name
+            LIMIT ?""",
+        (f"%{q}%", q, q, q, q, q, q, limit),
+    ).fetchall()
+    if rows:
+        return rows
+    # Word-order fallback: "dragon, red" finds "red dragon" and
+    # "dragon, chromatic red" — every word present, shortest name first.
+    words = [w for w in re.findall(r"[a-z0-9']+", q) if len(w) > 1]
+    if len(words) < 2:
+        return []
+    likes = " AND ".join("lower(name) LIKE ?" for _ in words)
+    return conn.execute(
+        f"SELECT * FROM monsters WHERE {active} AND {likes} "
+        f"ORDER BY CASE WHEN coalesce(trim(hit_dice), '') = '' THEN 1 ELSE 0 END, "
+        f"length(name), name LIMIT ?",
+        [f"%{w}%" for w in words] + [limit],
+    ).fetchall()
+
+
 def _generate_treasure_text(types_list: list[str]) -> str:
     """Run treasure.generate_treasure for each type, capture printed output as a
     single string. Replaces the previous subprocess+regex approach."""
@@ -52,7 +109,10 @@ def register(mcp):
     def monster_lookup(name: str) -> dict:
         """Look up a monster by name in the AD&D 2e monster database.
         Returns stats including HD, THAC0, AC, damage, treasure type, morale, and XP value.
-        Supports partial/case-insensitive name matching."""
+        Case-insensitive; an exact name wins, then the family's ", common"
+        entry, then other partial matches. A partial match comes back with
+        `matched_on` and `other_matches` — check it is the creature you meant.
+        Soft-deleted entries (joke monsters) are never returned."""
         db_path = _find_db(_MONSTERS_DB_CANDIDATES)
         if db_path is None:
             return {"error": "monsters.db not found."}
@@ -60,16 +120,12 @@ def register(mcp):
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         try:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT * FROM monsters WHERE name LIKE ? COLLATE NOCASE",
-                (f"%{name}%",),
-            )
-            row = cur.fetchone()
-            if row is None:
+            rows = find_monster_rows(conn, name)
+            if not rows:
                 return {"error": f"No monster matching '{name}' found."}
+            row = rows[0]
 
-            return {
+            out = {
                 "name":              row["name"],
                 "climate_terrain":   row["climate_terrain"],
                 "frequency":         row["frequency"],
@@ -96,6 +152,15 @@ def register(mcp):
                 "categories":        json.loads(row["categories"]) if _has(row, "categories") and row["categories"] else [],
                 "source":            (row["source"] if _has(row, "source") else None),
             }
+            if row["name"].strip().lower() != name.strip().lower():
+                # A partial match: say so, and show what else it could have been.
+                out["matched_on"] = f"partial match for '{name}'"
+                out["other_matches"] = [r["name"] for r in rows[1:]]
+            elif not (row["hit_dice"] or "").strip():
+                # A family overview ("baboon") — the stats are on its variants.
+                out["matched_on"] = "family entry with no stat block — pick a variant"
+                out["other_matches"] = [r["name"] for r in rows[1:]]
+            return out
         finally:
             conn.close()
 

@@ -112,10 +112,13 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
 
         conn = db_get(_MONSTERS_DB)
 
-        where, params = "", []
+        live = any(r[1] == "deleted_at"
+                   for r in conn.execute("PRAGMA table_info(monsters)"))
+        clauses, params = (["deleted_at IS NULL"] if live else []), []
         if q:
-            where = "WHERE name LIKE ? COLLATE NOCASE"
+            clauses.append("name LIKE ? COLLATE NOCASE")
             params = [f"%{q}%"]
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         total = conn.execute(f"SELECT COUNT(*) FROM monsters {where}", params).fetchone()[0]
 

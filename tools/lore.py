@@ -3,6 +3,7 @@ import re
 import json
 from pathlib import Path
 import _campaign as _c
+from tools import class_xp as _xp
 
 
 def _read_safe(path: Path) -> str:
@@ -387,6 +388,8 @@ def register(mcp):
                                ("weapon", "weapon")):
                 if char.get(src) is not None:
                     entry[field] = char[src]
+            if _xp.is_multiclass(char):
+                entry["levels"] = _xp.class_levels(char)
             conds = cs.get("conditions") or []
             if conds:
                 entry["conditions"] = list(conds)

@@ -30,14 +30,7 @@ _CHA_LOYALTY_BASE = {
 
 
 def _resolve_npc(cfg: dict, slug: str) -> tuple[str | None, dict | None]:
-    s = slug.lower().strip()
-    npcs = cfg.get("npcs", {})
-    if s in npcs:
-        return s, npcs[s]
-    for k, v in npcs.items():
-        if k.lower().startswith(s) or v.get("label", "").lower().startswith(s):
-            return k, v
-    return None, None
+    return _c.resolve_npc(cfg, slug)
 
 
 def _cha_for(cfg: dict, key_or_label: str) -> int:

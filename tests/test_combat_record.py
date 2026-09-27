@@ -33,13 +33,17 @@ class EndCombatRecordTests(unittest.TestCase):
             _c("Goblin 2", "enemy", 0, 6),
             _c("Goblin 3", "enemy", 4, 4, ["fleeing"]),
             _c("Goblin 4", "enemy", 3, 5),
+            _c("Persis", "ally", 0, 8),
         ]}
         with mock.patch.object(combat, "_session", session):
             TempCampaign.register(combat)["end_combat"]()
         ev = [e for e in self.camp.events() if e["type"] == "combat"][-1]
         fates = {e["name"]: e["fate"] for e in ev["enemies"]}
-        self.assertEqual(fates, {"Goblin 1": "slain", "Goblin 2": "down",
-                                 "Goblin 3": "fled", "Goblin 4": "standing"})
+        # A monster at 0 hp is dead (DMG); an ally at 0 is only down.
+        self.assertEqual(fates, {"Goblin 1": "slain", "Goblin 2": "slain",
+                                 "Goblin 3": "fled", "Goblin 4": "standing",
+                                 "Persis": "down"})
+        # Only foes count toward XP; a fallen ally is not "defeated".
         self.assertEqual(ev["defeated"], {"goblin": 2})
 
 

@@ -167,15 +167,10 @@ def register(mcp):
         npc_slug  = ""
 
         if npc:
-            slug_key = npc.lower().strip()
-            npc_data = cfg.get("npcs", {}).get(slug_key)
-            if not npc_data:
-                # Try prefix match
-                for k, v in cfg.get("npcs", {}).items():
-                    if k.lower().startswith(slug_key) or v.get("label", "").lower().startswith(slug_key):
-                        npc_data = v
-                        slug_key = k
-                        break
+            known = set(cfg.get("npcs") or {})
+            slug_key, npc_data = _c.resolve_npc(cfg, npc)
+            if npc_data and slug_key not in known:
+                _c.save_campaign(cfg)   # registered from its character file
             if npc_data:
                 disp = int(npc_data.get("disposition", 0))
                 disposition_applied = disp // 20  # ±100 → ±5
@@ -189,7 +184,7 @@ def register(mcp):
                     rep = state.get("faction_state", {}).get(fac, {}).get("reputation", 0)
                     total_modifier += rep // 25  # ±100 → ±4
             else:
-                return {"error": f"NPC '{npc}' not found in campaign.json npcs."}
+                return {"error": f"NPC '{npc}' not found (no npcs entry, no character file)."}
 
         r1 = random.randint(1, 10)
         r2 = random.randint(1, 10)

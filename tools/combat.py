@@ -193,6 +193,39 @@ def _size_code(raw) -> str:
     return first if first in ("T", "S", "M", "L", "H", "G") else "M"
 
 
+_SIZE_RANK = {"T": 0, "S": 1, "M": 2, "L": 3, "H": 4, "G": 5}
+
+# Default size by race for a PC sheet with no `size` of its own (PHB: under
+# 4' is Small). Anything not listed is looked up in the monster DB by race
+# name ("minotaur" → L), and falls back to M.
+_RACE_SIZES = {
+    "human": "M", "elf": "M", "half-elf": "M", "halfelf": "M", "dwarf": "M",
+    "half-orc": "M", "halforc": "M", "orc": "M",
+    "halfling": "S", "gnome": "S", "kender": "S", "pixie": "S", "sprite": "T",
+    "brownie": "T", "goblin": "S", "kobold": "S",
+    "lizardfolk": "M", "lizard man": "M", "tabaxi": "M",
+    "bugbear": "L", "minotaur": "L", "ogre": "L",
+}
+
+
+def _size_rank(code) -> int:
+    return _SIZE_RANK.get(_size_code(code), 2)
+
+
+def _pc_size(char: dict) -> str:
+    """A PC's size code: the sheet's own `size`, else the race default."""
+    if char.get("size"):
+        return _size_code(char["size"])
+    race = str(char.get("race") or "").strip().lower()
+    if race in _RACE_SIZES:
+        return _RACE_SIZES[race]
+    if race:
+        stats = _monster_stats(race)
+        if stats and stats.get("size"):
+            return _size_code(stats["size"])
+    return "M"
+
+
 def _takes_large_damage(size_code: str) -> bool:
     return str(size_code or "M").lower() in _LARGE_SIZES
 
@@ -506,7 +539,7 @@ def _monster_stats(name: str) -> dict | None:
     slice of monster_lookup() without the multi-paragraph description, so
     setup_combat() can return every enemy's stats inline."""
     try:
-        from tools.lookup import _find_db, _MONSTERS_DB_CANDIDATES
+        from tools.lookup import _find_db, _MONSTERS_DB_CANDIDATES, find_monster_rows
     except Exception:
         return None
     db_path = _find_db(_MONSTERS_DB_CANDIDATES)
@@ -515,11 +548,8 @@ def _monster_stats(name: str) -> dict | None:
     try:
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM monsters WHERE name LIKE ? COLLATE NOCASE "
-            "ORDER BY length(name) LIMIT 1",
-            (f"%{name}%",),
-        ).fetchone()
+        rows = find_monster_rows(conn, name, limit=1)
+        row = rows[0] if rows else None
         conn.close()
     except Exception:
         return None
@@ -549,10 +579,18 @@ def _monster_stats(name: str) -> dict | None:
     }
 
 
-def _enemy_fate(c: dict) -> str:
-    """slain (below 0 hp), down (exactly 0), fled (fleeing), or standing."""
+def _is_dead(c: dict) -> bool:
+    """Dead, not merely down. Monsters die at 0 hp (DMG); the 0 to -9
+    unconscious-and-bleeding band is for the party and its allies."""
     hp = c.get("hp", 0)
-    if hp < 0:
+    return hp <= -10 or (c.get("side") == "enemy" and hp <= 0)
+
+
+def _enemy_fate(c: dict) -> str:
+    """slain (dead — a monster at 0 or below), down (an ally at exactly 0),
+    fled (fleeing), or standing."""
+    hp = c.get("hp", 0)
+    if hp < 0 or _is_dead(c):
         return "slain"
     if hp == 0:
         return "down"
@@ -574,7 +612,7 @@ def _enemy_record(combatants: list[dict]) -> tuple[list[dict], dict]:
         fate = _enemy_fate(c)
         enemies.append({"name": c["name"], "side": c.get("side", "enemy"),
                         "hp": c.get("hp"), "hp_max": c.get("hp_max"), "fate": fate})
-        if fate in ("slain", "down"):
+        if fate in ("slain", "down") and c.get("side", "enemy") == "enemy":
             kind = re.sub(r"\s+\d+$", "", c["name"]).strip().lower()
             defeated[kind] = defeated.get(kind, 0) + 1
     return enemies, defeated
@@ -620,7 +658,8 @@ def register(mcp):
                 "attacks_per_round": 1.0,
                 "attacks_made": 0,
                 "attacks_this_round": 0,
-                "size":         _size_code(char.get("size") or "M"),
+                "size":         _pc_size(char),
+                "ac_vs_larger": int(char.get("ac_vs_larger") or 0),
                 "side":         "party",
                 "init":         None,
                 "conditions":   conditions,
@@ -818,7 +857,8 @@ def register(mcp):
 
         condition options: 'rear' (+2 hit), 'charging' (+2 hit, AC penalty),
         'set_vs_charge' (double damage on hit), 'fleeing' (auto-hit).
-        HP floor: 0 = unconscious (stable), -1 to -9 = bleeding (1 HP/round), -10 = dead.
+        HP floor for the party and allies: 0 = unconscious (stable), -1 to -9 =
+        bleeding (1 HP/round), -10 = dead. Monsters (side "enemy") die at 0.
 
         weapon: pick one of the attacker's sheet attack blocks by name, matched
             case-insensitively on a substring — `weapon="undead"` selects
@@ -889,6 +929,11 @@ def register(mcp):
             else:
                 effective_roll = roll + hit_bonus
                 target_ac = tgt["ac"] + tgt_eff_ac
+                size_ac = int(tgt.get("ac_vs_larger") or 0)
+                if size_ac and _size_rank(atk.get("size")) > _size_rank(tgt.get("size")):
+                    target_ac -= size_ac
+                    notes.append(f"{tgt['name']} gets {size_ac:+d} AC against the larger "
+                                 f"{atk['name']} (size {_size_code(atk.get('size'))}).")
                 # No second +2 for a rear attack here: the bonus is already in
                 # hit_bonus above, and adding it to the target's AC as well was
                 # applying it twice (a net +4 on a documented +2).
@@ -923,7 +968,7 @@ def register(mcp):
             damage    = max(0, raw_dmg)
             tgt["hp"] = max(-10, tgt["hp"] - damage)
             hp_after  = tgt["hp"]
-            dead      = tgt["hp"] <= -10
+            dead      = _is_dead(tgt)
             downed    = tgt["hp"] <= 0
             if dead:
                 notes.append(f"{tgt['name']} is dead!")
@@ -983,7 +1028,7 @@ def register(mcp):
         hp_before = c["hp"]
         c["hp"]   = max(-10, c["hp"] - amount)
         downed    = c["hp"] <= 0
-        dead      = c["hp"] <= -10
+        dead      = _is_dead(c)
 
         result = {
             "name":            c["name"],
@@ -1198,7 +1243,7 @@ def register(mcp):
         combatants_out = []
         for i, c in enumerate(_session["combatants"]):
             status = "active"
-            if c["hp"] <= -10:
+            if _is_dead(c):
                 status = "dead"
             elif c["hp"] <= 0:
                 status = "unconscious"
@@ -1507,7 +1552,9 @@ def register(mcp):
 
         Actions whose attacker is already down (HP <= 0) are skipped and
         reported rather than rolled, so a round declared up-front stays honest
-        when someone drops mid-round. Anything that isn't a plain weapon attack
+        when someone drops mid-round. So are actions against a target that is
+        already dead: the result lists `living_foes`, and the replacement swing
+        is resolve_attack(attacker, new_target, advance=False). Anything that isn't a plain weapon attack
         — spells, turning undead, saves, fleeing — still needs its own call;
         split the round around it.
 
@@ -1544,9 +1591,27 @@ def register(mcp):
             if atk["hp"] <= 0:
                 results.append({
                     "attacker": atk["name"],
-                    "skipped":  "down — cannot act"
-                            if atk["hp"] > -10 else "dead — cannot act",
+                    "skipped":  "dead — cannot act" if _is_dead(atk)
+                            else "down — cannot act",
                 })
+                continue
+            tgt = _find_combatant(target)
+            if tgt is not None and _is_dead(tgt):
+                # Declared against a foe that fell earlier this round: roll
+                # nothing rather than spend a swing on a corpse. The attacker's
+                # segment passes so initiative stays in step; their replacement
+                # attack is a resolve_attack(..., advance=False) on a new target.
+                entry = {
+                    "attacker": atk["name"],
+                    "target":   tgt["name"],
+                    "skipped":  "target already dead — attack not rolled",
+                    "living_foes": [c["name"] for c in _session["combatants"]
+                                    if c["side"] != atk["side"] and not _is_dead(c)
+                                    and c["hp"] > 0],
+                }
+                if act.get("advance", True):
+                    entry["next"] = next_turn()
+                results.append(entry)
                 continue
             r = resolve_attack(
                 attacker=attacker,

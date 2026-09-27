@@ -338,11 +338,250 @@ def build_row(title: str, wikitext: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------- #
+# Multi-creature pages
+# --------------------------------------------------------------------------- #
+# A page that covers a family ("Bat", "Baboon") carries its stat blocks in one
+# of two shapes the single-infobox reader above never saw:
+#
+#   1. numbered infobox fields — ``name1 = Wild Baboon | hitdice1 = 1+1 |
+#      name2 = Banderlog | hitdice2 = 4`` — one index per creature;
+#   2. an article table after an empty infobox — a header row of variant names
+#      and one ``! Hit Dice: | … | …`` row per stat, one column per creature.
+#
+# Both produce one row per variant. The family row the old importer wrote
+# (name only, no stats) is left alone as the overview entry.
+
+# Article-table row label (lower-cased, trailing colon stripped) -> column.
+_TABLE_FIELD_MAP = {
+    "climate/terrain": "climate_terrain", "terrain": "climate_terrain",
+    "frequency": "frequency",
+    "no. appearing": "no_appearing", "number appearing": "no_appearing",
+    "armor class": "armor_class", "armour class": "armor_class",
+    "movement": "move",
+    "hit dice": "hit_dice",
+    "thac0": "thac0",
+    "% in lair": "pct_in_lair",
+    "treasure": "treasure_type", "treasure type": "treasure_type",
+    "no. of attacks": "no_of_attacks", "number of attacks": "no_of_attacks",
+    "damage/attack": "damage_attack", "damage/attacks": "damage_attack",
+    "special attacks": "special_attacks",
+    "special defenses": "special_defenses", "special defences": "special_defenses",
+    "magic resistance": "magic_resistance", "magical resistance": "magic_resistance",
+    "intelligence": "intelligence",
+    "alignment": "alignment",
+    "size": "size",
+    "psionic ability": "psionic_ability",
+    "attack/defense modes": "attack_defense_modes",
+    "morale": "morale",
+    "xp value": "xp_value", "xp": "xp_value",
+}
+
+_STAT_COLUMNS = tuple(dict.fromkeys(
+    list(_FIELD_MAP.values()) + list(_TABLE_FIELD_MAP.values())))
+
+
+def _indexed_key(key: str) -> tuple[str, str]:
+    """Split an infobox key into (field, index): 'hitdice2' -> ('hitdice', '2').
+
+    'thac0' ends in a digit that belongs to the name, so it is split by hand —
+    a generic trailing-digits split would read 'thac01' as ('thac', '01')."""
+    if key.startswith("thac0"):
+        return "thac0", key[5:]
+    m = re.fullmatch(r"(.*?[a-z])(\d*)", key)
+    return (m.group(1), m.group(2)) if m else (key, "")
+
+
+def variant_name(base: str, variant: str) -> str:
+    """'bat' + 'Common' -> 'bat, common'; 'baboon' + 'Wild Baboon' -> 'wild baboon'.
+
+    A variant label that already contains the family's head noun stands on its
+    own; a bare qualifier is appended to the family name, the MM's own
+    'bat, common' form. A '(various)' tag on the family name is dropped, so
+    the Bat page's columns land on the 'bat, common' the MM rows already use."""
+    base = re.sub(r"\s*\(various\)\s*$", "", (base or "").strip().lower())
+    v = re.sub(r"\s+", " ", clean_markup(variant or "")).strip().lower()
+    if not v:
+        return base
+    if not base or v == base:
+        return v
+    head = [w for w in re.findall(r"[a-z]+", re.sub(r"\(.*?\)", "", base))
+            if len(w) > 2]
+    if head and head[-1] in re.findall(r"[a-z]+", v):
+        return v
+    return f"{base}, {v}"
+
+
+def _base_row(name: str, body: str, categories: list[str], src: str) -> dict:
+    row = {c: None for c in _ALL_COLUMNS}
+    row["name"] = name
+    row["description"] = body or None
+    row["categories"] = json.dumps(categories) if categories else None
+    row["source"] = f"{src} ({_SOURCE_TAG})" if src else _SOURCE_TAG
+    return row
+
+
+def _set_stat(row: dict, col: str, raw: str) -> None:
+    val = clean_markup(raw or "").replace("&nbsp;", " ").strip()
+    val = re.sub(r"\s*\n\s*", "; ", val)
+    if not val:
+        return
+    row[col] = _parse_thac0(val) if col == "thac0" else val
+
+
+def _split_cells(line: str) -> list[str]:
+    """One wikitable line ('! a !! b' / '| a || b') into its cell values,
+    dropping 'style=…|' attribute prefixes and splitting stray <th> tags."""
+    line = re.sub(r"<t[hd][^>]*>", "!!", line[1:])
+    cells = []
+    for part in re.split(r"!!|\|\|", line):
+        head, sep, tail = part.partition("|")
+        if sep and "[[" not in head and "{{" not in head and "=" in head:
+            part = tail
+        cells.append(part.replace("{{br}}", " ").strip())
+    return cells
+
+
+def parse_stat_tables(wikitext: str) -> list[tuple[list[str], dict[str, list[str]]]]:
+    """Every ``{| … |}`` table that has a Hit Dice row, as
+    (variant names from the header row, {label: [value per column]})."""
+    out = []
+    for m in re.finditer(r"\{\|(.*?)\n\|\}", wikitext, re.S):
+        header: list[str] | None = None
+        fields: dict[str, list[str]] = {}
+        for chunk in re.split(r"\n\|-[^\n]*", m.group(1)):
+            cells: list[tuple[str, str]] = []
+            for ln in chunk.split("\n"):
+                ln = ln.strip()
+                if ln[:1] in ("!", "|") and not ln.startswith("|+"):
+                    cells += [(ln[0], c) for c in _split_cells(ln)]
+            if not cells:
+                continue
+            if header is None and all(t == "!" for t, _ in cells):
+                header = [c for _, c in cells]
+                continue
+            label = clean_markup(cells[0][1]).rstrip(": ").strip().lower()
+            fields[label] = [c for _, c in cells[1:]]
+        if "hit dice" in fields:
+            out.append((header or [], fields))
+    return out
+
+
+def build_rows(title: str, wikitext: str) -> list[dict]:
+    """Every creature on a page: the plain single-infobox row (as build_row),
+    one row per numbered infobox index, and one row per article-table column.
+    Returns [] for redirects and pages with no creature infobox."""
+    if re.match(r"\s*#redirect", wikitext or "", re.IGNORECASE):
+        return []
+    rows: list[dict] = []
+    rest, seen_any = wikitext, False
+    while True:
+        inner, end = _find_template(rest, "Creature")
+        if inner is None:
+            break
+        seen_any = True
+        fields = parse_infobox(inner)
+        tail = rest[end:]
+        nxt = re.search(r"\{\{\s*Creature\b", tail, re.IGNORECASE)
+        section = tail[:nxt.start()] if nxt else tail
+        rest = tail
+
+        base = (clean_markup(fields.get("name", "")) or title).strip().lower()
+        body, categories, _ = split_metadata(clean_markup(section))
+        # Only the text before the first stat table is description.
+        body = re.split(r"\n\{\|", body)[0].strip() if body else body
+
+        by_index: dict[str, dict[str, str]] = {}
+        for k, v in fields.items():
+            f, idx = _indexed_key(k)
+            by_index.setdefault(idx, {})[f] = v
+        numbered = sorted((i for i in by_index if i), key=int)
+
+        if numbered:
+            for i in numbered:
+                f = by_index[i]
+                if not any(k in f for k in _FIELD_MAP):
+                    continue
+                row = _base_row(variant_name(base, f.get("name", "")), body, categories,
+                                clean_markup(f.get("source", "") or fields.get("source", "")))
+                for wiki_key, col in _FIELD_MAP.items():
+                    _set_stat(row, col, f.get(wiki_key, ""))
+                rows.append(row)
+        else:
+            plain = build_row(title, "{{" + inner + "}}" + section)
+            if plain is not None:
+                plain["description"] = body or None
+                rows.append(plain)
+
+        for header, tfields in parse_stat_tables(section):
+            ncols = len(tfields["hit dice"])
+            names = header[1:] if len(header) > ncols else header
+            for c in range(ncols):
+                label = names[c] if c < len(names) else ""
+                row = _base_row(variant_name(base, label) if ncols > 1 else base,
+                                body, categories,
+                                clean_markup(fields.get("source", "")))
+                for tlabel, vals in tfields.items():
+                    col = _TABLE_FIELD_MAP.get(tlabel)
+                    if col and c < len(vals):
+                        _set_stat(row, col, vals[c])
+                rows.append(row)
+    if not seen_any:
+        return []
+    out, seen = [], set()
+    for r in rows:
+        if not r["name"] or r["name"] in seen:
+            continue
+        if ("general information" in r["name"] or r["name"].endswith(", general")
+                or r["name"].endswith(" (general)") or "overview" in r["name"]):
+            continue
+        seen.add(r["name"])
+        out.append(r)
+    return out
+
+
+def has_stats(row) -> bool:
+    return bool((row["hit_dice"] if row["hit_dice"] is not None else "").strip())
+
+
+def name_variants(name: str) -> set[str]:
+    """Spellings a creature may already be recorded under: 'bat, common',
+    'common bat', 'bat (common)'."""
+    out = {name}
+    base, sep, var = name.partition(", ")
+    if sep:
+        out |= {f"{var} {base}", f"{base} ({var})"}
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # DB
 # --------------------------------------------------------------------------- #
 def existing_names(conn) -> set[str]:
     return {r[0].strip().lower()
             for r in conn.execute("SELECT name FROM monsters WHERE name IS NOT NULL")}
+
+
+def statless_names(conn) -> set[str]:
+    """Recorded creatures with no hit dice — the rows a multi-creature page
+    produced before its numbered fields and stat tables were read."""
+    return {r[0].strip().lower() for r in conn.execute(
+        "SELECT name FROM monsters WHERE name IS NOT NULL "
+        "AND coalesce(trim(hit_dice), '') = ''")}
+
+
+def fill_stats(conn, row: dict) -> int:
+    """Write a parsed row's stat columns into the recorded creature of the same
+    name, only where that row has nothing. Description, source and categories
+    are kept. Returns the number of rows updated."""
+    cols = [c for c in _STAT_COLUMNS if row.get(c) not in (None, "")]
+    if not cols:
+        return 0
+    sets = ", ".join(f"{c} = coalesce(nullif(trim({c}), ''), ?)" for c in cols)
+    cur = conn.execute(
+        f"UPDATE monsters SET {sets} WHERE lower(trim(name)) = ? "
+        f"AND coalesce(trim(hit_dice), '') = ''",
+        [row[c] for c in cols] + [row["name"]])
+    return cur.rowcount
 
 
 def next_id(conn) -> int:
@@ -397,25 +636,37 @@ def main(argv: list[str] | None = None) -> int:
                   end="\r", flush=True)
         print()
 
-        # Build rows for creatures not already recorded.
+        # Build rows for creatures not already recorded; collect stats for
+        # recorded ones that came in without any (multi-creature pages).
+        statless = statless_names(conn)
         new_rows: list[dict] = []
+        backfills: list[dict] = []
         seen: set[str] = set()
         skipped_existing = skipped_nodata = 0
         for title in titles:
             wt = wikitexts.get(title)
-            row = build_row(title, wt) if wt else None
-            if row is None:
+            rows = build_rows(title, wt) if wt else []
+            if not rows:
                 skipped_nodata += 1
                 continue
-            key = row["name"]
-            if key in have or key in seen:
-                skipped_existing += 1
-                continue
-            seen.add(key)
-            new_rows.append(row)
+            for row in rows:
+                key = row["name"]
+                if key in seen:
+                    continue
+                seen.add(key)
+                if key in statless and has_stats(row):
+                    backfills.append(row)
+                elif name_variants(key) & have:
+                    skipped_existing += 1
+                elif has_stats(row) or len(rows) == 1:
+                    new_rows.append(row)
 
-        print(f"{len(new_rows)} new creatures (skipped {skipped_existing} "
-              f"already-recorded, {skipped_nodata} redirects/non-creature).")
+        print(f"{len(new_rows)} new creatures, {len(backfills)} recorded creatures "
+              f"to fill in (skipped {skipped_existing} already-recorded, "
+              f"{skipped_nodata} redirects/non-creature).")
+        if args.verbose:
+            for row in backfills:
+                print(f"  ~ {row['name']}  (HD {row['hit_dice']})")
 
         # Resolve image URLs in bulk.
         url_map: dict[str, str] = {}
@@ -447,11 +698,19 @@ def main(argv: list[str] | None = None) -> int:
             if args.verbose and inserted % 50 == 0:
                 print(f"  …{inserted} inserted", end="\r", flush=True)
 
+        filled = 0
+        for row in backfills:
+            if not args.dry_run:
+                filled += fill_stats(conn, row)
+            else:
+                filled += 1
+
         if not args.dry_run:
             conn.commit()
 
         verb = "would insert" if args.dry_run else "inserted"
-        print(f"\nDone. {verb} {inserted} creatures; downloaded {images} images.")
+        print(f"\nDone. {verb} {inserted} creatures, filled in {filled}; "
+              f"downloaded {images} images.")
         if args.dry_run:
             print("(dry run — nothing written)")
         return 0

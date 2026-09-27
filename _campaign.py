@@ -347,6 +347,47 @@ def char_key_for(cfg: dict, label: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
+def resolve_npc(cfg: dict, slug: str, register: bool = True) -> tuple[str | None, dict | None]:
+    """Find a named NPC in campaign.json['npcs'] by slug or label (exact, then
+    prefix), falling back to its characters/<slug>.md file.
+
+    introduce_npc writes the file; older campaigns have NPCs with a file and no
+    npcs entry, which hire(), loyalty_check() and reaction(npc=) used to reject
+    as unknown. With `register`, such an NPC gets a minimal {label, slug} entry
+    here — the same stub set_disposition has always written — and the caller
+    saves cfg. PCs are never registered as NPCs."""
+    s = (slug or "").lower().strip()
+    if not s:
+        return None, None
+    npcs = cfg.setdefault("npcs", {})
+    if s in npcs:
+        return s, npcs[s]
+    for k, v in npcs.items():
+        if v.get("label", "").lower() == s:
+            return k, v
+    for k, v in npcs.items():
+        if k.lower().startswith(s) or v.get("label", "").lower().startswith(s):
+            return k, v
+    if not register or s in (cfg.get("characters") or {}):
+        return None, None
+    md = cfg["_data_dir"] / "characters" / f"{s}.md"
+    if not md.exists():
+        return None, None
+    first = md.read_text(encoding="utf-8").splitlines()[:1]
+    label = (first[0].lstrip("#").strip() if first else "") or s
+    npcs[s] = {"label": label, "slug": s}
+    return s, npcs[s]
+
+
+_STAT_BLOCK_KEYS = ("hp_max", "ac", "thac0", "cls", "level", "attacks")
+
+
+def has_stat_block(npc: dict | None) -> bool:
+    """True when an npcs entry carries mechanics, not just the {label, slug}
+    registration stub — sheet writers must not render a stub over the prose."""
+    return bool(npc) and any(npc.get(k) not in (None, "", []) for k in _STAT_BLOCK_KEYS)
+
+
 def marching_order(cfg: dict) -> list[str]:
     """Character keys front to back.
 
@@ -388,7 +429,8 @@ def write_character_sheet(cfg: dict, key: str, char: dict):
     cls    = char.get("cls", "")
     race   = char.get("race", "human").title()
     gender = char.get("gender", "").title()
-    level  = char.get("level", 0)
+    from tools import class_xp as _xp   # local: tools/ imports this module
+    level  = _xp.level_label(char) if char.get("level") else ""
     hp_max = char.get("hp_max", 0)
     ac     = char.get("ac", 0)
 

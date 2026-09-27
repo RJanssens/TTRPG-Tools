@@ -64,7 +64,7 @@ Each of these runs a mandated sequence server-side, in order, and returns every 
 
 - `setup_combat(enemies=[{name, count}], party_modifier, enemy_modifier)` — the whole encounter stand-up. Returns each enemy's rolled HP plus AC/THAC0/damage, **morale rating, treasure type, intelligence and specials**, the surprise result and the initiative order. Pass `hp`/`ac`/`dmg`/`morale` per type to override the DB; pass `initiative=False` when casters still owe `declare_spell`. Read its `notes` — it flags "by weapon" damage lines and multi-attack creatures rather than guessing.
 - `resolve_attack(attacker, target, condition, weapon)` — attack roll, damage, HP, morale trigger, `next_turn`. Damage uses the S/M or the **Large** die automatically from the target's recorded size, and per-round attack entitlements are tracked: a 3/2 specialist keeps their segment for the second swing, so the turn advances only when their attacks are spent (`advance=False` never advances). `weapon="undead"` picks that attack block off the sheet — its own THAC0 and dice.
-- `combat_round([{attacker, target, condition}, …])` — a full round, resolved **in initiative order** regardless of the order you list them (`order="given"` to sequence by hand). Skips and reports actors who are already down.
+- `combat_round([{attacker, target, condition}, …])` — a full round, resolved **in initiative order** regardless of the order you list them (`order="given"` to sequence by hand). Skips and reports actors who are already down, and swings declared against a target that is already dead (the result lists `living_foes`; the replacement swing is `resolve_attack(attacker, new_target, advance=False)`).
 - `scout(character, checks, minutes, terrain)` — the skill checks, then the encounter check, then the clock. Defaults to Move Silently / Hide in Shadows / Detect Noise; name the checks the fiction actually calls for.
 - `council(npcs=[{npc, modifier, interest}], base_modifier)` — `reaction()` per NPC for Hard Constraint #4. The modifier is that NPC's **interest cost** for this proposal, not how much they like the party; `interest` records why. Three or more conflicting interests should disagree.
 - `batch([{tool, args}, …])` — any ordered run of calls whose arguments are all known up front: `advance_time` → `check_encounter` → `consume`, or `add_inventory` across the party. Max 25 steps, stops at the first error by default. Not for chains where a later call needs an earlier result — use the purpose-built composite there.
@@ -94,6 +94,10 @@ Published-module content (UK3, WGR1, etc.) is **DM-only reference**, not in-fict
 When a setup paragraph would require enumerating enemies-by-room or predicting NPC behaviour, stop and rewrite as: "the party can see/hear/sense X; the rest is unknown until they act."
 
 Module text: `module_lookup(query, section)`; never read `reference/` with Bash or Read.
+
+**Contents come from the source, not from memory.** Before describing what is in a room, container, satchel, corpse or cache, read it: `room.perceived` from `move_party`/`room`, or `module_lookup` for the keyed entry. What you remember of a module is not a source. An invented crowbar or a misplaced stair gets acted on by the player before anyone notices, and the retcon costs more than the lookup would have. If the module says nothing, roll or decide deliberately and record it with `note_room`. Don't improvise the contents and "fix it later".
+
+**Tool trouble stays out of the scene.** When a tool misbehaves mid-play, work around it silently and keep a list. Raise it OOC only at a natural break, and word it so it names nothing the characters haven't identified. *"`monster_lookup('bat')` returned the werebat"* in the same turn as unexplained wingbeats behind a door tells the player what is out there, and that it came off a wandering-monster table. That is a Hard Constraint #5 leak, however helpful the note is meant to be.
 
 ---
 
@@ -273,7 +277,7 @@ The step-by-step form below is what those composites run, and what to fall back 
 
 **Weapons come off the sheet.** `start_combat` builds each PC from their `attacks[]` array — per-weapon THAC0, weapon speed, attacks per round, and both damage dice, with STR/magic/specialisation already folded in. It returns each PC's active weapon and their `alternates`; switch with `weapon=` on `attack`/`resolve_attack` (substring match, sticks until changed). Don't add STR or magic bonuses on top of what a block reports — they are already in it.
 
-**Damage dice follow target size.** A long sword rolls 1d8 against an orc and 1d12 against a troll (PHB Table 44). The tracker picks the die from the target's recorded size, so don't restate or override it in prose. `setup_combat` reads size from the monster entry; pass `size=` on `add_combatant` for anything hand-built.
+**Damage dice follow target size.** A long sword rolls 1d8 against an orc and 1d12 against a troll (PHB Table 44). The tracker picks the die from the target's recorded size, so don't restate or override it in prose. `setup_combat` reads size from the monster entry; pass `size=` on `add_combatant` for anything hand-built. PCs take `size` from their sheet, else from their race (pixie S, minotaur L); a PC whose race gives AC against bigger attackers (a pixie's +2 vs Medium or larger) carries `ac_vs_larger`, which the tracker applies on every attack. Set both with `update_stats(key, size=, ac_vs_larger=)`. Don't hand-apply it with an effect.
 
 **Read `warnings` from `start_combat`.** A PC with no usable `attacks[]` entry falls back to 1d6 and is named there. Fix the sheet rather than narrating around it.
 
@@ -317,7 +321,7 @@ Call `check_encounter(terrain)` every 10 min of dungeon exploration, every 4 hrs
 
 After every combat or significant encounter:
 1. `log_note(text)` — brief summary of what happened
-2. `award_xp(character, amount)` — 65 XP per standard enemy (HD×15 for non-standard), 100–300 for objectives
+2. `award_xp(character, amount)` — each enemy's XP value from its monster entry (see Experience Points), 100–300 for objectives
 3. `advance_calendar(days)` if time passed
 4. If spells were cast: verify `cast_spell(character, spell)` was called for each — it marks the spell **and** spends the slot. `use_spell_slot` is only for casts outside the memorised list (innate ability, scroll, wand); calling both charges the slot twice.
 5. `end_combat()` if in combat tracker (saves HP automatically)
@@ -334,7 +338,7 @@ After rest:
 
 - Roll dice honestly. Report the result. Do not fudge. See Hard Constraint #1 (die-first).
 - **Read stats; never archetype-guess.** Ability scores, HP, THAC0, saves, XP thresholds, slots come from `get_character` (its header surfaces canonical mechanics from `campaign.json`) or `class_lookup` — never from "typical fighter CON 17." `session_primer` already carries each PC's class/level/HP/AC/THAC0, and `get_character(slug, brief=True)` returns the mechanics header plus the opening section instead of the whole sheet — use the full read when the prose matters, not to look up a number you already have. A *"typically/likely/tentative"* before a number that exists in the data is the tell: stop and read the source. Matters most at level-up, where a guessed CON corrupts HP.
-- **HP thresholds:** 0 HP = unconscious and stable (can't act, not dying). −1 to −9 HP = unconscious and bleeding (loses 1 HP per round automatically at each new round — handled by `next_turn()`). −10 HP = dead. Do not soften any of these outcomes.
+- **HP thresholds (PCs and allies):** 0 HP = unconscious and stable (can't act, not dying). −1 to −9 HP = unconscious and bleeding (loses 1 HP per round automatically at each new round — handled by `next_turn()`). −10 HP = dead. **Monsters die at 0.** The tracker marks any `enemy` at 0 or below as dead. Do not soften any of these outcomes.
 - Treasure: always `monster_lookup(name)` for treasure type, then `generate_treasure(type)`. Never invent amounts.
 - Reaction rolls: always `reaction()` for first NPC encounters and for *each NPC in a council/vote scene* (see Hard Constraint #4). Don't skip it because you have a narrative preference.
 - Morale: always `morale_check(rating)` at 50% casualties. Enemies who break, flee.
@@ -380,9 +384,11 @@ Per Hard Constraint #1: roll *before* writing the outcome. If your prose already
 
 Award at natural break points (end of encounter, objective, session) — never mid-scene.
 
-- Standard enemy: 65 XP (or HD × 15 for unusual creatures); objective: 100–300 XP by difficulty; exceptional roleplay/clever solution: 25–50 XP bonus.
+- Enemies: the **XP value in the creature's monster entry** (`monster_lookup` / `setup_combat` return it: 15 for a goblin, 175 for a stirge), split among the party. Use 65 (or HD × 15 for unusual creatures) only when the entry has no value. Objective: 100–300 XP by difficulty; exceptional roleplay/clever solution: 25–50 XP bonus.
 
 **Do not inflate bonuses to mark a clean victory** — no "campaign-pivot creativity bonus." A clever plan earned the roll that produced the win (Hard Constraint #2); the XP still follows standard rates.
+
+**Multi-class characters** ("Fighter/Thief") split every award evenly between their classes, and each class levels on its own table. `award_xp` still takes the whole award; its `xp_by_class` shows each class's share and the hint names the class that levelled. Level them with `update_stats(key, levels={"fighter": 1, "thief": 2})`, not `level=`.
 
 ---
 
@@ -410,7 +416,7 @@ Prefer these over recalling rules from training data. Full signatures are in the
 - `rules_lookup(query, source?)` / `rules_section(source, section)` — FTS5 search over PHB/DMG/MM, then fetch a section's body. Use BEFORE narrating a rule the player might dispute.
 - `spell_lookup(name, caster?)` — casting time/init, range, AOE, duration, save, components. **Per Hard Constraint #2: call for every spell named in a player plan before ratifying it.**
 - `class_lookup(class_name, level)` — THAC0, saves, slots, XP progression (`level=0` for full table). Use at level-up or when setting a save.
-- `monster_lookup(name)` — stats, treasure type, morale, XP. `item_lookup(name, ...)` / `item_update(item_id, rarity?)` — equipment & magic-item details; set rarity when stocking stores/treasure.
+- `monster_lookup(name)` — stats, treasure type, morale, XP. An exact name wins, then the family's `, common` entry ("bat" → "bat, common", not the werebat). A partial match, or a family row with no stat block ("baboon"), comes back with `matched_on` and `other_matches`, so read them and pick the creature you meant. Joke entries (Dragon's April issues) are soft-deleted and never returned; `tools/soft_delete_monsters.py` manages that list. `item_lookup(name, ...)` / `item_update(item_id, rarity?)` — equipment & magic-item details; set rarity when stocking stores/treasure.
 - `ability_lookup(ability, score?)` — derived attributes (bend bars, system shock, bonus priest spells, henchmen cap, adjustments). Use before any ability-driven ruling (open doors, languages, save vs poison, illusion immunity, regen). Omit `score` for the full table.
 - `proficiency_lookup(name?, group?, ability?)` / `proficiency_groups(class_name?)` — PHB Tables 37/38. A proficiency check is d20 ≤ (ability + modifier).
 - `turning_undead(level, undead?|hd?, role?)` — DMG Table 47; returns the d20 target + decoded cell (number / `T` / `D` / `D*` / `—`). `role="paladin"` reads level-2. Use whenever a priest/paladin turns.

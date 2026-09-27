@@ -547,10 +547,14 @@ def build(db_path: Path, max_per_table: int) -> dict:
             r[1] == "categories" for r in conn.execute("PRAGMA table_info(monsters)")
         )
         cat_col = "categories" if has_categories else "NULL AS categories"
+        has_deleted = any(
+            r[1] == "deleted_at" for r in conn.execute("PRAGMA table_info(monsters)")
+        )
+        live = " AND deleted_at IS NULL" if has_deleted else ""
         rows = conn.execute(
             f"SELECT name, frequency, no_appearing, hit_dice, climate_terrain, "
             f"intelligence, description, xp_value, {cat_col} FROM monsters "
-            f"WHERE name IS NOT NULL"
+            f"WHERE name IS NOT NULL{live}"
         ).fetchall()
     finally:
         conn.close()

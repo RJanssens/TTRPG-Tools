@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 import _campaign as _c
 import names
+from tools import class_xp as _xp
 
 BASE_DIR = Path(__file__).parent.parent
 _2E_DB   = BASE_DIR / "global" / "2e.db"
@@ -53,6 +54,10 @@ def _sync_combatant(key: str, char: dict, changes: dict) -> bool:
             return False
         if "ac" in changes:
             c["ac"] = char["ac"]
+        if "size" in changes:
+            c["size"] = char["size"]
+        if "ac_vs_larger" in changes:
+            c["ac_vs_larger"] = int(char.get("ac_vs_larger") or 0)
         if "hp_max" in changes:
             c["hp_max"] = char["hp_max"]
             c["hp"] = min(c["hp"], char["hp_max"])
@@ -110,7 +115,7 @@ def _mechanics_block(char: dict) -> str:
     ident = " · ".join(p for p in [
         f"{race[:1].upper()}{race[1:]} {cls}".strip() if race else cls,
         char.get("alignment") or "",
-        f"Level {level}" if level is not None else "",
+        f"Level {_xp.level_label(char)}" if level is not None else "",
         f"HP {char['hp_max']}" if char.get("hp_max") is not None else "",
         f"AC {char['ac']}"     if char.get("ac")     is not None else "",
         f"THAC0 {char['thac0']}" if char.get("thac0") is not None else "",
@@ -211,6 +216,11 @@ def register(mcp):
 
         content = f"# {name}\n*{race_line}*\n\n## Status\nAlive\n\n## Notes\n\n"
         (chars_dir / f"{slug}.md").write_text(content, encoding="utf-8")
+
+        # Register the NPC so hire(), loyalty_check() and reaction(npc=) can
+        # find it without a stat block first.
+        cfg.setdefault("npcs", {})[slug] = {"label": name, "slug": slug, "race": race}
+        _c.save_campaign(cfg)
 
         _c.append_event(cfg, {
             "type":  "npc_met",
@@ -318,6 +328,7 @@ def register(mcp):
         thac0: int | None = None,
         hp_max: int | None = None,
         level: int | None = None,
+        levels: dict = None,
         saves: list = None,
         attacks: list = None,
         ability_scores: dict = None,
@@ -327,6 +338,8 @@ def register(mcp):
         natural_abilities: list = None,
         movement_rate: int | None = None,
         alignment: str = "",
+        size: str = "",
+        ac_vs_larger: int | None = None,
         reason: str = "",
     ) -> dict:
         """Change a PC's or NPC's stored mechanics in place: AC after new armour,
@@ -335,8 +348,15 @@ def register(mcp):
 
         key:    PC key or label (prefix match), else an NPC slug that already
                 has a stat block (NPCs without one use set_npc_stats first)
+        levels: multi-class only — per-class levels, e.g. {"fighter": 2, "thief": 3}
+                for a Fighter/Thief. Every class in `cls` must be named; `level`
+                is then set to the highest of them. Pass the full new list.
         saves:  five ints in PP&D/RSW/PETR/BREATH/SPELL order, or [{type, value}]
         attacks / inventory / lists: replace the whole list — pass the full new list
+        size:   T/S/M/L/H/G — the die attackers roll against this character
+                (a sheet with no size takes its race's default)
+        ac_vs_larger: AC bonus against attackers bigger than this character
+                (a pixie's +2 vs Medium or larger), applied in every attack
         reason: one line for the chronicle ("plate mail and shield")
 
         Lowering hp_max clamps current HP to it; raising it leaves current HP
@@ -350,7 +370,7 @@ def register(mcp):
             slug = key.lower().strip()
             record = cfg.get("npcs", {}).get(slug)
             pc_key, kind = slug, "npc"
-            if record is None:
+            if not _c.has_stat_block(record):
                 if (cfg["_data_dir"] / "characters" / f"{slug}.md").exists():
                     return {"error": f"NPC '{slug}' has no stat block yet — use set_npc_stats."}
                 return {"error": f"No PC or NPC '{key}' found."}
@@ -361,7 +381,29 @@ def register(mcp):
             "inventory": inventory, "weapon_profs": weapon_profs, "nwps": nwps,
             "natural_abilities": natural_abilities, "movement_rate": movement_rate,
             "alignment": alignment or None,
+            "ac_vs_larger": ac_vs_larger,
         }
+        if levels is not None:
+            classes = _xp.component_classes(record.get("cls", ""))
+            if len(classes) < 2:
+                return {"error": "levels is for multi-class characters — use level."}
+            try:
+                norm_lv = {str(k).strip().lower(): int(v) for k, v in levels.items()}
+            except (AttributeError, TypeError, ValueError):
+                return {"error": "levels must map each class to an int, e.g. {\"fighter\": 2}."}
+            if set(norm_lv) != set(classes) or any(v < 1 for v in norm_lv.values()):
+                return {"error": f"levels must give a level >= 1 for each of: {', '.join(classes)}."}
+            if level is not None and level != max(norm_lv.values()):
+                return {"error": "level must be the highest of levels — or leave it out."}
+            wanted["levels"] = {c: norm_lv[c] for c in classes}
+            wanted["level"] = max(norm_lv.values())
+        elif level is not None and _xp.is_multiclass(record):
+            return {"error": "Multi-class character — pass levels={class: level, ...}, not level."}
+        if size:
+            code = size.strip()[:1].upper()
+            if code not in ("T", "S", "M", "L", "H", "G"):
+                return {"error": "size must be T, S, M, L, H or G."}
+            wanted["size"] = code
         if saves is not None:
             norm = _c.normalize_saves(saves)
             if not norm:
@@ -563,7 +605,10 @@ def register(mcp):
         To change a stat, use update_stats — it rewrites the sheet itself.
         This is for a sheet that has drifted from campaign.json."""
         cfg = _c.load_campaign()
-        char = cfg.get("characters", {}).get(key) or cfg.get("npcs", {}).get(key)
+        char = cfg.get("characters", {}).get(key)
+        if not char:
+            npc = cfg.get("npcs", {}).get(key)
+            char = npc if _c.has_stat_block(npc) else None
         if not char:
             return {
                 "error": (
