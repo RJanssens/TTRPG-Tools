@@ -625,3 +625,40 @@ class ReadTimeErrorTests(unittest.TestCase):
             dp.campaign_room("c", "m", "39", timeout=3.0)
             dp.campaign_known("c", "m", timeout=3.0)
         self.assertEqual(seen, [3.0, 3.0])
+
+
+class TlsContextTests(unittest.TestCase):
+    """DUNGML_CA_CERT: an https dmap-server signed by a private CA."""
+
+    def test_no_context_when_unset(self):
+        with unittest.mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("DUNGML_CA_CERT", None)
+            self.assertIsNone(dp.ssl_context())
+
+    def test_context_trusts_the_named_ca(self):
+        sentinel = object()
+        with unittest.mock.patch.dict("os.environ", {"DUNGML_CA_CERT": "/ca.crt"}), \
+             unittest.mock.patch("ssl.create_default_context",
+                                 return_value=sentinel) as mk:
+            self.assertIs(dp.ssl_context(), sentinel)
+        mk.assert_called_once_with(cafile="/ca.crt")
+
+    def test_request_passes_the_context(self):
+        sentinel = object()
+        with unittest.mock.patch.object(dp, "ssl_context", return_value=sentinel), \
+             unittest.mock.patch("urllib.request.urlopen",
+                                 side_effect=TimeoutError("t")) as uo:
+            with self.assertRaises(dp.DungmlUnavailable):
+                dp._request("GET", "/x")
+        self.assertIs(uo.call_args.kwargs["context"], sentinel)
+
+    def test_render_passes_the_context(self):
+        from tools import combat_map
+        sentinel = object()
+        with unittest.mock.patch.object(dp, "ssl_context", return_value=sentinel), \
+             unittest.mock.patch("urllib.request.urlopen",
+                                 side_effect=TimeoutError("t")) as uo:
+            with self.assertRaises(Exception):
+                combat_map._dungml_render("map \"x\" {}")
+        self.assertIs(uo.call_args.kwargs["context"], sentinel)

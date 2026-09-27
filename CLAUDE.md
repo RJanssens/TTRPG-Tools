@@ -611,6 +611,7 @@ so that is the branch `dmap-server` should be running.
 |---|---|---|
 | `DUNGML_API_BASE` | `http://127.0.0.1:8000` | `tools/combat_map.py`, `tools/dungml_play.py` |
 | `DUNGML_SERVICE_TOKEN` | `dev-service` | `tools/dungml_play.py` — the contract routes need a service principal |
+| `DUNGML_CA_CERT` | unset | both — the CA file to trust when `DUNGML_API_BASE` is an `https://` server with a private CA |
 
 The defaults work for a stock local `dmap-server`, so normally there is
 nothing to set. dungml holds its own fog state (what each campaign has

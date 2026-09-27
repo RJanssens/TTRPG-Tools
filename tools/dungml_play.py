@@ -27,6 +27,7 @@ import http.client
 import json
 import os
 import re
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +38,16 @@ DUNGML_API_BASE = os.environ.get("DUNGML_API_BASE", "http://127.0.0.1:8000").rst
 # Static-mode service principal (dungml's StaticIdentityProvider). In a
 # Keycloak deployment this is the M2M client's access token instead.
 DUNGML_SERVICE_TOKEN = os.environ.get("DUNGML_SERVICE_TOKEN", "dev-service")
+
+
+def ssl_context() -> ssl.SSLContext | None:
+    """Trust for an https dmap-server signed by a private CA: the CA file named
+    by `DUNGML_CA_CERT`. None when unset — http URLs ignore it, and https
+    falls back to the system trust store."""
+    ca = os.environ.get("DUNGML_CA_CERT", "")
+    return ssl.create_default_context(cafile=ca) if ca else None
+
+
 _TIMEOUT_S = 10.0
 
 # Scopes the render token can carry. "fog" draws only what the party has
@@ -111,7 +122,8 @@ def _request(
         headers["Authorization"] = f"Bearer {DUNGML_SERVICE_TOKEN}"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=ssl_context()) as resp:
             payload = resp.read()
     except urllib.error.HTTPError as e:
         if e.code == 404 and method == "GET" and not strict:

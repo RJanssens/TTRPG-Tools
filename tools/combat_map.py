@@ -44,7 +44,8 @@ def _dungml_render(source: str, renderer: str | None = None) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=_DUNGML_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(req, timeout=_DUNGML_TIMEOUT_S,
+                                    context=dungml_play.ssl_context()) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         # FastAPI puts our parse-error envelope under `detail`.
