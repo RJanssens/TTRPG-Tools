@@ -5,24 +5,6 @@
 .claude/settings.local.json
 .dm_session
 
-# Personal campaign data — playthroughs, characters, session logs, secrets
-campaigns/
-.active
-
-# Scraped Greyhawk wiki setting data (copyrighted; regeneratable via tools/)
-settings/greyhawk/greyhawk.db
-settings/greyhawk/greyhawk.db-shm
-settings/greyhawk/greyhawk.db-wal
-settings/greyhawk/images/
-
-# Copyrighted reference text & derived tables (regeneratable via tools/)
-global/reference/combat_and_tactics.txt
-global/reference/uk7-dark-clouds-gather.md
-global/reference/rules_quick_ref.md
-global/encounter_tables.json
-global/encounter_tables.json.bak*
-global/*.db.bak*
-
 # Python
 __pycache__/
 *.pyc
@@ -49,3 +31,13 @@ campaigns/*/images/*.webp
 
 # Generated narration audio (regeneratable via TTS)
 campaigns/*/audio/
+
+# Scraped Greyhawk wiki images — ~300 MB, refetchable with the scraper.
+# The DB snapshot itself (settings/greyhawk/greyhawk.db) stays tracked:
+# it is the queryable reference the lookup tools read.
+settings/*/images/
+
+# Timestamped local backups of generated data
+*.bak
+*.bak.*
+*.bak_*

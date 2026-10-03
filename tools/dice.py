@@ -4,6 +4,7 @@ import json
 import random
 from pathlib import Path
 import _campaign as _c
+from tools.composites import call_tool as _call_tool
 
 
 # --- Global tiered encounter tables ---------------------------------------- #
@@ -495,83 +496,6 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def monster_saving_throw(name: str, save_type: str, hd: float,
-                             hd_bonus: int = 0, intelligent: bool = True) -> dict:
-        """Roll a saving throw for a monster by Hit Dice (DMG Table 46, Warrior group).
-
-        Use for any combatant added via add_combatant() that has no character file.
-        Per the DMG (global/reference/dmg.txt, Table 46) monsters save on the Warrior
-        table at a level set by their Hit Dice:
-          - Every creature saves vs paralysis/poison/death at level = HD.
-          - Intelligent creatures (animal INT or better) save vs everything at level = HD.
-          - Non-intelligent creatures (INT 0) save vs all *other* attacks at level = HD/2,
-            rounded up.
-          - A hit-dice bonus (the "+N" in e.g. 5+6) adds one level per 4 points or fraction.
-
-        name: label for the rolling creature (e.g. "Ogre #2") — display only, no file needed.
-        save_type: para/paralysis/poison/death | rsw/rod/staff/wand | poly/polymorph/petrify | breath/bw | spell/magic
-        hd: number of Hit Dice (pass the dice count; e.g. 5 for a 5+6 ogre, with hd_bonus=6).
-        hd_bonus: the "+N"/"-N" modifier on the HD (6 for 5+6, -1 for 1-1; default 0).
-        intelligent: set False only for INT 0 (Non-intelligent) creatures; True otherwise."""
-        save_aliases = {
-            "para": 0, "paralysis": 0, "poison": 0, "death": 0,
-            "rsw": 1, "rod": 1, "staff": 1, "wand": 1,
-            "poly": 2, "polymorph": 2, "petrify": 2,
-            "breath": 3, "bw": 3,
-            "spell": 4, "magic": 4,
-        }
-        save_names = ["Paralysis/Poison/Death", "Rod/Staff/Wand", "Polymorph/Petrify", "Breath Weapon", "Spell/Magic"]
-
-        idx = save_aliases.get(save_type.lower())
-        if idx is None:
-            return {"error": f"Unknown save type '{save_type}'. Use: para, rsw, poly, breath, spell."}
-
-        # DMG Table 46 — Warrior group. (cap, [para/poison/death, rsw, petrify/polymorph, breath, spell])
-        # cap = highest character level in the band; first row whose cap >= level wins.
-        warrior_saves = [
-            (0,  [16, 18, 17, 20, 19]),
-            (2,  [14, 16, 15, 17, 17]),
-            (4,  [13, 15, 14, 16, 16]),
-            (6,  [11, 13, 12, 13, 14]),
-            (8,  [10, 12, 11, 12, 13]),
-            (10, [8, 10, 9, 9, 11]),
-            (12, [7, 9, 8, 8, 10]),
-            (14, [5, 7, 6, 5, 8]),
-            (16, [4, 6, 5, 4, 7]),
-            (99, [3, 5, 4, 4, 6]),
-        ]
-
-        # Effective HD level: dice count + one level per 4 bonus points (round up).
-        base_level = max(0, int(hd))
-        if hd_bonus > 0:
-            base_level += (hd_bonus + 3) // 4  # ceil(hd_bonus / 4)
-        # Poison/death always saves at full HD; non-intelligent halve all other saves (round up).
-        if idx == 0 or intelligent:
-            level = base_level
-        else:
-            level = (base_level + 1) // 2  # ceil(base_level / 2)
-
-        target = next(cols for cap, cols in warrior_saves if level <= cap)[idx]
-        roll_result = random.randint(1, 20)
-        success = roll_result >= target
-
-        hd_str = f"{int(hd)}"
-        if hd_bonus > 0:
-            hd_str += f"+{hd_bonus}"
-        elif hd_bonus < 0:
-            hd_str += f"{hd_bonus}"
-
-        return {
-            "character": name,
-            "save": save_names[idx],
-            "hd": hd_str,
-            "save_as_level": level,
-            "roll": roll_result,
-            "target": target,
-            "success": success,
-        }
-
-    @mcp.tool()
     def system_shock(character: str) -> dict:
         """Roll system shock for a character (PHB Table 3, CON-driven).
         Required after polymorph, petrification, raise dead, or any massive
@@ -683,4 +607,114 @@ def register(mcp):
             "roll": roll_result,
             "target": target,
             "success": success,
+        }
+
+    # --- Composite scene tools ----------------------------------------------
+    # The rules owe several rolls for one player action ("Pippa scouts ahead"
+    # = stealth + listen + the 10-minute encounter check + the clock), and
+    # CLAUDE.md rightly forbids parallelising them because each logs an event.
+    # Run them here, in order, for one round trip instead of four or five.
+
+    @mcp.tool()
+    async def scout(
+        character: str,
+        checks:    list[str] | None = None,
+        minutes:   int = 10,
+        terrain:   str = "dungeon",
+    ) -> dict:
+        """Resolve a scouting move in one call: each named skill check, then the
+        encounter check for the time spent, then the clock.
+
+        character: the scout (PC or NPC)
+        checks:    skill names to roll, partial-matched against the character's
+                   sheet — defaults to ["move silently", "hide in shadows",
+                   "detect noise"]. Pass an explicit list to match the fiction
+                   (no Hide check when they're crossing open floor).
+        minutes:   time the move takes (default 10, the dungeon turn)
+        terrain:   dungeon / wilderness / road / urban, for the encounter check
+
+        Rolls happen before you narrate, in the order given: skills, then
+        encounter, then time. A failed stealth check is a failed approach —
+        read the results and narrate from them (Hard Constraints #1 and #3).
+
+        Checks the character doesn't have are reported as unavailable rather
+        than rolled; nothing is silently substituted."""
+        if checks is None:
+            checks = ["move silently", "hide in shadows", "detect noise"]
+        if isinstance(checks, str):
+            checks = [checks]
+
+        results = []
+        for name in checks:
+            results.append(await _call_tool(mcp, "skill_check",
+                                            character=character, skill=name))
+
+        out: dict = {
+            "character": character,
+            "checks":    results,
+            "encounter": await _call_tool(mcp, "check_encounter", terrain=terrain),
+        }
+        if minutes:
+            out["time"] = await _call_tool(mcp, "advance_time", minutes=int(minutes))
+        return out
+
+    @mcp.tool()
+    async def council(npcs: list[dict] | list[str], base_modifier: int = 0) -> dict:
+        """Roll reaction() for every NPC weighing in on a player proposal — one
+        call, one round trip, one roll per NPC.
+
+        This is the tool for CLAUDE.md Hard Constraint #4: consensus is rolled,
+        never assumed. Each NPC votes their own interest, so pass the
+        interest-cost modifier for *this* proposal rather than leaning on how
+        much they like the party — reaction(npc=slug) already folds in stored
+        disposition and faction reputation.
+
+        npcs: ["shalfey", "tira"] or, preferably,
+              [{"npc": "tira", "modifier": -4,
+                "interest": "the relic leaves her temple"},
+               {"npc": "shalfey", "modifier": 2,
+                "interest": "wants the road reopened"}]
+        base_modifier: applied to every NPC on top of their own modifier (a
+              persuasive speech, a shared threat).
+
+        `interest` is recorded in the result, not used in the maths — it keeps
+        the reason for each modifier on the record. Three or more NPCs with
+        conflicting interests should produce disagreement; if every roll comes
+        back friendly, that is the dice talking, not a decision you may make."""
+        if isinstance(npcs, str):
+            npcs = [npcs]
+        if not isinstance(npcs, list) or not npcs:
+            return {"error": "npcs must be a non-empty list of slugs or {npc, modifier, interest} dicts."}
+
+        votes = []
+        for entry in npcs:
+            if isinstance(entry, str):
+                slug, mod, interest = entry, 0, ""
+            elif isinstance(entry, dict):
+                slug = str(entry.get("npc") or entry.get("slug") or "")
+                mod = int(entry.get("modifier") or 0)
+                interest = str(entry.get("interest") or "")
+            else:
+                votes.append({"error": f"unusable entry: {entry!r}"})
+                continue
+            if not slug:
+                votes.append({"error": f"entry has no npc slug: {entry!r}"})
+                continue
+
+            res = await _call_tool(mcp, "reaction", npc=slug,
+                                   modifier=mod + int(base_modifier))
+            vote = {"npc": slug, "modifier_applied": mod + int(base_modifier)}
+            if interest:
+                vote["interest"] = interest
+            vote["reaction"] = res
+            votes.append(vote)
+
+        rolled = [v for v in votes if isinstance(v.get("reaction"), dict)
+                  and "error" not in v["reaction"]]
+        attitudes = [str(v["reaction"].get("result", "")) for v in rolled]
+        return {
+            "votes":     votes,
+            "count":     len(rolled),
+            "attitudes": attitudes,
+            "unanimous": bool(attitudes) and len(set(attitudes)) == 1,
         }

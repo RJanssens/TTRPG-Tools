@@ -20,7 +20,6 @@ SOURCES = [
     ("phb",  "Player's Handbook",     REF_DIR / "phb.txt"),
     ("dmg",  "Dungeon Master Guide",  REF_DIR / "dmg.txt"),
     ("mm",   "Monstrous Manual",      REF_DIR / "monstermanual.txt"),
-    ("ct",   "Player's Option: Combat & Tactics", REF_DIR / "combat_and_tactics.txt"),
 ]
 
 # Cap per chunk so a single result excerpt is digestible

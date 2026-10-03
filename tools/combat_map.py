@@ -2,8 +2,9 @@
 
 The map renderer delegates to the dungml backend (`dmap-server`) at
 `DUNGML_API_BASE` (default http://127.0.0.1:8000). Rooms, corridors,
-doors, windows, and features are drawn by dungml's classic-bw / hatched
-/ floorplan renderers; combatants ride on top as integer-cell tokens in
+doors, windows, and features are drawn by dungml's classic-bw /
+hatched / floorplan / oldschool-blue renderers; combatants ride on top
+as integer-cell tokens in
 the same coordinate space as the map's `grid { bounds W x H }` block.
 """
 import base64
@@ -15,6 +16,7 @@ import urllib.request
 from pathlib import Path
 
 import _campaign as _c
+from tools import dungml_play
 from tools.combat import get_session
 
 BASE_DIR = Path(__file__).parent.parent
@@ -119,6 +121,23 @@ def _svg_to_data_url(svg: str) -> str:
     inside data URLs."""
     enc = base64.b64encode(svg.encode("utf-8")).decode("ascii")
     return f"data:image/svg+xml;base64,{enc}"
+
+
+# dungml moved its built-in feature shapes (pillar, chest, altar, stairs, …)
+# into a bundled include library. Without `include "core.dmap"` those names
+# still draw, but as a generic fallback square and with an error diagnostic
+# per feature — so a map that used to render a chest now renders a box. The
+# tools here document the built-ins as working directly, so supply the include
+# when the author hasn't asked for a library of their own.
+_INCLUDE_RX = re.compile(r"^\s*include\s", re.MULTILINE)
+_CORE_INCLUDE = 'include "core.dmap"'
+
+
+def _ensure_core_include(dsl: str) -> str:
+    """Prepend the built-in feature library unless the source includes one."""
+    if _INCLUDE_RX.search(dsl or ""):
+        return dsl
+    return f"{_CORE_INCLUDE}\n{dsl}"
 
 
 # ----- Combatant-driven marker upsert -----
@@ -413,10 +432,12 @@ def register(mcp):
           dsl:      a full .dmap source string, including a top-level
                     `map "Name" { grid { bounds W x H } ... }` block and
                     any rooms / corridors / doors / features you want.
-          renderer: optional override — one of "classic-bw" (default),
-                    "floorplan" (building style alias), or "hatched"
-                    (architectural section drawings). If unset the
-                    renderer named in the source is used.
+          renderer: optional override — "classic-bw" (default),
+                    "floorplan" (building style), "hatched" (architectural
+                    section drawings) or "oldschool-blue" (blueprint look).
+                    If unset the renderer named in the source is used.
+                    `GET /api/dsl/renderers` on the dungml backend is
+                    authoritative if you need to check.
 
         Returns: {size, scale, diagnostics} on success, or {error, ...}
         on parse failure / backend unreachable. `diagnostics` is a list
@@ -447,6 +468,10 @@ def register(mcp):
         session = get_session()
         if session is None:
             return {"error": "No active combat session. Call start_combat first."}
+
+        # Normalised once, here: the stored DSL, the re-renders on every token
+        # move, and the copy the fog contract gets must all be the same source.
+        dsl = _ensure_core_include(dsl)
 
         try:
             result = _dungml_render(dsl, renderer=renderer)
@@ -482,11 +507,24 @@ def register(mcp):
         session["grid"] = grid
         save_combat_state(cfg, session)
 
-        return {
+        # Hand the same source to the play-session contract so the combat tab
+        # can draw it fogged. Best-effort: a map service that's down costs the
+        # fog view, not the map.
+        link = dungml_play.sync_combat_map(cfg, dsl)
+
+        out = {
             "size":        f"{width}×{height}",
             "scale":       scale,
             "diagnostics": diagnostics,
         }
+        if link.get("width"):
+            out["fog"] = {
+                "scope": link.get("scope"),
+                "party_node": link.get("party_node"),
+                "note": "combat tab draws the fogged view — advance it with "
+                        "dungml_party_at / dungml_reveal",
+            }
+        return out
 
     @mcp.tool()
     def place_combatant(name: str, x: int, y: int) -> dict:
@@ -532,6 +570,9 @@ def register(mcp):
             )
             if err is not None:
                 rerender_error = err.get("error")
+            # The marker block was just rewritten — push the new source so the
+            # fogged view shows the token where the local render does.
+            dungml_play.sync_combat_map(cfg, grid.get("dsl") or "")
 
         save_combat_state(cfg, session)
 

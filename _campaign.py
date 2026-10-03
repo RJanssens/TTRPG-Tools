@@ -360,13 +360,9 @@ def write_character_sheet(cfg: dict, key: str, char: dict):
 
     # ── Header ───────────────────────────────────────────────────────────────
     L += [f"# {label}", ""]
-    parts = [p for p in [cls, race, gender, f"Level {level}" if level else ""] if p]
+    align  = char.get("alignment", "")
+    parts = [p for p in [cls, race, gender, align, f"Level {level}" if level else ""] if p]
     L += ["  ".join(f"**{p}**" if i == 0 else p for i, p in enumerate(parts)), ""]
-
-    # ── Alignment ────────────────────────────────────────────────────────────
-    alignment = (char.get("alignment") or "").strip()
-    if alignment:
-        L += [f"**Alignment:** {alignment}", ""]
 
     # ── Background ───────────────────────────────────────────────────────────
     bg = char.get("background", "").strip()

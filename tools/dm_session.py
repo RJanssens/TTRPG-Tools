@@ -24,10 +24,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import queue
 import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -414,87 +416,129 @@ def _detail_addendum() -> str | None:
     return _DETAIL_PREFIX + body
 
 
-# --- Per-campaign instructions -------------------------------------------
-# Free-text, per-campaign directive injected into every turn's system prompt.
-# UNLIKE tone and detail (presentation knobs that explicitly never override the
-# rules), this is a CANON / PROCEDURAL constraint: it sits at the same authority
-# level as CLAUDE.md's Hard Procedural Constraints. The typical use is locking a
-# campaign to its module key (e.g. "run strictly off modules/<slug>/, consult
-# Level-NN.md before keying any room"). Stored in
-# campaigns/<slug>/_instructions.json as {"text": str, "enabled": bool}.
-# Empty/disabled injects nothing, so existing campaigns see no change.
-_INSTRUCTIONS_PREFIX = (
-    "CAMPAIGN INSTRUCTIONS — a binding, campaign-specific constraint set by the "
-    "human running this table. Treat it with the SAME force as the Hard "
-    "Procedural Constraints in CLAUDE.md: it is not a tone or presentation knob "
-    "and you may not deprioritise it for narrative convenience. It does not "
-    "license violating CLAUDE.md's Hard Constraints (dice, fourth wall, "
-    "pipeline); where both apply, both bind. Follow it every turn:\n\n"
+# --- Reasoning effort ----------------------------------------------------
+# Measured on three identical turns through this pipeline: default effort ran
+# 252 s / 191 s / 124 s, `--effort low` ran 47 s / 58 s / 36 s — a 4x cut,
+# because ~88% of a turn's generated tokens are thinking, not prose. But low
+# effort also skipped the combat pipeline on one of those turns, so it is not
+# a free win: it buys speed by spending procedural diligence.
+#
+# Hence "auto": cheap effort for the many routine turns, full effort for the
+# ones where the Hard Constraints actually bite (a live fight, a multi-NPC
+# council, a multi-step plan). The composite tools carry the pipeline now
+# (setup_combat, combat_round, scout, council), so a low-effort turn has far
+# less procedure left to reason its way through.
+_EFFORT_CHOICES = ("auto", "low", "medium", "high", "xhigh", "max")
+_EFFORT_DEFAULT = "auto"
+
+# Length above which a player message reads as a multi-step plan rather than
+# a single action. Tuned from the campaign logs: routine turns run well under
+# this, plans and negotiations run over it.
+_PLAN_CHARS = 300
+
+# Words that mark a turn where getting the procedure right matters: staged
+# plans, social manoeuvring, and anything that owes a spell or a save.
+_HIGH_EFFORT_MARKERS = (
+    "ambush", "argue", "bargain", "barter", "bluff", "cast", "convince",
+    "council", "deceive", "disguise", "distract", "haggle", "intimidate",
+    "lie to", "negotiate", "persuade", "plan", "pretend", "ritual", "sneak",
+    "surrender", "threaten", "trap", "trick",
 )
 
-_INSTRUCTIONS_DEFAULTS = {"text": "", "enabled": True}
 
-
-def _instructions_path(slug: str | None = None) -> Path | None:
-    slug = slug or _active_campaign_slug()
+def _effort_path() -> Path | None:
+    slug = _active_campaign_slug()
     if not slug:
         return None
-    return _REPO_ROOT / "campaigns" / slug / "_instructions.json"
+    return _REPO_ROOT / "campaigns" / slug / "_effort.json"
 
 
-def instructions_setting(slug: str | None = None) -> dict:
-    """Return a campaign's instructions setting merged with defaults:
-    ``{"text": str, "enabled": bool}``. Defaults to the active campaign;
-    pass ``slug`` to read any campaign. Safe when no campaign is active or
-    the slug is unknown (returns the empty default)."""
-    out = dict(_INSTRUCTIONS_DEFAULTS)
-    p = _instructions_path(slug)
-    if p is None:
-        return out
+def effort_setting() -> dict:
+    """Return the active campaign's effort setting, ``{"effort": str}``.
+    Safe when no campaign is active (returns the default)."""
+    effort = _EFFORT_DEFAULT
+    p = _effort_path()
+    if p is not None:
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and loaded.get("effort") in _EFFORT_CHOICES:
+                effort = loaded["effort"]
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"effort": effort}
+
+
+def set_effort(effort: str) -> dict:
+    """Persist the active campaign's reasoning effort. ``auto`` lets
+    ``_effort_for_turn`` pick per turn; anything else pins it."""
+    effort = str(effort or "").strip().lower()
+    if effort not in _EFFORT_CHOICES:
+        effort = _EFFORT_DEFAULT
+    p = _effort_path()
+    if p is not None and p.parent.is_dir():
+        try:
+            p.write_text(json.dumps({"effort": effort}, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+    return {"effort": effort}
+
+
+def effort_choices() -> list[str]:
+    """Selectable effort levels, in order, for the dashboard control."""
+    return list(_EFFORT_CHOICES)
+
+
+def _npc_labels() -> list[str]:
+    """Lower-cased slugs and display names of every NPC the campaign knows.
+    Used to spot a scene where several named NPCs are being addressed at once
+    — the council case that CLAUDE.md Hard Constraint #4 governs."""
     try:
-        loaded = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            if isinstance(loaded.get("text"), str):
-                out["text"] = loaded["text"]
-            if isinstance(loaded.get("enabled"), bool):
-                out["enabled"] = loaded["enabled"]
-    except (OSError, json.JSONDecodeError):
-        pass
+        import _campaign as _c
+        cfg = _c.load_campaign()
+    except Exception:
+        return []
+    out = []
+    for slug, npc in (cfg.get("npcs") or {}).items():
+        out.append(slug.lower())
+        label = (npc.get("label") or "").strip().lower()
+        if label:
+            out.append(label)
+            first = label.split()[0]
+            if len(first) > 3:
+                out.append(first)
     return out
 
 
-def set_campaign_instructions(text: str | None = None,
-                              enabled: bool | None = None,
-                              slug: str | None = None) -> dict:
-    """Persist a campaign's instructions directive. ``text`` is the free-text
-    constraint injected into every subsequent DM turn's system prompt;
-    ``enabled`` toggles injection without discarding the text. Defaults to the
-    active campaign; pass ``slug`` to target any campaign. Takes effect on the
-    next turn. Returns the merged setting."""
-    current = instructions_setting(slug)
-    if text is not None:
-        current["text"] = str(text)[:6000]
-    if enabled is not None:
-        current["enabled"] = bool(enabled)
-    p = _instructions_path(slug)
-    if p is not None and p.parent.is_dir():
-        try:
-            p.write_text(json.dumps(current, indent=2), encoding="utf-8")
-        except OSError:
-            pass
-    return current
+def _auto_effort(message: str) -> str:
+    """Pick an effort level for this turn. See the note above for why.
+
+    Errs high: a wrongly-cheap turn can railroad, a wrongly-expensive one
+    only costs seconds."""
+    if _combat_active():
+        return "high"
+
+    low = (message or "").lower()
+    if len(low) >= _PLAN_CHARS:
+        return "high"
+    if any(marker in low for marker in _HIGH_EFFORT_MARKERS):
+        return "high"
+
+    labels = _npc_labels()
+    if labels:
+        named = {lab for lab in labels if lab and lab in low}
+        # Two distinct NPCs in one message is a scene with competing
+        # interests, not a single exchange.
+        if len(named) >= 2:
+            return "high"
+    return "low"
 
 
-def _instructions_addendum() -> str | None:
-    """The per-campaign instructions directive to inject this turn, or ``None``
-    when unset/disabled (nothing appended)."""
-    s = instructions_setting()
-    if not s.get("enabled", True):
-        return None
-    body = (s.get("text") or "").strip()
-    if not body:
-        return None
-    return _INSTRUCTIONS_PREFIX + body
+def _effort_for_turn(message: str) -> str | None:
+    """The ``--effort`` value for this turn, or None to leave the CLI default."""
+    setting = effort_setting()["effort"]
+    if setting == "auto":
+        return _auto_effort(message)
+    return setting or None
 
 
 def _recent_violations_addendum() -> str | None:
@@ -593,7 +637,12 @@ _ALLOWED_TOOLS = "mcp__ttrpg__*,Read,Write,Edit,Bash"
 # files via ``session_primer()`` — the system is designed to rehydrate that
 # way. ``DM_AUTO_RESET=0`` disables; ``DM_AUTO_RESET_TOKENS`` tunes the trigger.
 _AUTO_RESET_ENABLED = os.environ.get("DM_AUTO_RESET", "1") != "0"
-_AUTO_RESET_TOKENS = int(os.environ.get("DM_AUTO_RESET_TOKENS", "150000"))
+# 90k, not 150k: measured round-trip cost is ~2.6 s at 42-66k of context, 3.0 s
+# at 107k and 3.5 s at 150k, and a turn spends that on every one of its 5-20
+# round trips. Resetting earlier keeps the whole back half of a session on the
+# cheap end of that curve, and rehydration is now a single session_primer()
+# call (it returns the scene, so the DM no longer reads campaign files by hand).
+_AUTO_RESET_TOKENS = int(os.environ.get("DM_AUTO_RESET_TOKENS", "90000"))
 
 # One-shot system-prompt note injected on the first turn after an auto-reset.
 # It tells the (now context-free) DM that this is the SAME ongoing scene and to
@@ -716,6 +765,20 @@ _IMAGE_PROMPT_SYSTEM = (
 )
 
 
+# Flags for the two stateless side-passes (image-prompt rewrite, action
+# suggestions). Both are short text transforms that need no campaign context,
+# yet each was spawning a full-weight turn: the default model plus every MCP
+# schema, measured at a ~72k-token prefix to produce four chip labels. Haiku
+# with no tools and no MCP does the same job on a fraction of the latency.
+_AUX_ARGS = [
+    "--model", "haiku",
+    "--tools", "",
+    "--strict-mcp-config",
+    "--disable-slash-commands",
+    "--setting-sources", "",
+]
+
+
 def rewrite_for_image(
     narrative: str,
     hint: str | None = None,
@@ -750,6 +813,7 @@ def rewrite_for_image(
     args = [
         _CLAUDE_BIN, "-p", user_msg,
         "--append-system-prompt", _IMAGE_PROMPT_SYSTEM,
+        *_AUX_ARGS,
     ]
     try:
         proc = subprocess.run(
@@ -805,6 +869,7 @@ def suggest_actions(
     args = [
         _CLAUDE_BIN, "-p", text[:4000],
         "--append-system-prompt", _SUGGEST_ACTIONS_SYSTEM,
+        *_AUX_ARGS,
     ]
     try:
         proc = subprocess.run(
@@ -879,10 +944,13 @@ def last_dm_text() -> str | None:
 
 def reset_session() -> None:
     """Forget the active campaign's session — the next turn starts a
-    new one. Sessions in other campaigns are untouched."""
+    new one. Sessions in other campaigns are untouched.
+
+    Drops the resident process too: it is bound to the old session id."""
     p = _active_session_file()
     if p is not None:
         p.unlink(missing_ok=True)
+    _kill_resident()
 
 
 def set_session(sid: str) -> None:
@@ -890,6 +958,7 @@ def set_session(sid: str) -> None:
     campaign. Public counterpart to the implicit save inside ``stream_turn``;
     used by the dashboard's 'resume this session' button."""
     _save_session_id(sid)
+    _kill_resident()
 
 
 def _save_session_id(sid: str) -> None:
@@ -992,38 +1061,22 @@ def _migrate_legacy_session() -> None:
 _migrate_legacy_session()
 
 
-def _build_args(message: str, sid: str | None, rehydrate: bool = False) -> list[str]:
-    args = [
-        _CLAUDE_BIN, "-p", message,
-        "--output-format", "stream-json",
-        "--include-partial-messages",
-        "--verbose",
-        "--allowedTools", _ALLOWED_TOOLS,
-        "--fallback-model", "sonnet",
-        "--disable-slash-commands",
-        "--exclude-dynamic-system-prompt-sections",
-    ]
-    # System-prompt addenda, combined into one --append-system-prompt block:
-    #   - rehydration note when this turn follows an auto-reset (fresh session,
-    #     re-prime from state files and continue the scene seamlessly);
-    #   - per-campaign instructions (a binding canon/procedural constraint such
-    #     as a module lock; injected at the same authority as the Hard
-    #     Constraints, stable across turns);
-    #   - tone/voice direction (per-campaign, stable across turns so it only
-    #     busts the prompt cache when the user actually changes it);
-    #   - narrative detail level (how much raw mechanical detail to expose),
-    #     likewise stable until the user changes it;
-    #   - B4 audit nudge listing recent lapses the DM should not repeat. None on
-    #     quiet turns (no new violations) keeps the prompt-cache warm.
+def _system_prompt_parts(rehydrate: bool) -> list[str]:
+    """The --append-system-prompt blocks for this turn, in order:
+
+      - rehydration note when the turn follows an auto-reset (fresh session,
+        re-prime via session_primer() and continue the scene seamlessly);
+      - tone/voice direction (per-campaign, stable until the user edits it);
+      - narrative detail level, likewise stable;
+      - the audit nudge listing recent lapses not to repeat — None on quiet
+        turns, which keeps the prompt cache warm.
+
+    Also the resident process's respawn trigger: when this text changes the
+    process is replaced so the new addenda actually reach the model.
+    """
     parts = []
     if rehydrate:
         parts.append(_REHYDRATE_ADDENDUM)
-    # Per-campaign canon/procedural constraint (e.g. module lock) — highest
-    # authority of the optional addenda, so it leads the appended block. Stable
-    # across turns (cache-warm) until the user edits it.
-    instructions = _instructions_addendum()
-    if instructions:
-        parts.append(instructions)
     tone = _tone_addendum()
     if tone:
         parts.append(tone)
@@ -1033,6 +1086,45 @@ def _build_args(message: str, sid: str | None, rehydrate: bool = False) -> list[
     violations = _recent_violations_addendum()
     if violations:
         parts.append(violations)
+    return parts
+
+
+def _build_args(
+    message: str | None,
+    sid: str | None,
+    rehydrate: bool = False,
+    effort: str | None = None,
+) -> list[str]:
+    """Assemble the CLI argv for one turn.
+
+    ``message=None`` builds the resident-process form: the turn arrives on
+    stdin as stream-json instead of as a positional prompt, so one process can
+    serve many turns (see ``_Resident``). Everything else is identical, which
+    matters because the argv is what decides whether the resident can be
+    reused or has to be respawned."""
+    args = [_CLAUDE_BIN, "-p"]
+    if message is None:
+        args += ["--input-format", "stream-json"]
+    else:
+        args += [message]
+    args += [
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+        "--allowedTools", _ALLOWED_TOOLS,
+        "--fallback-model", "sonnet",
+        "--disable-slash-commands",
+        "--exclude-dynamic-system-prompt-sections",
+        # Default is `on`, which records the system prompt on a conversation's
+        # first request and replays it verbatim on every later --resume, even
+        # when a launch passes different text. Every turn here passes fresh
+        # --append-system-prompt content (tone, narrative detail, the audit
+        # nudge), so `on` silently discarded all of it from turn 2 onward.
+        "--system-prompt-snapshot", "off",
+    ]
+    if effort:
+        args += ["--effort", effort]
+    parts = _system_prompt_parts(rehydrate)
     if parts:
         args += ["--append-system-prompt", "\n\n".join(parts)]
     if sid:
@@ -1148,6 +1240,258 @@ def _process_event_line(line: str) -> dict | None:
     return evt
 
 
+# --- Resident CLI process -------------------------------------------------
+# Spawning `claude -p` per turn costs a flat ~3.0 s before the model sees a
+# token: node boot, MCP server spawn, transcript replay. Measured 5.81 s of
+# wall time against 2.74 s of API time on a small session. Feeding turns to
+# one long-lived process over stream-json stdin instead measured 4.78 s for
+# the first turn and 2.18 s wall against 2.18 s of API time for every turn
+# after — i.e. the overhead goes to zero once the process is warm.
+#
+# The process is respawned whenever the argv would change (a new session id
+# after an auto-reset, a tone/detail edit, a different effort level), which is
+# also what makes the system-prompt addenda take effect: with
+# --system-prompt-snapshot off, a respawn re-renders them.
+_RESIDENT_ENABLED = os.environ.get("DM_PERSIST", "1") != "0"
+
+# Ceiling on how long one turn may take before we give up on the resident and
+# tear it down. Generous — a long combat turn legitimately runs minutes.
+_TURN_TIMEOUT = float(os.environ.get("DM_TURN_TIMEOUT", "900"))
+
+
+class _Resident:
+    """A long-lived ``claude -p --input-format stream-json`` process.
+
+    stdout and stderr are drained by daemon threads so neither can fill its
+    pipe buffer and deadlock the child between turns; stdout lines land on a
+    queue that ``stream_turn`` consumes with a deadline."""
+
+    def __init__(self, args: list[str], signature: tuple, sid: str | None):
+        self.args = list(args)
+        self.signature = signature
+        # The session this process was launched against, and the one the CLI
+        # actually reported. They differ on the first turn of a new session:
+        # we launch with no --resume and learn the id from the init event.
+        self.sid_at_spawn = sid
+        self.observed_sid: str | None = None
+        self.proc = subprocess.Popen(
+            args,
+            cwd=_REPO_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._lines: "queue.Queue[str | None]" = queue.Queue()
+        self._stderr: deque[str] = deque(maxlen=80)
+        threading.Thread(target=self._pump_stdout, daemon=True).start()
+        threading.Thread(target=self._pump_stderr, daemon=True).start()
+
+    def _pump_stdout(self) -> None:
+        try:
+            for line in self.proc.stdout:  # type: ignore[union-attr]
+                self._lines.put(line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._lines.put(None)  # EOF sentinel
+
+    def _pump_stderr(self) -> None:
+        try:
+            for line in self.proc.stderr:  # type: ignore[union-attr]
+                self._stderr.append(line)
+        except (OSError, ValueError):
+            pass
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def stderr_tail(self) -> str:
+        return "".join(self._stderr)[-2000:]
+
+    def send(self, message: str) -> None:
+        payload = json.dumps({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": message}]},
+        })
+        self.proc.stdin.write(payload + "\n")  # type: ignore[union-attr]
+        self.proc.stdin.flush()                # type: ignore[union-attr]
+
+    def next_line(self, timeout: float) -> str | None:
+        """Next stdout line, or None on EOF. Raises queue.Empty on timeout."""
+        return self._lines.get(timeout=timeout)
+
+    def kill(self) -> None:
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        except OSError:
+            pass
+        if self.alive():
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+
+_resident: _Resident | None = None
+
+
+def _turn_signature(rehydrate: bool, effort: str | None) -> tuple:
+    """Everything except the session id that a resident process bakes in at
+    spawn. A change here means the process must be replaced, not reused.
+
+    The session id is compared separately: on the first turn of a new session
+    we launch without --resume and only learn the id from the init event, so a
+    naive comparison would respawn on turn 2 for no reason."""
+    return (bool(rehydrate), effort, "\n\n".join(_system_prompt_parts(rehydrate)))
+
+
+def _kill_resident() -> None:
+    global _resident
+    res, _resident = _resident, None
+    if res is not None:
+        res.kill()
+
+
+def _ensure_resident(sid: str | None, rehydrate: bool, effort: str | None) -> _Resident | None:
+    """Return a usable resident process, respawning it if the turn's argv
+    changed or the old one died. None when the spawn itself failed, so the
+    caller can fall back to the per-turn spawn path."""
+    global _resident
+    sig = _turn_signature(rehydrate, effort)
+    if (_resident is not None
+            and _resident.alive()
+            and _resident.signature == sig
+            and sid in (_resident.sid_at_spawn, _resident.observed_sid)):
+        return _resident
+
+    _kill_resident()
+    args = _build_args(None, sid, rehydrate=rehydrate, effort=effort)
+    try:
+        _resident = _Resident(args, sig, sid)
+    except OSError:
+        _resident = None
+    return _resident
+
+
+def _stream_turn_resident(message: str, sid: str | None,
+                          rehydrate: bool, effort: str | None) -> Iterator[dict]:
+    """One turn against the resident process. Falls back to a fresh spawn if
+    the process can't be started or dies before answering."""
+    res = _ensure_resident(sid, rehydrate, effort)
+    if res is None:
+        yield from _spawn_turn_events(message, sid, rehydrate, effort)
+        return
+
+    with _active_proc_lock:
+        global _active_proc
+        _active_proc = res.proc
+    _set_turn_state(in_flight=True, started_at=time.time(), tools_used=0)
+
+    deadline = time.time() + _TURN_TIMEOUT
+    try:
+        res.send(message)
+    except (OSError, ValueError):
+        # Process died between the liveness check and the write — start over
+        # once with a fresh spawn rather than dropping the player's turn.
+        _kill_resident()
+        _set_turn_state(in_flight=False, started_at=None, tools_used=0)
+        yield from _spawn_turn_events(message, sid, rehydrate, effort)
+        return
+
+    completed = False
+    try:
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                _kill_resident()
+                completed = True  # nothing left to drain
+                yield {"type": "error", "returncode": None,
+                       "stderr": f"DM turn exceeded {_TURN_TIMEOUT:.0f}s — resident process killed."}
+                return
+            try:
+                line = res.next_line(timeout=remaining)
+            except queue.Empty:
+                continue
+            if line is None:  # the process exited
+                stderr = res.stderr_tail()
+                rc = res.proc.poll()
+                _kill_resident()
+                completed = True
+                yield {"type": "error", "returncode": rc, "stderr": stderr}
+                return
+
+            evt = _consume_event(res, line)
+            if evt is None:
+                continue
+            yield evt
+            if evt.get("type") == "result":
+                completed = True
+                return
+    finally:
+        if not completed:
+            # The consumer went away mid-turn — a page reload drops the SSE
+            # stream and Werkzeug closes this generator. The turn is still
+            # running, and its unread events would otherwise be read by the
+            # *next* turn, which would then stop at this turn's result event.
+            # Drain to the end, exactly as the old per-turn path blocked on
+            # proc.wait(), so the transcript is written and /api/last_narrative
+            # can replay the reply on reload.
+            _drain_turn(res, deadline)
+        with _active_proc_lock:
+            if _active_proc is res.proc:
+                _active_proc = None
+        _set_turn_state(in_flight=False, started_at=None, tools_used=0)
+        threading.Thread(target=_audit_after_turn, daemon=True).start()
+
+
+def _consume_event(res: _Resident, line: str) -> dict | None:
+    """Parse one stdout line and fold in its side effects: persist the session
+    id, note it on the resident, and tally tool uses for the live poll."""
+    evt = _process_event_line(line)
+    if evt is None:
+        return None
+    if evt.get("type") == "system" and isinstance(evt.get("session_id"), str):
+        res.observed_sid = evt["session_id"]
+    _tally_tool_uses(evt)
+    return evt
+
+
+def _drain_turn(res: _Resident, deadline: float) -> None:
+    """Read the rest of an abandoned turn's output and discard it, so the
+    resident is clean for the next turn. Kills the process if the turn never
+    finishes within the deadline."""
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            _kill_resident()
+            return
+        try:
+            line = res.next_line(timeout=remaining)
+        except queue.Empty:
+            continue
+        if line is None:
+            _kill_resident()
+            return
+        evt = _consume_event(res, line)
+        if evt is not None and evt.get("type") == "result":
+            return
+
+
+def _tally_tool_uses(evt: dict) -> None:
+    """Count tool_use blocks for the live turn-state poll."""
+    if evt.get("type") != "assistant":
+        return
+    content = evt.get("message", {}).get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            _bump_tools_used()
+
+
 def stream_turn(message: str) -> Iterator[dict]:
     """Run one DM turn against the persisted session.
 
@@ -1158,10 +1502,39 @@ def stream_turn(message: str) -> Iterator[dict]:
     On non-zero exit, yields a final ``{"type": "error", ...}`` event with
     the captured stderr (truncated)."""
     did_auto_reset = _maybe_auto_reset()
+    if did_auto_reset:
+        # The session id is gone; the resident is bound to the old one.
+        _kill_resident()
     sid = session_id()
-    args = _build_args(message, sid, rehydrate=did_auto_reset)
+    effort = _effort_for_turn(message)
 
     with _turn_lock:
+        if _RESIDENT_ENABLED:
+            yield from _stream_turn_resident(message, sid, did_auto_reset, effort)
+            return
+    yield from _stream_turn_spawn(message, sid, did_auto_reset, effort)
+
+
+def _stream_turn_spawn(message: str, sid: str | None,
+                       rehydrate: bool = False,
+                       effort: str | None = None) -> Iterator[dict]:
+    """One turn in its own short-lived process, taking ``_turn_lock`` — the
+    original path, used when ``DM_PERSIST=0``."""
+    with _turn_lock:
+        yield from _spawn_turn_events(message, sid, rehydrate, effort)
+
+
+def _spawn_turn_events(message: str, sid: str | None,
+                       rehydrate: bool = False,
+                       effort: str | None = None) -> Iterator[dict]:
+    """The per-turn spawn itself, without touching ``_turn_lock``.
+
+    Called directly by the resident path when its process won't start or dies
+    mid-turn — that path already holds the lock, and ``_turn_lock`` is not
+    reentrant."""
+    args = _build_args(message, sid, rehydrate=rehydrate, effort=effort)
+
+    if True:
         proc = subprocess.Popen(
             args,
             cwd=_REPO_ROOT,
@@ -1215,6 +1588,9 @@ def force_reset() -> dict:
     back to the dashboard."""
     global _turn_lock, _active_proc
     killed = False
+    # Drop the resident first: a wedged turn's process IS the resident, and
+    # leaving it registered would hand the next turn the same stuck process.
+    _kill_resident()
     with _active_proc_lock:
         proc = _active_proc
         _active_proc = None

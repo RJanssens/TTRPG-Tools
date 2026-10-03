@@ -301,6 +301,7 @@ def register(mcp):
         saves: list = None,
         race: str = "human",
         gender: str = "male",
+        alignment: str = "",
         level: int = 1,
         ability_scores: dict = None,
         background: str = "",
@@ -319,6 +320,7 @@ def register(mcp):
         ability_scores: {"str": 16, "dex": 12, "con": 14, "int": 10, "wis": 11, "cha": 8}
         attacks: [{name, speed, attacks, thac0, damage_sm, damage_l?, range?}, ...]
         weapon_profs: ["Longsword", "Dagger", ...]
+        alignment: e.g. "Lawful Good", "Chaotic Neutral"
         nwps: ["Riding (WIS)", ...] or [{name, ability, slots?}, ...]
         natural_abilities: ["Infravision 60'", ...]
         inventory: ["Longsword", "Chain mail", "Backpack", ...]
@@ -356,6 +358,7 @@ def register(mcp):
             "saves":        saves,
             "skills":       skills or {},
         }
+        if alignment:           char_data["alignment"]         = alignment
         if ability_scores:      char_data["ability_scores"]    = ability_scores
         if background:          char_data["background"]        = background
         if attacks:             char_data["attacks"]           = attacks

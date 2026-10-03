@@ -2,11 +2,14 @@
 """Campaign dashboard web app. Run: python3 dashboard.py [--campaign NAME] [--port 5000]"""
 
 import argparse
+import hashlib
 import html
+import ipaddress
 import json
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from datetime import datetime, timezone
@@ -21,7 +24,7 @@ from tools import homebrew_classes as _hb
 from tools import dm_session as _dm
 from tools import images as _img
 from tools import tts as _tts
-from tools import lore_facts as _facts
+from tools import dungml_play as _dungml
 
 _MONSTERS_DB  = Path(__file__).parent / "global" / "monsters.db"
 _MONSTERS_DIR = Path(__file__).parent / "global" / "monsters"
@@ -274,7 +277,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
 
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
-  html {{ scrollbar-color: var(--rule-hi) var(--bg-deep); background: var(--bg-base); }}
+  html {{ scrollbar-color: var(--rule-hi) var(--bg-deep); }}
   ::selection {{ background: rgba(200,169,110,0.35); color: var(--ink-display); }}
 
   body {{
@@ -370,37 +373,6 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     left: 14px; right: 14px; bottom: -16px;
     height: 2px;
     background: var(--accent-gold);
-  }}
-
-  /* ---- Phone: collapse the nav into one swipeable row ----
-     Eleven uppercase links wrap into a tall block on a narrow screen and eat
-     the viewport. Below 640px we keep them on a single line and let the bar
-     scroll horizontally (momentum scroll on iOS), so the chrome stays one
-     row tall and every destination is a thumb-swipe away. */
-  @media (max-width: 640px) {{
-    /* Mobile browsers mis-paint background-attachment:fixed on a scrollable
-       page — the gradient covers only the first viewport and the rest goes
-       white. Anchor the background to the (tall) body instead. */
-    body {{ background-attachment: scroll; }}
-    nav {{
-      flex-wrap: nowrap;
-      overflow-x: auto;
-      overflow-y: hidden;
-      -webkit-overflow-scrolling: touch;
-      scrollbar-width: none;
-      padding: 10px 12px;
-    }}
-    nav::-webkit-scrollbar {{ display: none; }}
-    nav a {{
-      flex: 0 0 auto;
-      white-space: nowrap;
-      padding: 4px 12px;
-      letter-spacing: 0.16em;
-    }}
-    /* Keep the active-link underline inside the shorter, clipped bar. */
-    nav a.is-active::before {{ bottom: -6px; }}
-    .nav-play-toggles {{ margin-left: 6px; flex: 0 0 auto; }}
-    .container {{ padding: 20px 16px 48px; }}
   }}
 
   /* ---- Typography ---- */
@@ -1194,6 +1166,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <a href="/">Gallery</a>
   <a href="/world">World</a>
   <a href="/quests">Quests</a>
+  <a href="/log">Chronicle</a>
   <a href="/sessions">Sessions</a>
   <a href="/characters">Cast</a>
   <a href="/locations">Locations</a>
@@ -2130,8 +2103,6 @@ def world_view():
         + '</summary>'
         + f'<div class="spoiler-body">{secrets_html}</div>'
         + '</details>'
-        + '<h2><a href="/log">Chronicle</a></h2>'
-        + '<p class="muted">Session-by-session adventure log.</p>'
     )
     return render(f"{campaign_name} — World", body)
 
@@ -2500,22 +2471,6 @@ def campaigns_index():
   </form>
 </dialog>
 
-<dialog id="camp-instructions-dialog" class="camp-dialog">
-  <form id="camp-instructions-form">
-    <h3>Campaign instructions — <span id="camp-instr-target"></span></h3>
-    <p class="muted">A binding per-campaign constraint (e.g. lock the campaign to its module key) injected into every DM turn at the same authority as the Hard Constraints. Takes effect on that campaign's next turn.</p>
-    <label>Instructions<textarea name="text" maxlength="6000" rows="6" placeholder="e.g. Run strictly off modules/<slug>/; read the matching Level-NN.md before keying any room, encounter, NPC, or cosmology beat; do not invent substitutes for module factions, the previous-party roster, or the central mystery."></textarea></label>
-    <label style="display:flex; align-items:center; gap:8px; text-transform: none; letter-spacing: 0;">
-      <input type="checkbox" name="enabled" style="width:auto" checked> Enabled (uncheck to keep the text but stop injecting it)
-    </label>
-    <div class="err" id="camp-instr-err"></div>
-    <div class="actions">
-      <button type="button" data-close>Cancel</button>
-      <button type="submit" id="camp-instr-submit">Save</button>
-    </div>
-  </form>
-</dialog>
-
 <script>
 (function(){
   const grid = document.getElementById('camp-grid');
@@ -2543,13 +2498,6 @@ def campaigns_index():
   const banSubmit = document.getElementById('camp-banner-submit');
   let banSlug = null;
   let banMode = 'upload';
-
-  const instrDlg = document.getElementById('camp-instructions-dialog');
-  const instrForm = document.getElementById('camp-instructions-form');
-  const instrTarget = document.getElementById('camp-instr-target');
-  const instrErr = document.getElementById('camp-instr-err');
-  const instrSubmit = document.getElementById('camp-instr-submit');
-  let instrSlug = null;
 
   function esc(s) {
     return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2609,15 +2557,12 @@ def campaigns_index():
     open.addEventListener('click', () => switchAndOpen(c.slug));
     const banBtn = document.createElement('button'); banBtn.textContent = 'Banner';
     banBtn.addEventListener('click', () => openBanner(c.slug, c.name));
-    const instrBtn = document.createElement('button'); instrBtn.textContent = '📜 Instructions';
-    instrBtn.title = 'Binding per-campaign constraint (e.g. module lock)';
-    instrBtn.addEventListener('click', () => openInstructions(c.slug, c.name));
     const exp = document.createElement('a'); exp.className = 'btn'; exp.textContent = 'Export';
     exp.href = '/campaigns/' + encodeURIComponent(c.slug) + '/export.tgz';
     const del = document.createElement('button'); del.className = 'danger'; del.textContent = 'Delete';
     del.addEventListener('click', () => openDelete(c.slug));
     if (c.active) del.disabled = true, del.title = 'Switch to another campaign before deleting this one.';
-    actions.append(open, banBtn, instrBtn, exp, del);
+    actions.append(open, banBtn, exp, del);
     body.appendChild(actions);
     wrap.appendChild(body);
     return wrap;
@@ -2650,20 +2595,6 @@ def campaigns_index():
     banForm.reset();
     banDlg.showModal();
   }
-  async function openInstructions(slug, name) {
-    instrSlug = slug; instrTarget.textContent = name; instrErr.textContent = '';
-    instrForm.elements.text.value = '';
-    instrForm.elements.enabled.checked = true;
-    instrDlg.showModal();
-    try {
-      const r = await fetch('/campaigns/' + encodeURIComponent(slug) + '/instructions');
-      const d = await r.json().catch(() => ({}));
-      if (r.ok && d.instructions) {
-        instrForm.elements.text.value = d.instructions.text || '';
-        instrForm.elements.enabled.checked = d.instructions.enabled !== false;
-      }
-    } catch (e) { /* leave blank on fetch failure */ }
-  }
   function setBannerMode(mode) {
     banMode = mode;
     banForm.querySelectorAll('.banner-tabs button').forEach(b => {
@@ -2681,7 +2612,7 @@ def campaigns_index():
     dlg.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => dlg.close()));
     dlg.addEventListener('click', (e) => { if (e.target === dlg) dlg.close(); });
   }
-  [newDlg, impDlg, delDlg, banDlg, instrDlg].forEach(wireClose);
+  [newDlg, impDlg, delDlg, banDlg].forEach(wireClose);
 
   newBtn.addEventListener('click', () => {
     newErr.textContent = ''; newForm.reset();
@@ -2756,31 +2687,6 @@ def campaigns_index():
     }
   });
 
-  instrForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    instrErr.textContent = '';
-    if (!instrSlug) return;
-    instrSubmit.disabled = true;
-    const origTxt = instrSubmit.textContent;
-    instrSubmit.textContent = 'Saving…';
-    try {
-      const r = await fetch('/campaigns/' + encodeURIComponent(instrSlug) + '/instructions', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          text: instrForm.elements.text.value,
-          enabled: instrForm.elements.enabled.checked,
-        }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) { instrErr.textContent = d.error || 'Failed.'; return; }
-      instrDlg.close();
-    } finally {
-      instrSubmit.disabled = false;
-      instrSubmit.textContent = origTxt;
-    }
-  });
-
   refresh();
 })();
 </script>
@@ -2801,23 +2707,6 @@ def campaign_banner(slug: str):
     if not p:
         abort(404)
     return send_file(str(p))
-
-
-@app.route("/campaigns/<slug>/instructions", methods=["GET", "POST"])
-def campaign_instructions(slug: str):
-    """Read (GET) or persist (POST) a campaign's binding instructions directive
-    without needing to switch to it. POST body: {"text": <str>, "enabled":
-    <bool>}. Takes effect on that campaign's next DM turn."""
-    if not re.match(r"^[a-z0-9][a-z0-9\-_]*$", slug):
-        return jsonify({"error": "invalid slug"}), 400
-    if not (Path(__file__).parent / "campaigns" / slug / "campaign.json").is_file():
-        return jsonify({"error": "campaign not found"}), 404
-    if request.method == "GET":
-        return jsonify({"instructions": _dm.instructions_setting(slug)})
-    data = request.get_json(silent=True) or {}
-    setting = _dm.set_campaign_instructions(
-        text=data.get("text"), enabled=data.get("enabled"), slug=slug)
-    return jsonify({"ok": True, "instructions": setting})
 
 
 @app.route("/campaigns/<slug>/switch", methods=["POST"])
@@ -3471,11 +3360,6 @@ _PLAY_HTML = """
     letter-spacing: 0;
     margin-left: 6px;
   }
-  .play-toolbar .sid .session-no {
-    color: var(--ink-display);
-    margin-left: 6px;
-  }
-  .play-toolbar .sid .session-no:empty { display: none; }
   .play-toolbar .sid code.sid-size {
     color: var(--ink-muted);
     margin-left: 8px;
@@ -3514,23 +3398,6 @@ _PLAY_HTML = """
     min-width: 7ch;
     color: var(--ink, #e8e2d0);
   }
-  .play-toolbar .instructions-group { display: inline-flex; align-items: center; gap: 5px; }
-  .play-toolbar #play-instructions-btn.active { color: var(--accent-gold, #c8a24a); opacity: 1; }
-  .play-toolbar #play-instructions-text {
-    width: 28ch;
-    max-width: 40vw;
-    font-size: 0.8em;
-    resize: vertical;
-    vertical-align: middle;
-    color: var(--ink, #e8e2d0);
-    background: rgba(0,0,0,0.25);
-    border: 1px solid rgba(200,162,74,0.4);
-    border-radius: 4px;
-    padding: 3px 5px;
-  }
-  .play-toolbar #play-instructions-text[hidden] { display: none; }
-  .play-toolbar #play-instructions-enabled-wrap { font-size: 0.78em; opacity: 0.8; display: inline-flex; align-items: center; gap: 3px; }
-  .play-toolbar #play-instructions-enabled-wrap[hidden] { display: none; }
   .play-toolbar .spacer { flex: 1; }
   .play-toolbar button {
     background: transparent;
@@ -4321,39 +4188,6 @@ _PLAY_HTML = """
     white-space: nowrap;
   }
 
-  /* "Did you know" lore fact beneath the thinking row, shown only while the
-     DM is composing. Scoped to .has-dyk so the recovery indicator (which
-     reuses .turn.thinking as a plain row) is unaffected. */
-  .turn.thinking.has-dyk { flex-direction: column; align-items: stretch; gap: 10px; }
-  .turn.thinking.has-dyk .thinking-row { display: flex; align-items: center; gap: 14px; }
-  .turn.thinking .dyk {
-    border-top: 1px dotted var(--rule);
-    padding-top: 10px;
-    font-style: normal;
-    line-height: 1.55;
-    opacity: 0;
-    transition: opacity 0.55s ease;
-  }
-  .turn.thinking .dyk.show { opacity: 1; }
-  .turn.thinking .dyk-label {
-    font-family: var(--font-display);
-    text-transform: uppercase;
-    letter-spacing: 0.16em;
-    font-size: 0.7em;
-    color: var(--accent-gold);
-    margin-right: 9px;
-  }
-  .turn.thinking .dyk-label::before { content: '\\2726  '; }   /* ✦ */
-  .turn.thinking .dyk-fact { font-size: 0.95em; color: var(--ink-body); }
-  .turn.thinking .dyk-cat {
-    font-family: var(--font-mono);
-    font-size: 0.7em;
-    color: var(--accent-gold);
-    opacity: 0.55;
-    margin-left: 8px;
-    white-space: nowrap;
-  }
-
   /* ---- Sidebar ---- */
   .play-side {
     background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
@@ -4458,8 +4292,43 @@ _PLAY_HTML = """
     font-size: 0.6em;
     letter-spacing: 0;
   }
-  .party-list { display: flex; flex-direction: column; gap: 10px; }
-  .party-mini { display: flex; gap: 10px; align-items: flex-start; }
+  .party-list { display: flex; flex-direction: column; gap: 16px; }
+  .party-mini { display: flex; gap: 12px; align-items: flex-start; }
+
+  /* ---- Party reorder handles ---- */
+  /* The party sequence *is* campaign.json's `characters` key order, which
+     every surface iterates (this sidebar, the Cast page, the statusline,
+     combat setup) — so moving a card here moves it everywhere. Faint until
+     the card is hovered; the column always occupies its width so revealing
+     the arrows never shifts the layout. */
+  .party-mini-order {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex-shrink: 0;
+    opacity: 0.22;
+    transition: opacity 180ms ease;
+  }
+  .party-mini:hover .party-mini-order,
+  .party-mini-order:focus-within { opacity: 1; }
+  .ord-btn {
+    appearance: none;
+    width: 17px; height: 15px;
+    padding: 0;
+    line-height: 1;
+    font-size: 0.7em;
+    background: var(--bg-rec);
+    color: var(--ink-muted);
+    border: 1px solid var(--rule);
+    border-radius: 2px;
+    cursor: pointer;
+    transition: color 140ms ease, border-color 140ms ease;
+  }
+  .ord-btn:hover:not(:disabled) {
+    color: var(--accent-gold-hi);
+    border-color: var(--accent-gold);
+  }
+  .ord-btn:disabled { opacity: 0.25; cursor: default; }
 
   /* ---- Audit dialog + toolbar pip ---- */
   /* The post-turn audit lives behind the 📋 button in the recovery/debug
@@ -4523,7 +4392,7 @@ _PLAY_HTML = """
   }}
   .portrait-frame {
     flex-shrink: 0;
-    width: 50px; height: 50px;
+    width: 58px; height: 58px;
     border-radius: 50%;
     background: var(--bg-deep);
     border: 1px solid var(--accent-gold);
@@ -4560,9 +4429,9 @@ _PLAY_HTML = """
   .party-mini-name {
     font-family: var(--font-display);
     color: var(--ink-display);
-    font-size: 0.88em;
+    font-size: 0.94em;
     letter-spacing: 0.06em;
-    line-height: 1.15;
+    line-height: 1.2;
     display: block;
     text-decoration: none;
     transition: color 180ms ease;
@@ -4584,7 +4453,7 @@ _PLAY_HTML = """
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-top: 3px;
+    margin-top: 6px;
   }
   .party-mini-hp .hp-meter { flex: 1; }
   .party-mini-hp-text {
@@ -4599,7 +4468,7 @@ _PLAY_HTML = """
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-top: 2px;
+    margin-top: 3px;
     opacity: 0.75;
   }
   .party-mini-xp .xp-meter { flex: 1; }
@@ -4650,100 +4519,13 @@ _PLAY_HTML = """
     }
     .play-side { max-height: 480px; }
   }
-
-  /* ---- Phone (≤640px): stack everything and let the page scroll ----
-     On desktop /play locks to the viewport (body overflow hidden, log owns the
-     scroll). That falls apart on a phone: the party sidebar would sit below a
-     clipped, unreachable fold. Here we release the lock so the document scrolls
-     naturally — toolbar, narrative log, composer, then the party panel as a
-     full-width block beneath the main column. */
-  @media (max-width: 640px) {
-    /* Release the viewport lock (body overflow hidden + fixed-height flex
-       container) and let the document scroll. The :has() rules only matter on
-       browsers that support it; the block-flow stacking below uses plain
-       selectors so it works everywhere. */
-    body:has(.play-shell) { overflow: auto; }
-    .container:has(.play-shell) {
-      display: block;
-      height: auto;
-      min-height: 0;
-      padding: 14px 14px 32px;
-    }
-    /* Drop the two-column grid: stack main and sidebar as ordinary blocks,
-       each sized to its own content. A grid here lets the viewport-capped
-       flex chain starve the sidebar row down to a sliver. */
-    .play-shell {
-      display: block;
-      flex: none;
-      height: auto;
-      min-height: 0;
-    }
-    .play-main {
-      display: flex;
-      flex-direction: column;
-      flex: none;
-      min-height: 0;
-    }
-
-    /* Header items wrap; the front-end icon buttons fall to the row(s)
-       beneath them. The session chip claims the full first line so the tone /
-       detail controls and icon clusters read as a tidy second tier. */
-    .play-toolbar {
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px 10px;
-      margin-bottom: 10px;
-      min-width: 0;
-      max-width: 100%;
-    }
-    .play-toolbar .spacer { display: none; }
-    /* Flex items default to min-width:auto and refuse to shrink below their
-       content — which keeps a wide group on one line and overflows the row.
-       Allowing them to shrink is what actually lets the wrap engage. */
-    .play-toolbar > * { min-width: 0; }
-    .play-toolbar .session-group { flex: 1 1 100%; min-width: 0; }
-    /* The session hash is a long unbreakable mono string; if it can't break it
-       pushes the page wider than the phone, and the browser shrink-to-fits the
-       whole toolbar back onto one row. Force it to wrap within the line. */
-    .play-toolbar .sid { min-width: 0; }
-    .play-toolbar .sid a,
-    .play-toolbar .sid code { overflow-wrap: anywhere; word-break: break-word; }
-    /* Roomier finger targets for the icon buttons on a touchscreen. */
-    .icon-btn,
-    .turn-toggle.icon { width: 36px; height: 32px; font-size: 0.98em; }
-
-    /* The log no longer flexes to fill the viewport (the page scrolls now);
-       give it a comfortable fixed slice so the composer stays in reach. */
-    .play-log {
-      flex: none;
-      height: 58vh;
-      min-height: 300px;
-      padding: 16px 16px;
-      font-size: 1em;
-    }
-
-    /* Party sidebar: full-width block below the narrative, sized to its
-       content, no inner scroll. margin-top replaces the dropped grid gap. */
-    .play-side {
-      display: block;
-      width: 100%;
-      margin-top: 14px;
-      max-height: none;
-      overflow: visible;
-    }
-
-    /* Composer scaled for thumbs; nudge the jump-button clear of it. */
-    .play-form textarea { font-size: 1.05em; min-height: 56px; padding: 12px 14px; }
-    .play-form button { width: 56px; }
-    .jump-btn { right: 14px; bottom: 96px; }
-  }
 </style>
 
 <div class="play-shell">
   <section class="play-main">
     <div class="play-toolbar">
       <span class="session-group">
-        <span class="sid">session<span id="play-session-no" class="session-no"></span><a id="play-sid" href="#" target="_blank" rel="noopener"><code>…</code></a><code id="play-sid-size" class="sid-size"></code></span>
+        <span class="sid">session<a id="play-sid" href="#" target="_blank" rel="noopener"><code>…</code></a><code id="play-sid-size" class="sid-size"></code></span>
         <button id="play-reset" type="button" class="icon-btn" title="New session: start a fresh DM conversation (current session remains in /sessions)" aria-label="New session">✨</button>
       </span>
       <span class="tone-group" role="group" aria-label="DM narration tone" title="DM narration tone — shapes voice and texture only, never the rules">
@@ -4763,10 +4545,16 @@ _PLAY_HTML = """
         <input id="play-detail" type="range" min="0" max="3" step="1" value="2" aria-label="Narrative detail level" />
         <span id="play-detail-label" class="detail-label">Standard</span>
       </span>
-      <span class="instructions-group" role="group" aria-label="Campaign instructions" title="Campaign instructions — a binding per-campaign constraint (e.g. lock the campaign to its module) injected into every DM turn at the same authority as the Hard Constraints.">
-        <button id="play-instructions-btn" type="button" class="icon-btn" title="Campaign instructions — binding per-campaign constraint (e.g. module lock)" aria-label="Campaign instructions">📜</button>
-        <textarea id="play-instructions-text" maxlength="6000" rows="3" placeholder="Binding per-campaign instructions (e.g. run strictly off modules/<slug>/, consult Level-NN.md before keying any room)…" hidden aria-label="Campaign instructions text"></textarea>
-        <label id="play-instructions-enabled-wrap" hidden><input id="play-instructions-enabled" type="checkbox" checked /> enabled</label>
+      <span class="tone-group" role="group" aria-label="DM reasoning effort" title="Reasoning effort — how long the DM deliberates before answering. Auto spends it where the rules bite (live combat, multi-NPC scenes, staged plans) and stays cheap elsewhere. Lower is faster; pinning Low everywhere trades procedural care for speed.">
+        <span class="tone-icon" aria-hidden="true">⚡</span>
+        <select id="play-effort" aria-label="DM reasoning effort">
+          <option value="auto">Effort: auto</option>
+          <option value="low">Effort: low</option>
+          <option value="medium">Effort: medium</option>
+          <option value="high">Effort: high</option>
+          <option value="xhigh">Effort: xhigh</option>
+          <option value="max">Effort: max</option>
+        </select>
       </span>
       <span class="view-controls">
         <span class="filter-group" role="group" aria-label="Show message types">
@@ -4871,9 +4659,9 @@ _PLAY_HTML = """
   </section>
 
   <aside class="play-side">
-    <!-- <div class="side-camp" id="side-camp"></div> -->
+    <div class="side-camp" id="side-camp"></div>
     <div class="side-stats" id="side-stats"></div>
-    <!-- <div class="side-title">The Party</div> -->
+    <div class="side-title">The Party</div>
     <div class="party-list" id="party-list">
       <div class="muted" style="text-align:center; font-size:0.84em; font-style:italic">…</div>
     </div>
@@ -5012,50 +4800,24 @@ _PLAY_HTML = """
     detailSlider.addEventListener('change', saveDetail);
   }
 
-  // --- Campaign instructions (binding per-campaign constraint) -------------
-  const instrBtn = document.getElementById('play-instructions-btn');
-  const instrText = document.getElementById('play-instructions-text');
-  const instrEnabled = document.getElementById('play-instructions-enabled');
-  const instrEnabledWrap = document.getElementById('play-instructions-enabled-wrap');
+  // --- Reasoning effort ---------------------------------------------------
+  const effortSel = document.getElementById('play-effort');
 
-  function applyInstructionsSetting(i) {
-    if (!i || !instrText) return;
-    instrText.value = i.text || '';
-    if (instrEnabled) instrEnabled.checked = i.enabled !== false;
-    // Mark the toggle button active when a directive is set and enabled.
-    if (instrBtn) {
-      const active = !!(i.text && i.text.trim()) && i.enabled !== false;
-      instrBtn.classList.toggle('active', active);
-    }
+  function applyEffortSetting(e) {
+    if (!effortSel || !e || !e.effort) return;
+    effortSel.value = e.effort;
   }
 
-  async function saveInstructions() {
-    if (!instrText) return;
-    try {
-      await fetch('/play/instructions', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-          text: instrText.value,
-          enabled: instrEnabled ? instrEnabled.checked : true,
-        }),
-      });
-    } catch (e) { /* best-effort */ }
-    applyInstructionsSetting({
-      text: instrText.value,
-      enabled: instrEnabled ? instrEnabled.checked : true,
+  if (effortSel) {
+    effortSel.addEventListener('change', async () => {
+      try {
+        await fetch('/play/effort', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({effort: effortSel.value}),
+        });
+      } catch (err) { /* best-effort */ }
     });
-  }
-
-  if (instrBtn) {
-    instrBtn.addEventListener('click', () => {
-      const hidden = instrText.hidden;
-      instrText.hidden = !hidden;
-      if (instrEnabledWrap) instrEnabledWrap.hidden = !hidden;
-      if (!instrText.hidden) instrText.focus();
-    });
-    instrText.addEventListener('change', saveInstructions);  // commits on blur
-    if (instrEnabled) instrEnabled.addEventListener('change', saveInstructions);
   }
 
   // --- Nav toggles: subheader (toolbar) + party panel ---------------------
@@ -5136,36 +4898,6 @@ _PLAY_HTML = """
   let thinkingStart = 0;
   let thinkingTimer = null;
   let thinkingTools = 0;
-
-  // "Did you know" lore facts — fetched once on load, then rotated with a
-  // cross-fade beneath the "DM is thinking" row during the wait for a reply.
-  let dykFacts = [];
-  let dykTimer = null;
-  let dykPos = 0;
-  const DYK_ROTATE_MS = 10000;
-  fetch('/api/facts/random?n=40')
-    .then(r => r.ok ? r.json() : null)
-    .then(d => { if (d && Array.isArray(d.facts)) dykFacts = d.facts; })
-    .catch(() => {});
-
-  function renderNextFact() {
-    if (!thinkingEl || !dykFacts.length) return;
-    const dyk = thinkingEl.querySelector('.dyk');
-    if (!dyk) return;
-    const f = dykFacts[dykPos % dykFacts.length];
-    dykPos++;
-    dyk.classList.remove('show');           // fade current out
-    setTimeout(function(){
-      if (!thinkingEl) return;              // turn ended mid-fade
-      const factSpan = dyk.querySelector('.dyk-fact');
-      const catSpan = dyk.querySelector('.dyk-cat');
-      if (factSpan) factSpan.textContent = f.text || '';
-      // Campaign facts show the campaign name; others show the category.
-      const tag = (f.category === 'campaign' && f.campaign) ? f.campaign : f.category;
-      if (catSpan) catSpan.textContent = tag ? ('— ' + tag) : '';
-      dyk.classList.add('show');            // fade next in
-    }, 280);
-  }
   // Map tool_use.id → DOM element so tool_result events can fill in the
   // result section once it lands.
   const toolElements = new Map();
@@ -5668,25 +5400,13 @@ _PLAY_HTML = """
     thinkingEl = document.createElement('div');
     thinkingEl.className = 'turn thinking';
     thinkingEl.innerHTML =
-        '<div class="thinking-row">'
-      +   '<span class="thinking-glyph" aria-hidden="true"><span></span><span></span><span></span></span>'
-      +   '<span class="thinking-text">DM is thinking…</span>'
-      +   '<span class="thinking-time">0.0s</span>'
-      + '</div>'
-      + '<div class="dyk" aria-live="polite">'
-      +   '<span class="dyk-label">Did you know</span>'
-      +   '<span class="dyk-fact"></span><span class="dyk-cat"></span>'
-      + '</div>';
+        '<span class="thinking-glyph" aria-hidden="true"><span></span><span></span><span></span></span>'
+      + '<span class="thinking-text">DM is thinking…</span>'
+      + '<span class="thinking-time">0.0s</span>';
     log.appendChild(thinkingEl);
     maybeScrollToBottom();
     updateThinkingTime();
     thinkingTimer = setInterval(updateThinkingTime, 200);
-    // Rotate lore facts during the wait (only if any loaded).
-    if (dykFacts.length) {
-      thinkingEl.classList.add('has-dyk');
-      renderNextFact();
-      dykTimer = setInterval(renderNextFact, DYK_ROTATE_MS);
-    }
   }
 
   function updateThinkingTime() {
@@ -5701,42 +5421,9 @@ _PLAY_HTML = """
 
   function stopThinking() {
     if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
-    if (dykTimer) { clearInterval(dykTimer); dykTimer = null; }
     if (thinkingEl && thinkingEl.parentElement) thinkingEl.remove();
     thinkingEl = null;
   }
-
-  // --- Browser-tab activity indicator -------------------------------------
-  // Reflects the DM turn state in the favicon so you can tell at a glance
-  // (or from another tab) whether a response is ongoing or complete:
-  //   ongoing  -> gold dot favicon
-  //   complete -> favicon restored; but if the turn finishes while this tab is
-  //               in the background, a green check flags it until you return.
-  const FAVI_IDLE = '/static/favicon.svg';
-  const FAVI_BUSY = 'data:image/svg+xml,' + encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="#c8a96e"/></svg>');
-  const FAVI_DONE = 'data:image/svg+xml,' + encodeURIComponent(
-    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><circle cx="8" cy="8" r="7" fill="#3f9142"/><path d="M4.5 8.3L7 10.8l4.5-5.3" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>');
-
-  function setFavicon(href) {
-    let l = document.querySelector('link[rel="icon"]');
-    if (!l) { l = document.createElement('link'); l.rel = 'icon'; document.head.appendChild(l); }
-    l.type = 'image/svg+xml';
-    l.href = href;
-  }
-  function tabBusy() { setFavicon(FAVI_BUSY); }
-  function tabIdle() { setFavicon(FAVI_IDLE); }
-  function tabDone() {
-    // Only flag completion when the user is looking elsewhere; if they're on
-    // this tab they can already see the result, so just reset.
-    if (document.hidden) { setFavicon(FAVI_DONE); }
-    else { tabIdle(); }
-  }
-  // Returning to the tab clears a lingering "complete" flag, but never while a
-  // turn is still in flight (tabBusy owns the indicator then).
-  document.addEventListener('visibilitychange', function() {
-    if (!document.hidden && !localTurnActive) tabIdle();
-  });
 
   function clearEmptyState() {
     if (firstAppend) {
@@ -6172,7 +5859,6 @@ _PLAY_HTML = """
     clearSuggestions();
     append('player', text);
     startThinking();
-    tabBusy();
     send.disabled = true;
     lastDmText = '';
     streamedText = false;
@@ -6213,7 +5899,6 @@ _PLAY_HTML = """
       flushDmReveal();          // make sure anything queued is shown before we exit
       stopThinking();
       localTurnActive = false;
-      tabDone();
       send.disabled = false;
       statusEl.textContent = '';
       input.focus();
@@ -6232,7 +5917,7 @@ _PLAY_HTML = """
       partyList.innerHTML = '<div class="muted" style="text-align:center; font-size:0.82em; font-style:italic">No characters in roster.</div>';
       return;
     }
-    partyList.innerHTML = chars.map(c => {
+    partyList.innerHTML = chars.map((c, i) => {
       const pct = c.hp_max > 0 ? Math.max(0, Math.min(100, (c.hp / c.hp_max) * 100)) : 0;
       const ko = (c.hp || 0) <= 0;
       const portrait = c.portrait
@@ -6257,9 +5942,21 @@ _PLAY_HTML = """
         xpHtml = ''
           + '<div class="party-mini-xp" title="XP ' + xpFmt(c.xp) + ' / ' + xpFmt(c.xp_next) + ' (next level)">'
           +   '<span class="xp-meter"><i style="width:' + xpPct.toFixed(1) + '%"></i></span>'
-          +   '<span class="party-mini-xp-text">' + xpFmt(c.xp) + '</span>'
+          +   '<span class="party-mini-xp-text">' + xpFmt(c.xp) + '/' + xpFmt(c.xp_next) + '</span>'
           + '</div>';
       }
+
+      // Reorder handles. Disabled at the ends so the arrow that can't do
+      // anything reads as unavailable rather than silently no-opping.
+      const ordKey = esc(c.key || '');
+      const ordName = esc(c.label || '');
+      const ordHtml = ''
+        + '<div class="party-mini-order">'
+        +   '<button type="button" class="ord-btn" data-key="' + ordKey + '" data-dir="up"'
+        +     (i === 0 ? ' disabled' : '') + ' title="Move up" aria-label="Move ' + ordName + ' up">▴</button>'
+        +   '<button type="button" class="ord-btn" data-key="' + ordKey + '" data-dir="down"'
+        +     (i === chars.length - 1 ? ' disabled' : '') + ' title="Move down" aria-label="Move ' + ordName + ' down">▾</button>'
+        + '</div>';
 
       return ''
         + '<article class="party-mini">'
@@ -6267,28 +5964,30 @@ _PLAY_HTML = """
         +   '<div class="party-mini-body">'
         +     '<a class="party-mini-name" href="' + sheetUrl + '">' + esc(c.label) + '</a>'
         +     (sub ? '<div class="party-mini-class">' + esc(sub) + '</div>' : '')
-        +     xpHtml
         +     '<div class="party-mini-hp">'
         +       '<span class="hp-meter"><i style="width:' + pct.toFixed(1) + '%"></i></span>'
         +       '<span class="party-mini-hp-text">' + esc(c.hp) + '/' + esc(c.hp_max) + '</span>'
         +     '</div>'
+        +     xpHtml
         +     (conds ? '<div class="party-mini-conds">' + conds + '</div>' : '')
         +   '</div>'
+        +   ordHtml
         + '</article>';
     }).join('');
   }
 
   function renderSidebarStats(s) {
-    // sideCamp.innerHTML = (s.campaign && s.campaign.name) ? esc(s.campaign.name) : '';
-    // Session number lives in the global header now, beside the session hash.
-    const sessNoEl = document.getElementById('play-session-no');
-    if (sessNoEl) sessNoEl.textContent = s.session ? String(s.session) : '';
+    sideCamp.innerHTML = (s.campaign && s.campaign.name) ? esc(s.campaign.name) : '';
     const rows = [];
     const r1 = [];
-    if (s.day) r1.push(pip('Day', s.time ? (s.day + '  ' + s.time) : String(s.day)));
-    if (s.coin) r1.push(pip('', s.coin, 'pip-gold'));
+    if (s.session) r1.push(pip('Sess', s.session));
+    if (s.day) r1.push(pip('Day', s.day));
+    if (s.time) r1.push(pip('Time', s.time));
     if (r1.length) rows.push('<div class="side-row">' + r1.join('') + '</div>');
-    if (s.weather) rows.push('<div class="side-row">' + pip('Sky', s.weather) + '</div>');
+    const r2 = [];
+    if (s.weather) r2.push(pip('Sky', s.weather));
+    if (s.coin) r2.push(pip('Gold', s.coin, 'pip-gold'));
+    if (r2.length) rows.push('<div class="side-row">' + r2.join('') + '</div>');
     if (s.location) {
       rows.push('<div class="side-row row-loc">' + pip('At', s.location) + '</div>');
     }
@@ -6309,6 +6008,30 @@ _PLAY_HTML = """
       // best-effort: leave existing render in place
     }
   }
+
+  // Party reorder. The server owns the sequence (campaign.json's `characters`
+  // key order), so we POST the move and re-render from /api/play_state.json
+  // rather than shuffling the DOM locally — that keeps the sidebar honest if
+  // the write is rejected or the roster changed underneath us. Delegated,
+  // because renderParty replaces the whole list on every poll.
+  partyList.addEventListener('click', async (e) => {
+    const btn = e.target.closest('.ord-btn');
+    if (!btn || btn.disabled) return;
+    e.preventDefault();
+    partyList.querySelectorAll('.ord-btn').forEach(b => { b.disabled = true; });
+    try {
+      const r = await fetch('/api/party/reorder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: btn.dataset.key, direction: btn.dataset.dir}),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+    } catch (err) {
+      statusEl.textContent = 'reorder failed';
+      setTimeout(() => { statusEl.textContent = ''; }, 2000);
+    }
+    await refreshState();
+  });
 
   form.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -6689,7 +6412,7 @@ _PLAY_HTML = """
     renderSessionMeta(d);
     applyToneSetting(d.tone);
     applyDetailSetting({detail: d.detail, choices: d.detail_choices});
-    applyInstructionsSetting(d.instructions);
+    applyEffortSetting(d.effort);
   });
 
   // ------------------------------------------------------------------
@@ -6997,7 +6720,8 @@ def play_session_id():
         "tone": _dm.tone_setting(),
         "detail": _dm.detail_setting(),
         "detail_choices": _dm.detail_choices(),
-        "instructions": _dm.instructions_setting(),
+        "effort": _dm.effort_setting(),
+        "effort_choices": _dm.effort_choices(),
     })
 
 
@@ -7022,17 +6746,18 @@ def play_set_detail():
     return jsonify({"ok": True, "detail": setting})
 
 
-@app.route("/play/instructions", methods=["POST"])
-def play_set_instructions():
-    """Persist the active campaign's instructions directive. Body:
-    {"text": <str>, "enabled": <bool>}. A binding per-campaign canon/procedural
-    constraint (e.g. a module lock) injected into every subsequent DM turn's
-    system prompt at the same authority as CLAUDE.md's Hard Constraints. Takes
-    effect on the next turn."""
+@app.route("/play/effort", methods=["POST"])
+def play_set_effort():
+    """Persist the active campaign's DM reasoning effort. Body:
+    {"effort": "auto"|"low"|"medium"|"high"|"xhigh"|"max"}.
+
+    "auto" lets the driver pick per turn — full effort for a live combat, a
+    multi-NPC scene or a staged plan, cheap effort for routine turns. A pinned
+    level applies to every turn. Changing this replaces the resident CLI
+    process on the next turn, so it takes effect immediately."""
     data = request.get_json(silent=True) or {}
-    setting = _dm.set_campaign_instructions(
-        text=data.get("text"), enabled=data.get("enabled"))
-    return jsonify({"ok": True, "instructions": setting})
+    setting = _dm.set_effort(data.get("effort"))
+    return jsonify({"ok": True, "effort": setting})
 
 
 @app.route("/play/reset", methods=["POST"])
@@ -7053,6 +6778,65 @@ def play_force_reset():
 @app.route("/api/play_state.json")
 def api_play_state():
     return jsonify(_play_state())
+
+
+@app.route("/api/party/reorder", methods=["POST"])
+def api_party_reorder():
+    """Reorder the party sequence. Body is either
+
+        {"key": "<char key>", "direction": "up"|"down"}   — move one slot
+        {"order": ["<key>", ...]}                          — apply a sequence
+
+    The sequence *is* campaign.json's `characters` key order — the /play
+    sidebar, the Cast page, the statusline and `start_combat` all iterate that
+    dict — so this rewrites the object with its keys in the new order and
+    leaves every character record untouched."""
+    if not cfg:
+        return jsonify({"error": "no active campaign"}), 400
+    data = request.get_json(silent=True) or {}
+
+    # Read campaign.json straight off disk rather than writing back the
+    # dashboard's in-memory cfg: the MCP tools write this same file from
+    # another process during play, and a stale in-memory copy would clobber a
+    # quest or NPC added seconds ago. We reorder `characters` on the fresh
+    # document and leave every other key exactly as we found it.
+    path = cfg["_dir"] / "campaign.json"
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return jsonify({"error": f"cannot read campaign.json: {exc}"}), 500
+
+    chars = doc.get("characters") or {}
+    keys = list(chars)
+    if not keys:
+        return jsonify({"error": "no characters in roster"}), 400
+
+    explicit = data.get("order")
+    if explicit is not None:
+        if (not isinstance(explicit, list) or len(explicit) != len(keys)
+                or set(map(str, explicit)) != set(keys)):
+            return jsonify({"error": "order must be a permutation of the roster keys"}), 400
+        new_keys = [str(k) for k in explicit]
+    else:
+        key = str(data.get("key") or "")
+        direction = str(data.get("direction") or "").lower()
+        if key not in chars:
+            return jsonify({"error": f"unknown character key '{key}'"}), 404
+        if direction not in ("up", "down"):
+            return jsonify({"error": "direction must be 'up' or 'down'"}), 400
+        i = keys.index(key)
+        j = i - 1 if direction == "up" else i + 1
+        if not 0 <= j < len(keys):
+            # Already at that end. A no-op rather than an error, so a stray
+            # click on an end-of-list arrow costs nothing.
+            return jsonify({"ok": True, "order": keys, "moved": False})
+        new_keys = keys[:]
+        new_keys[i], new_keys[j] = new_keys[j], new_keys[i]
+
+    doc["characters"] = {k: chars[k] for k in new_keys}
+    _c.atomic_write_text(path, json.dumps(doc, indent=2))
+    _reload_cfg()          # pick the new order up for this process straight away
+    return jsonify({"ok": True, "order": new_keys, "moved": True})
 
 
 @app.route("/api/last_narrative")
@@ -7469,22 +7253,12 @@ def _nwps_list(nwps: list) -> str:
         return ""
     rows = []
     for n in nwps:
-        if isinstance(n, dict):
-            name = html.escape(str(n.get("name", "?")))
-            ab = n.get("ability") or ""
-            ab_html = f' <span class="muted">({html.escape(str(ab))})</span>' if ab else ""
-            rows.append(f"<li>{name}{ab_html}</li>")
-        elif isinstance(n, str) and n.strip():
-            # Plain-string form, e.g. "Healing (WIS)" or "Herbalism (INT, 2 slots)".
-            # The governing ability is usually embedded in a trailing paren —
-            # split it out so it renders muted, matching the dict form.
-            m = re.match(r"^(.*?)\s*\(([^)]*)\)\s*$", n.strip())
-            if m:
-                name = html.escape(m.group(1).strip())
-                ab = html.escape(m.group(2).strip())
-                rows.append(f'<li>{name} <span class="muted">({ab})</span></li>')
-            else:
-                rows.append(f"<li>{html.escape(n.strip())}</li>")
+        if not isinstance(n, dict):
+            continue
+        name = html.escape(str(n.get("name", "?")))
+        ab = n.get("ability") or ""
+        ab_html = f' <span class="muted">({html.escape(str(ab))})</span>' if ab else ""
+        rows.append(f"<li>{name}{ab_html}</li>")
     return f'<ul class="sheet-list">{"".join(rows)}</ul>' if rows else ""
 
 
@@ -7698,7 +7472,6 @@ def character_sheet(slug: str):
     image_index = _load_image_index() if char else _load_image_index()
     portrait = _find_portrait(name, image_index, slug)
     portrait_html = ""
-    regen_dialog_html = ""
     if portrait:
         fn = html.escape(portrait["filename"])
         desc = html.escape(portrait.get("description", ""))
@@ -7706,46 +7479,11 @@ def character_sheet(slug: str):
             f'<details class="portrait-desc"><summary>portrait notes</summary>'
             f'<p>{desc}</p></details>'
         ) if desc else ""
-        # The ↻ button opens a small dialog that lets you optionally add a
-        # prompt. The typed text is combined with the character's stored
-        # portrait_prompt (which anchors the likeness / CHA-appropriate
-        # appearance); leaving it blank redraws from that base prompt as-is.
-        base_prompt = (char.get("portrait_prompt") or "").strip()
-        regen_btn = (
-            f'<button class="portrait-regen" data-slug="{html.escape(slug)}" '
-            f'type="button" title="Regenerate portrait…" '
-            f'aria-label="Regenerate portrait">↻</button>'
-        )
         portrait_html = (
-            f'<div class="sheet-portrait-wrap holding-portrait-wrap">'
+            f'<div class="sheet-portrait-wrap">'
             f'<img class="sheet-portrait" src="/images/{fn}" alt="{html.escape(name)}">'
-            f'{regen_btn}'
             f'{desc_block}'
             f'</div>'
-        )
-        if base_prompt:
-            note = ("Optional extra direction — combined with this character's stored "
-                    "portrait prompt. Leave blank to redraw from the base prompt as-is.")
-            base_block = (
-                f'<details class="portrait-base"><summary>base prompt</summary>'
-                f'<p class="muted">{html.escape(base_prompt)}</p></details>'
-            )
-        else:
-            note = ("No portrait prompt is stored for this character — describe the "
-                    "portrait you want below (a blank box can't regenerate).")
-            base_block = ""
-        regen_dialog_html = (
-            '<dialog id="portrait-regen-dialog" class="portrait-regen-dialog">'
-            '<form id="portrait-regen-form" method="dialog">'
-            '<h3>Regenerate portrait</h3>'
-            f'<p class="muted">{note}</p>'
-            '<textarea id="portrait-regen-extra" rows="3" '
-            'placeholder="e.g. older, grey at the temples · a fresh scar · softer light"></textarea>'
-            f'{base_block}'
-            '<div class="actions">'
-            '<button type="button" id="portrait-regen-cancel">Cancel</button>'
-            '<button type="submit" id="portrait-regen-go">Generate</button>'
-            '</div></form></dialog>'
         )
 
     # Identity strip: class lvl · race · gender · alignment
@@ -7810,8 +7548,6 @@ def character_sheet(slug: str):
     panels.append(_sheet_panel("Background", bg_html))
 
     body = '<div class="sheet">' + header + "".join(p for p in panels if p) + '</div>'
-    if regen_dialog_html:
-        body += regen_dialog_html + _SHEET_PORTRAIT_JS
     return render(f"{html.escape(name)} — {html.escape(campaign_name)}", body)
 
 
@@ -7861,93 +7597,6 @@ _HOLDING_DETAIL_JS = """<script>
     });
   }
   document.querySelectorAll('.portrait-generate, .portrait-regen').forEach(bind);
-})();
-</script>"""
-
-
-# Regenerate-portrait widget for /sheets/<slug>. The ↻ button opens a themed
-# dialog with an optional prompt field; submitting POSTs the extra text to the
-# character endpoint, which combines it with the stored base prompt.
-_SHEET_PORTRAIT_JS = """<style>
-  dialog.portrait-regen-dialog {
-    border: 1px solid var(--rule-hi);
-    background: linear-gradient(to bottom, var(--bg-card-hi), var(--bg-card));
-    color: var(--ink-body);
-    border-radius: 5px;
-    padding: 0;
-    max-width: 460px;
-    width: calc(100% - 32px);
-    box-shadow: var(--shadow-card);
-  }
-  dialog.portrait-regen-dialog::backdrop { background: rgba(0,0,0,0.62); }
-  dialog.portrait-regen-dialog form { padding: 20px 22px; }
-  dialog.portrait-regen-dialog h3 { margin: 0 0 8px; }
-  dialog.portrait-regen-dialog textarea {
-    width: 100%; box-sizing: border-box; margin-top: 4px;
-    background: var(--bg-rec); color: var(--ink-body);
-    border: 1px solid var(--rule); border-radius: 3px;
-    padding: 10px 12px; font-family: var(--font-body); font-size: 1em;
-    resize: vertical; min-height: 64px; line-height: 1.5;
-  }
-  dialog.portrait-regen-dialog textarea:focus {
-    outline: none; border-color: var(--accent-gold);
-    box-shadow: 0 0 0 1px rgba(200,169,110,0.25);
-  }
-  dialog.portrait-regen-dialog details.portrait-base { margin-top: 10px; }
-  dialog.portrait-regen-dialog details.portrait-base summary {
-    cursor: pointer; font-size: 0.8em; color: var(--ink-muted); font-style: italic;
-  }
-  dialog.portrait-regen-dialog details.portrait-base p { font-size: 0.82em; line-height: 1.5; margin-top: 6px; }
-  dialog.portrait-regen-dialog .actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
-  dialog.portrait-regen-dialog .actions button {
-    background: transparent; color: var(--accent-gold);
-    border: 1px solid var(--rule); border-radius: 3px;
-    padding: 6px 16px; font-family: var(--font-display);
-    font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.12em;
-    cursor: pointer; transition: all 160ms ease;
-  }
-  dialog.portrait-regen-dialog .actions button:hover { border-color: var(--accent-gold); color: var(--accent-gold-hi); }
-  dialog.portrait-regen-dialog .actions #portrait-regen-go {
-    background: linear-gradient(to bottom, #4a3625, #2e2014);
-    color: var(--ink-display); border-color: var(--rule-hi);
-  }
-  dialog.portrait-regen-dialog .actions button:disabled { opacity: 0.5; cursor: progress; }
-</style>
-<script>
-(function(){
-  const btn = document.querySelector('.portrait-regen[data-slug]');
-  const dlg = document.getElementById('portrait-regen-dialog');
-  if (!btn || !dlg) return;
-  const form = document.getElementById('portrait-regen-form');
-  const extra = document.getElementById('portrait-regen-extra');
-  const go = document.getElementById('portrait-regen-go');
-  const cancel = document.getElementById('portrait-regen-cancel');
-
-  btn.addEventListener('click', function(){
-    if (typeof dlg.showModal === 'function') dlg.showModal();
-    else dlg.setAttribute('open', '');
-    setTimeout(function(){ extra.focus(); }, 30);
-  });
-  cancel.addEventListener('click', function(){ dlg.close(); });
-
-  form.addEventListener('submit', async function(e){
-    e.preventDefault();
-    const txt = (extra.value || '').trim();
-    go.disabled = true; cancel.disabled = true;
-    const orig = go.textContent; go.textContent = 'rendering…';
-    try {
-      const r = await fetch('/api/characters/' + encodeURIComponent(btn.dataset.slug) + '/portrait',
-                            {method:'POST',
-                             headers:{'Content-Type':'application/json'},
-                             body: JSON.stringify({prompt: txt})});
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-      location.reload();   // pick up the new portrait + index update
-    } catch (err) {
-      alert('Portrait generation failed: ' + err.message);
-      go.disabled = false; cancel.disabled = false; go.textContent = orig;
-    }
-  });
 })();
 </script>"""
 
@@ -8164,111 +7813,6 @@ def api_holding_portrait(kind: str, slug: str):
         "filename": pr["filename"],
         "url": f"/images/{pr['filename']}",
     })
-
-
-@app.route("/api/characters/<slug>/portrait", methods=["POST"])
-def api_character_portrait(slug: str):
-    """Regenerate a PC/NPC portrait from the sheet page (the ↻ button).
-
-    Body (optional JSON): ``{"prompt": "<extra direction>"}``. The extra text is
-    appended to the character's stored ``portrait_prompt`` — the anchor that
-    keeps the likeness / CHA-appropriate appearance consistent — so a hint
-    refines rather than replaces it. With no stored prompt the typed text is
-    used alone. An empty body just redraws from the base prompt (mirrors the
-    regenerate_portrait MCP tool). The new image is indexed by slug, so
-    _find_portrait picks it up on reload; the stored base prompt is left
-    unchanged so future regenerations stay anchored."""
-    if not cfg:
-        return jsonify({"error": "no campaign loaded"}), 400
-    slug_clean = re.sub(r"[^a-z0-9_-]", "", slug.lower())
-    char = (cfg.get("characters", {}) or {}).get(slug_clean) \
-        or (cfg.get("npcs", {}) or {}).get(slug_clean)
-    if not char:
-        return jsonify({"error": f"no character '{slug_clean}'"}), 404
-
-    data = request.get_json(silent=True) or {}
-    extra = (data.get("prompt") or "").strip()
-    base = (char.get("portrait_prompt") or "").strip()
-    if base and extra:
-        prompt = f"{base}. {extra}"
-    elif extra:
-        prompt = extra
-    elif base:
-        prompt = base
-    else:
-        return jsonify({"error": "No portrait_prompt stored for this character and "
-                                 "no prompt provided — describe the portrait you want."}), 400
-
-    pr = _img.generate_portrait_for(cfg, slug_clean, prompt)
-    if "error" in pr:
-        return jsonify(pr), 500
-    return jsonify({
-        "ok": True,
-        "filename": pr["filename"],
-        "url": f"/images/{pr['filename']}",
-    })
-
-
-# ---------------------------------------------------------------------------
-# "Did you know" lore facts — a cross-campaign trivia store shown on /play
-# during the wait for the DM's reply. Schema + CRUD live in tools/lore_facts.py
-# (shared with the MCP tools); these endpoints are thin HTTP wrappers.
-# ---------------------------------------------------------------------------
-@app.route("/api/facts", methods=["GET"])
-def api_facts_list():
-    """List facts. Optional ?category=, ?campaign=, ?enabled=0|1 filters."""
-    en = request.args.get("enabled")
-    rows = _facts.list_facts(
-        category=request.args.get("category") or None,
-        campaign=request.args.get("campaign") or None,
-        enabled=(int(en) if en in ("0", "1") else None),
-    )
-    return jsonify({"facts": rows, "count": len(rows)})
-
-
-@app.route("/api/facts/random", methods=["GET"])
-def api_facts_random():
-    """Return ?n= random enabled facts (default 1, max 100), optionally
-    filtered by ?category= / ?campaign=. This is what /play pulls on load to
-    fill the 'did you know' rotation."""
-    rows = _facts.random_facts(
-        n=request.args.get("n", 1),
-        category=request.args.get("category") or None,
-        campaign=request.args.get("campaign") or None,
-    )
-    return jsonify({"facts": rows, "count": len(rows)})
-
-
-@app.route("/api/facts", methods=["POST"])
-def api_facts_create():
-    """Create a fact. Body: {text (required), category?, source?, campaign?}."""
-    data = request.get_json(silent=True) or {}
-    res = _facts.create_fact(
-        text=data.get("text", ""),
-        category=data.get("category", ""),
-        source=data.get("source", ""),
-        campaign=data.get("campaign", ""),
-    )
-    return (jsonify(res), 400) if "error" in res else (jsonify(res), 201)
-
-
-@app.route("/api/facts/<int:fid>", methods=["PATCH", "PUT"])
-def api_facts_update(fid: int):
-    """Update a fact. Body may include text, category, source, campaign, enabled."""
-    data = request.get_json(silent=True) or {}
-    fields = {k: data[k] for k in ("text", "category", "source", "campaign", "enabled")
-              if k in data}
-    res = _facts.update_fact(fid, **fields)
-    if "error" in res:
-        return jsonify(res), 404 if res["error"].startswith("no fact") else 400
-    return jsonify(res)
-
-
-@app.route("/api/facts/<int:fid>", methods=["DELETE"])
-def api_facts_delete(fid: int):
-    """Delete a fact by id."""
-    res = _facts.delete_fact(fid)
-    return (jsonify(res), 404) if "error" in res else jsonify(res)
 
 
 @app.route("/characters")
@@ -9307,8 +8851,7 @@ def class_detail(slug: str):
         if has_spells and _g(r, "spell_slots"):
             try:
                 slots = json.loads(_g(r, "spell_slots"))
-                # "level" is the caster level, not a spell tier — skip it.
-                slots_str = " / ".join(str(v) for k, v in sorted(slots.items()) if v and k != "level")
+                slots_str = " / ".join(str(v) for k, v in sorted(slots.items()) if v)
             except Exception:
                 slots_str = "—"
 
@@ -9454,6 +8997,30 @@ def class_detail(slug: str):
 
 _COMBAT_CSS = """
 <style>
+  /* dungml fog controls. The pill is the at-a-glance answer to "is a play
+     session driving this map?" — amber when fogged, blue on the GM view,
+     grey when the tab has fallen back to the plain local render. */
+  .fog-pill {
+    font-size: .74em; letter-spacing: .04em; text-transform: uppercase;
+    padding: 2px 8px; border-radius: 9px; border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .fog-pill.fog-on   { color:#e8c88a; border-color:#6b5426; background:#2a2114; }
+  .fog-pill.fog-gm   { color:#9fc4e8; border-color:#2f4a63; background:#141d26; }
+  .fog-pill.fog-off  { color:#7a7266; border-color:#332e26; background:#1d1a15; }
+  .fog-select {
+    background:#1d1a15; color:#d4c5a9; border:1px solid #3a332a;
+    border-radius:4px; font-size:.8em; padding:2px 4px; max-width:200px;
+  }
+  .fog-toggle { display:inline-flex; gap:2px; }
+  .fog-toggle .zoom-btn.is-active {
+    background:#3a2f1c; color:#e8c88a; border-color:#6b5426;
+  }
+</style>
+"""
+
+_COMBAT_CSS_BASE = """
+<style>
 .container{max-width:1400px}
 .combat-layout{display:flex;gap:20px;align-items:flex-start;flex-wrap:nowrap}
 .combat-canvas-wrap{flex:1 1 auto;overflow:hidden;min-width:0;height:560px;
@@ -9478,6 +9045,8 @@ _COMBAT_CSS = """
 .init-val{color:#8a7a60;font-size:.85em;font-family:monospace;margin-left:6px;flex-shrink:0}
 </style>
 """
+
+_COMBAT_CSS = _COMBAT_CSS + _COMBAT_CSS_BASE
 
 _COMBAT_JS = (
     'var map = new CombatMap(document.getElementById("cmap"), {cellPx: 36});\n'
@@ -9541,25 +9110,128 @@ _COMBAT_JS = (
     '  });\n'
     '}\n'
     '\n'
+    '\n'
+    '// ── dungml fog-of-war view ────────────────────────────────────────────\n'
+    '// When a play session is connected the map background comes from\n'
+    '// dmap-server (fogged to what the party has discovered) instead of the\n'
+    '// flat render create_map cached locally. Geometry still comes from the\n'
+    '// session block, so tokens land on the same cells either way.\n'
+    'var _fogPill   = document.getElementById("fog-pill");\n'
+    'var _fogView   = document.getElementById("fog-view");\n'
+    'var _fogLocale = document.getElementById("fog-locale");\n'
+    'var _localesLoaded = false;\n'
+    '\n'
+    'function fogState(data, dm) {\n'
+    '  if (!dm || !dm.connected || !dm.width || !dm.height) return data;\n'
+    '  var base = data.grid || {};\n'
+    '  var g = {};\n'
+    '  for (var k in base) g[k] = base[k];\n'
+    '  g.width   = dm.width;\n'
+    '  g.height  = dm.height;\n'
+    '  g.scale   = base.scale || "5ft";\n'
+    '  // ?v= is the render fingerprint: it changes when fog burns off, the\n'
+    '  // party moves, or the scope flips, and only then.\n'
+    '  g.svg_url = dm.render_url + "?v=" + encodeURIComponent(dm.version || "0");\n'
+    '  var out = {};\n'
+    '  for (var k2 in data) out[k2] = data[k2];\n'
+    '  out.grid = g;\n'
+    '  return out;\n'
+    '}\n'
+    '\n'
+    'function updateFogUi(dm) {\n'
+    '  if (!_fogPill) return;\n'
+    '  var on = dm && dm.connected;\n'
+    '  var gm = on && dm.scope === "gm";\n'
+    '  _fogPill.className = "fog-pill " + (gm ? "fog-gm" : on ? "fog-on" : "fog-off");\n'
+    '  if (on) {\n'
+    '    var where = dm.map_name || "combat map";\n'
+    '    _fogPill.textContent = (gm ? "GM view" : "fog of war") + " · " + where;\n'
+    '    _fogPill.title = dm.party_node\n'
+    '      ? "party at " + dm.party_node\n'
+    '      : "no party marker set — use dungml_party_at";\n'
+    '  } else {\n'
+    '    _fogPill.textContent = (dm && dm.reachable) ? "no fog session" : "map service offline";\n'
+    '    _fogPill.title = (dm && dm.detail) || "";\n'
+    '  }\n'
+    '  if (_fogView) {\n'
+    '    _fogView.style.display = on ? "inline-flex" : "none";\n'
+    '    var btns = _fogView.querySelectorAll("button");\n'
+    '    for (var i = 0; i < btns.length; i++) {\n'
+    '      var active = btns[i].getAttribute("data-scope") === (dm.scope || "fog");\n'
+    '      btns[i].classList.toggle("is-active", active);\n'
+    '    }\n'
+    '  }\n'
+    '  if (_fogLocale) {\n'
+    '    _fogLocale.style.display = (dm && dm.reachable) ? "" : "none";\n'
+    '    if (dm && dm.reachable && !_localesLoaded) { _localesLoaded = true; loadLocales(dm); }\n'
+    '  }\n'
+    '}\n'
+    '\n'
+    'async function loadLocales(dm) {\n'
+    '  try {\n'
+    '    var r = await fetch("/combat-fog-locales");\n'
+    '    var d = await r.json();\n'
+    '    var cur = d.map_id || "combat";\n'
+    '    var opts = [\'<option value="combat">Combat map (pushed)</option>\'];\n'
+    '    (d.locales || []).forEach(function(m) {\n'
+    '      opts.push(\'<option value="\' + m.map_id + \'">\' + (m.name || m.map_id) + "</option>");\n'
+    '    });\n'
+    '    _fogLocale.innerHTML = opts.join("");\n'
+    '    _fogLocale.value = cur;\n'
+    '  } catch(e) { _localesLoaded = false; }\n'
+    '}\n'
+    '\n'
+    'if (_fogView) {\n'
+    '  _fogView.addEventListener("click", async function(e) {\n'
+    '    var b = e.target.closest("button[data-scope]");\n'
+    '    if (!b) return;\n'
+    '    await fetch("/combat-fog-view", {method: "POST",\n'
+    '      headers: {"content-type": "application/json"},\n'
+    '      body: JSON.stringify({scope: b.getAttribute("data-scope")})});\n'
+    '    refresh();\n'
+    '  });\n'
+    '}\n'
+    'if (_fogLocale) {\n'
+    '  _fogLocale.addEventListener("change", async function() {\n'
+    '    await fetch("/combat-fog-locale", {method: "POST",\n'
+    '      headers: {"content-type": "application/json"},\n'
+    '      body: JSON.stringify({map_id: _fogLocale.value})});\n'
+    '    refresh();\n'
+    '  });\n'
+    '}\n'
+    '\n'
     'async function refresh() {\n'
     '  try {\n'
     '    var r = await fetch("/combat-state");\n'
     '    var data = await r.json();\n'
-    '    if (!data.active || !data.grid) {\n'
+    '    var dm = data.dungml || {};\n'
+    '    updateFogUi(dm);\n'
+    '    var hasCombat = !!(data.active && data.grid);\n'
+    '    if (!hasCombat && !dm.connected) {\n'
     '      document.getElementById("round-info").textContent = "No active combat map";\n'
     '      document.getElementById("turn-info").textContent = "";\n'
     '      initListEl.innerHTML = \'<p class="muted" style="font-size:.85em">No combat active</p>\';\n'
+    '      document.getElementById("unplaced").innerHTML = "";\n'
     '      _currentDsl = null;\n'
     '      if (copyBtn) copyBtn.disabled = true;\n'
     '      return;\n'
     '    }\n'
-    '    document.getElementById("round-info").textContent = "Round " + data.round;\n'
-    '    document.getElementById("turn-info").textContent = "▶ " + (data.current || "");\n'
-    '    _currentDsl = (data.grid && data.grid.dsl) || null;\n'
+    '    if (hasCombat) {\n'
+    '      document.getElementById("round-info").textContent = "Round " + data.round;\n'
+    '      document.getElementById("turn-info").textContent = "▶ " + (data.current || "");\n'
+    '      _currentDsl = (data.grid && data.grid.dsl) || null;\n'
+    '    } else {\n'
+    '      // Session connected between fights: the tab is a live locale view.\n'
+    '      document.getElementById("round-info").textContent = dm.map_name || "Current locale";\n'
+    '      document.getElementById("turn-info").textContent =\n'
+    '        dm.party_node ? "party at " + dm.party_node : "";\n'
+    '      initListEl.innerHTML = \'<p class="muted" style="font-size:.85em">No combat active</p>\';\n'
+    '      _currentDsl = null;\n'
+    '    }\n'
     '    if (copyBtn) copyBtn.disabled = !_currentDsl;\n'
-    '    map.render(data);\n'
-    '    map.renderInitList(initListEl, data.combatants || []);\n'
-    '    var unplaced = (data.combatants || []).filter(function(c){\n'
+    '    map.render(fogState(data, dm));\n'
+    '    map.renderInitList(initListEl, hasCombat ? (data.combatants || []) : []);\n'
+    '    var unplaced = (hasCombat ? (data.combatants || []) : []).filter(function(c){\n'
     '      return c.x === null || c.x === undefined;\n'
     '    });\n'
     '    document.getElementById("unplaced").innerHTML = unplaced.length\n'
@@ -9576,6 +9248,167 @@ _COMBAT_JS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# dungml fog-of-war bridge
+#
+# When a dungml play session is connected, the combat tab draws the *fogged*
+# render of the party's current locale instead of the flat local one. The SVG
+# comes from dmap-server, so it is cached briefly here: the tab polls
+# /combat-state every 2s, and both that poll (for the version fingerprint)
+# and the <img> fetch would otherwise each hit the map service.
+# ---------------------------------------------------------------------------
+
+_DUNGML_SVG_TTL_S   = 1.5
+_DUNGML_BLOCK_TTL_S = 2.0
+
+_dungml_svg_cache: dict = {"key": None, "svg": b"", "etag": "", "meta": {}, "ts": 0.0}
+_dungml_block_cache: dict = {"block": None, "ts": 0.0}
+
+
+def _dungml_fog_svg(scope: str | None = None) -> tuple[bytes | None, str, dict]:
+    """The current fogged SVG, a short content fingerprint, and its metadata.
+
+    Returns `(None, "", {})` when no session is connected or the map service
+    is down — callers fall back to the plain local render.
+    """
+    link = _dungml.link_state(cfg)
+    key = (link["source"], link["map_id"], scope or link["scope"])
+    now = time.monotonic()
+    c = _dungml_svg_cache
+    if c["key"] == key and c["svg"] and (now - c["ts"]) < _DUNGML_SVG_TTL_S:
+        return c["svg"], c["etag"], c["meta"]
+    try:
+        svg, meta = _dungml.render_current(cfg, scope=scope)
+    except _dungml.DungmlUnavailable:
+        return None, "", {}
+    if not svg or meta.get("placeholder"):
+        return None, "", {}
+    etag = hashlib.sha1(svg).hexdigest()[:16]
+    c.update(key=key, svg=svg, etag=etag, meta=meta, ts=now)
+    return svg, etag, meta
+
+
+def _dungml_block() -> dict:
+    """The `dungml` block served on /combat-state.
+
+    Carries a `version` fingerprint that changes whenever the render changes —
+    fog burning off, the party moving, the scope flipping — so the tab knows
+    to refetch the image instead of trusting its cache.
+    """
+    now = time.monotonic()
+    c = _dungml_block_cache
+    if c["block"] is not None and (now - c["ts"]) < _DUNGML_BLOCK_TTL_S:
+        return c["block"]
+    try:
+        block = _dungml.connection_block(cfg)
+    except Exception as e:  # never let the map service break the combat tab
+        block = {"connected": False, "reachable": False, "detail": str(e)}
+    if block.get("connected"):
+        _svg, etag, meta = _dungml_fog_svg()
+        if etag:
+            block["version"] = etag
+            # The render is authoritative: the party may have been moved from
+            # the dungml side, leaving the cached link stale.
+            if meta.get("party_node") is not None:
+                block["party_node"] = meta["party_node"]
+            if meta.get("width"):
+                block["width"] = meta["width"]
+                block["height"] = meta["height"]
+        else:
+            # Connected per the link, but nothing renders — treat as not
+            # connected so the tab shows the local map rather than a blank.
+            block["connected"] = False
+            block.setdefault("detail", "map not ready")
+    c.update(block=block, ts=now)
+    return block
+
+
+@app.route("/combat-fog.svg")
+def combat_fog_svg():
+    """Proxy the fogged render from dmap-server.
+
+    Proxied rather than linked directly so the browser sees one origin (the
+    render token stays server-side) and so the bytes are already cached from
+    the /combat-state poll.
+    """
+    scope = request.args.get("scope") or None
+    if scope not in (None, "fog", "gm"):
+        scope = None
+    svg, etag, _meta = _dungml_fog_svg(scope)
+    if svg is None:
+        abort(404)
+    resp = Response(svg, mimetype="image/svg+xml")
+    # The fog changes as the party explores; the ?v= fingerprint is what
+    # makes a new version load, so the response itself must not be cached.
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["ETag"] = etag
+    return resp
+
+
+@app.route("/combat-fog-view", methods=["POST"])
+def combat_fog_view():
+    """Flip the combat tab between the players' fogged view and the GM view.
+
+    A display setting only — it reveals nothing and does not touch what the
+    party has discovered.
+    """
+    scope = (request.get_json(silent=True) or {}).get("scope", "fog")
+    if scope not in ("fog", "gm"):
+        return jsonify({"error": "scope must be 'fog' or 'gm'"}), 400
+    link = _dungml.save_link_state(cfg, scope=scope)
+    _dungml_block_cache.update(block=None, ts=0.0)
+    return jsonify({"scope": link["scope"]})
+
+
+@app.route("/combat-fog-locales")
+def combat_fog_locales():
+    """Authored maps this campaign can use as its current locale."""
+    link = _dungml.link_state(cfg)
+    try:
+        maps = _dungml.campaign_maps(_dungml.external_id(cfg))
+    except _dungml.DungmlUnavailable as e:
+        return jsonify({"locales": [], "detail": str(e)})
+    return jsonify({
+        "source": link["source"],
+        "map_id": link["map_id"],
+        "locales": [
+            {"map_id": m.get("id"), "name": m.get("name"),
+             "is_default": m.get("is_default", False)}
+            for m in maps
+        ],
+    })
+
+
+@app.route("/combat-fog-locale", methods=["POST"])
+def combat_fog_locale():
+    """Select which map the combat tab draws: an authored locale, or the map
+    `create_map` last pushed (`map_id` omitted / "combat")."""
+    body = request.get_json(silent=True) or {}
+    map_id = (body.get("map_id") or "").strip()
+    if not map_id or map_id == "combat":
+        _dungml.save_link_state(cfg, source="combat", map_id=None, map_name=None)
+    else:
+        try:
+            maps = _dungml.campaign_maps(_dungml.external_id(cfg))
+        except _dungml.DungmlUnavailable as e:
+            return jsonify({"error": str(e)}), 503
+        hit = next((m for m in maps if str(m.get("id")) == map_id), None)
+        if hit is None:
+            return jsonify({"error": "unknown locale"}), 404
+        _dungml.save_link_state(
+            cfg, source="campaign", map_id=hit["id"], map_name=hit.get("name")
+        )
+    _dungml_svg_cache.update(key=None, svg=b"", etag="", ts=0.0)
+    _dungml_block_cache.update(block=None, ts=0.0)
+    try:
+        link = _dungml.probe(cfg)
+    except Exception:
+        link = _dungml.link_state(cfg)
+    return jsonify({"source": link["source"], "map_id": link["map_id"],
+                    "map_name": link["map_name"],
+                    "width": link["width"], "height": link["height"]})
+
+
 @app.route("/combat")
 def combat_view():
     name = html.escape(cfg.get("name", "Campaign"))
@@ -9585,6 +9418,14 @@ def combat_view():
         + '<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px">'
         + '  <span id="round-info" style="color:#c8a96e;font-weight:bold">Loading…</span>'
         + '  <span id="turn-info" style="color:#d4c5a9"></span>'
+        + '  <span id="fog-pill" class="fog-pill fog-off" title="dungml play-session status">map service offline</span>'
+        + '  <select id="fog-locale" class="fog-select" title="Which map the tab draws — an authored dungml locale, or the map create_map last pushed" style="display:none">'
+        + '    <option value="combat">Combat map (pushed)</option>'
+        + '  </select>'
+        + '  <span id="fog-view" class="fog-toggle" style="display:none">'
+        + '    <button type="button" class="zoom-btn" data-scope="fog" title="Players\' view — only what the party has discovered">Fog</button>'
+        + '    <button type="button" class="zoom-btn" data-scope="gm" title="GM view — the whole map with the party marker">GM</button>'
+        + '  </span>'
         + '  <span style="margin-left:auto;display:flex;gap:5px;align-items:center">'
         + '    <button class="zoom-btn" id="copy-dsl-btn" title="Copy current map DSL to clipboard (paste into the dungml editor to persist)">Copy DSL</button>'
         + '    <button class="zoom-btn" onclick="map.setZoom(map.zoom*1.25)">+</button>'
@@ -9615,13 +9456,17 @@ def combat_view():
 @app.route("/combat-state")
 def combat_state():
     cs = cfg.get("_dir", Path(".")) / "combat_state.json"
+    data = {"active": False}
     if cs.exists():
         try:
             data = json.loads(cs.read_text(encoding="utf-8"))
-            return jsonify(data)
         except Exception:
-            pass
-    return jsonify({"active": False})
+            data = {"active": False}
+    # The fog view is independent of whether a fight is running — a connected
+    # play session means the tab can show the party's current locale even
+    # between combats.
+    data["dungml"] = _dungml_block()
+    return jsonify(data)
 
 
 # ---------------------------------------------------------------------------
@@ -10141,8 +9986,6 @@ _REFERENCE_SECTIONS = [
      "DMG Table 47: d20 target cross-indexed by undead type/HD and priest level. Paladins use level-2."),
     ("/greyhawk", "Greyhawk Setting",
      "Greyhawk wiki: deities, realms, characters, settlements, and full-text search."),
-    ("/reference/facts", "Lore Facts",
-     "The “did you know” trivia pool shown on /play: browse by category, add and delete entries."),
 ]
 
 
@@ -10166,207 +10009,6 @@ def reference_index():
         '</div>'
     )
     return render("Reference", body)
-
-
-@app.route("/reference/facts")
-def reference_facts():
-    """Manage the 'did you know' lore-fact pool: browse by category, add new
-    entries, delete existing ones. Add/delete go through /api/facts."""
-    facts = _facts.list_facts()                      # all, ordered by id
-    cat_names = sorted({f["category"] for f in facts if f["category"]})
-
-    # Group by category; order sections by size (largest first), then name.
-    groups: dict[str, list] = {}
-    for f in facts:
-        groups.setdefault(f["category"] or "(uncategorized)", []).append(f)
-    ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
-
-    def esc(s):
-        return html.escape("" if s is None else str(s))
-
-    # Quick category jump-nav with counts.
-    nav_chips = " ".join(
-        f'<a class="tag" href="#cat-{esc(re.sub(r"[^a-z0-9]+", "-", cat.lower()))}">'
-        f'{esc(cat)} <span class="muted">{len(items)}</span></a>'
-        for cat, items in ordered
-    )
-
-    sections = []
-    for cat, items in ordered:
-        anchor = re.sub(r"[^a-z0-9]+", "-", cat.lower())
-        rows = []
-        for f in items:
-            camp = (f.get("campaign") or "").strip()
-            camp_chip = f' <span class="tag">{esc(camp)}</span>' if camp else ""
-            disabled = "" if f.get("enabled", True) else ' <span class="muted">(hidden)</span>'
-            rows.append(
-                '<tr>'
-                f'<td>{esc(f["text"])}{camp_chip}{disabled}</td>'
-                f'<td class="fact-ts">{esc(f.get("created_at") or "")}</td>'
-                f'<td class="fact-act"><button class="fact-del" type="button" '
-                f'data-id="{f["id"]}" title="Delete entry" aria-label="Delete entry">✕</button></td>'
-                '</tr>'
-            )
-        sections.append(
-            f'<h2 id="cat-{esc(anchor)}">{esc(cat)} '
-            f'<span class="muted" style="font-size:0.7em">{len(items)} entries</span></h2>'
-            '<table class="fact-table"><thead><tr>'
-            '<th>Fact</th><th>Added</th><th></th></tr></thead><tbody>'
-            + "".join(rows) +
-            '</tbody></table>'
-        )
-
-    # Category dropdown: existing categories unioned with the canonical set
-    # (so unused-but-expected ones are always offered), plus a "+ new" escape
-    # hatch that reveals a free-text field.
-    _CANON_CATS = ["greyhawk", "monster", "rules", "spell", "magic",
-                   "history", "planes", "class", "campaign"]
-    cat_options = sorted(set(cat_names) | set(_CANON_CATS))
-    cat_select_options = (
-        '<option value="" selected>— category —</option>'
-        + "".join(f'<option value="{esc(c)}">{esc(c)}</option>' for c in cat_options)
-        + '<option value="__new__">+ new category…</option>'
-    )
-
-    body = f"""
-<style>
-  .fact-add {{ margin: 14px 0 26px; }}
-  .fact-add textarea {{
-    width: 100%; box-sizing: border-box;
-    background: var(--bg-rec); color: var(--ink-body);
-    border: 1px solid var(--rule); border-radius: 3px;
-    padding: 10px 12px; font-family: var(--font-body); font-size: 1em;
-    resize: vertical; min-height: 60px; line-height: 1.5;
-  }}
-  .fact-add textarea:focus {{ outline: none; border-color: var(--accent-gold); }}
-  .fact-add .row {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; align-items: center; }}
-  .fact-add input {{
-    background: var(--bg-rec); color: var(--ink-body);
-    border: 1px solid var(--rule); border-radius: 3px;
-    padding: 7px 10px; font-family: var(--font-body); font-size: 0.95em;
-  }}
-  .fact-add input:focus {{ outline: none; border-color: var(--accent-gold); }}
-  .fact-add select.cat {{
-    background: var(--bg-rec); color: var(--ink-body);
-    border: 1px solid var(--rule); border-radius: 3px;
-    padding: 7px 10px; font-family: var(--font-body); font-size: 0.95em;
-    cursor: pointer;
-  }}
-  .fact-add select.cat:focus {{ outline: none; border-color: var(--accent-gold); }}
-  .fact-add input.cat {{ width: 14ch; }}
-  .fact-add input.camp {{ width: 18ch; }}
-  .fact-add button {{
-    background: linear-gradient(to bottom, #4a3625, #2e2014);
-    color: var(--ink-display); border: 1px solid var(--rule-hi);
-    border-radius: 3px; padding: 7px 18px; cursor: pointer;
-    font-family: var(--font-display); font-size: 0.74em;
-    text-transform: uppercase; letter-spacing: 0.14em;
-    transition: all 160ms ease;
-  }}
-  .fact-add button:hover {{ border-color: var(--accent-gold); color: var(--accent-gold-hi); }}
-  .fact-add button:disabled {{ opacity: 0.5; cursor: progress; }}
-  #fact-add-status {{ margin-top: 8px; min-height: 1.2em; }}
-  .cat-nav {{ margin: 10px 0 22px; line-height: 2; }}
-  a.tag {{ text-decoration: none; }}
-  table.fact-table td {{ vertical-align: top; }}
-  table.fact-table .fact-ts {{
-    font-family: var(--font-mono); font-size: 0.8em; color: var(--ink-muted);
-    white-space: nowrap; width: 1%;
-  }}
-  table.fact-table .fact-act {{ width: 1%; text-align: center; }}
-  .fact-del {{
-    background: transparent; border: 1px solid var(--rule);
-    color: var(--ink-muted); border-radius: 3px; cursor: pointer;
-    width: 26px; height: 24px; line-height: 1; padding: 0;
-    transition: all 150ms ease;
-  }}
-  .fact-del:hover {{ border-color: var(--accent-blood, #a33); color: #e88; }}
-  .fact-del:disabled {{ opacity: 0.4; cursor: progress; }}
-</style>
-
-<h1>Lore Facts</h1>
-<p class="muted">The “did you know” trivia pool shown on <a href="/play">/play</a> while the DM
-composes a reply. {len(facts)} entries across {len(ordered)} categories.</p>
-
-<div class="card fact-add">
-  <h2 style="margin-top:0">Add an entry</h2>
-  <form id="fact-add-form">
-    <textarea id="fact-text" maxlength="600" placeholder="A short, interesting fact (one or two sentences)…"></textarea>
-    <div class="row">
-      <select id="fact-cat" class="cat">{cat_select_options}</select>
-      <input id="fact-cat-new" class="cat" type="text" placeholder="new category" autocomplete="off" hidden>
-      <input id="fact-camp" class="camp" type="text" placeholder="campaign (optional)" autocomplete="off">
-      <input id="fact-source" class="camp" type="text" placeholder="source (optional)" autocomplete="off">
-      <button type="submit" id="fact-add-btn">Add fact</button>
-    </div>
-  </form>
-  <div id="fact-add-status" class="muted"></div>
-</div>
-
-<div class="cat-nav">{nav_chips}</div>
-
-{"".join(sections) if sections else '<p class="muted">No entries yet.</p>'}
-
-<script>
-(function(){{
-  const form = document.getElementById('fact-add-form');
-  const text = document.getElementById('fact-text');
-  const cat = document.getElementById('fact-cat');
-  const catNew = document.getElementById('fact-cat-new');
-  const camp = document.getElementById('fact-camp');
-  const source = document.getElementById('fact-source');
-  const btn = document.getElementById('fact-add-btn');
-  const status = document.getElementById('fact-add-status');
-
-  // "+ new category…" reveals a free-text field for an unlisted category.
-  cat.addEventListener('change', function(){{
-    const isNew = cat.value === '__new__';
-    catNew.hidden = !isNew;
-    if (isNew) catNew.focus();
-  }});
-  function chosenCategory(){{
-    return cat.value === '__new__' ? catNew.value.trim() : cat.value.trim();
-  }}
-
-  form.addEventListener('submit', async function(e){{
-    e.preventDefault();
-    const t = (text.value || '').trim();
-    if (!t) {{ text.focus(); return; }}
-    btn.disabled = true; status.textContent = 'Adding…';
-    try {{
-      const r = await fetch('/api/facts', {{
-        method: 'POST', headers: {{'Content-Type': 'application/json'}},
-        body: JSON.stringify({{text: t, category: chosenCategory(),
-                              campaign: camp.value.trim(), source: source.value.trim()}})
-      }});
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-      location.reload();
-    }} catch (err) {{
-      status.textContent = 'Failed: ' + err.message;
-      btn.disabled = false;
-    }}
-  }});
-
-  document.querySelectorAll('.fact-del').forEach(function(b){{
-    b.addEventListener('click', async function(){{
-      if (!confirm('Delete this entry?')) return;
-      b.disabled = true;
-      try {{
-        const r = await fetch('/api/facts/' + b.dataset.id, {{method: 'DELETE'}});
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-        const tr = b.closest('tr'); if (tr) tr.remove();
-      }} catch (err) {{
-        alert('Delete failed: ' + err.message);
-        b.disabled = false;
-      }}
-    }});
-  }});
-}})();
-</script>
-"""
-    return render("Lore Facts", body)
 
 
 # ---------------------------------------------------------------------------
@@ -11664,16 +11306,43 @@ _dashboard_monsters.init(
 # Main
 # ---------------------------------------------------------------------------
 
+
+def _is_loopback(host: str) -> bool:
+    """True if binding `host` only accepts connections from this machine."""
+    if host in ("", "*", "0.0.0.0", "::"):
+        return False
+    if host in ("localhost", "localhost."):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # A hostname we cannot classify -- assume it is externally routable.
+        return False
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Campaign dashboard web app."
     )
     parser.add_argument("--campaign", help="Campaign name (default: active campaign)")
     parser.add_argument("--port", type=int, default=5000, help="Port to listen on (default: 5000)")
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
-    parser.add_argument("--ssl-cert", metavar="FILE", help="TLS certificate file (enables HTTPS)")
-    parser.add_argument("--ssl-key", metavar="FILE", help="TLS private key file")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Address to bind (default: 127.0.0.1, loopback only). "
+             "Use 0.0.0.0 to accept connections from the network.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Force the Werkzeug debugger/reloader on. Enabled by default for "
+             "loopback binds; on a non-loopback bind this exposes remote code "
+             "execution to anyone who can reach the port.",
+    )
     args = parser.parse_args()
+
+    loopback = _is_loopback(args.host)
+    debug = args.debug or loopback
 
     try:
         cfg = _c.load_campaign(args.campaign or None)
@@ -11681,16 +11350,20 @@ if __name__ == "__main__":
         print(f"Error loading campaign: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    ssl_context = None
-    if args.ssl_cert and args.ssl_key:
-        ssl_context = (args.ssl_cert, args.ssl_key)
-    elif args.ssl_cert or args.ssl_key:
-        print("Error: --ssl-cert and --ssl-key must both be provided.", file=sys.stderr)
-        sys.exit(1)
-
-    scheme = "https" if ssl_context else "http"
     print(f"Campaign: {cfg.get('name', cfg['_name'])}")
     print(f"Data dir: {cfg['_data_dir']}")
-    print(f"Starting dashboard at {scheme}://{args.host}:{args.port}")
-    app.run(debug=True, host=args.host, port=args.port, ssl_context=ssl_context,
-            use_reloader=not ssl_context)
+    display_host = "localhost" if loopback else args.host
+    print(f"Starting dashboard at http://{display_host}:{args.port}")
+    if not loopback:
+        print(
+            f"Listening on {args.host} -- reachable from the network. "
+            "There is no authentication on this dashboard.",
+            file=sys.stderr,
+        )
+        if debug:
+            print(
+                "WARNING: --debug on a non-loopback bind exposes the Werkzeug "
+                "debugger, which allows remote code execution.",
+                file=sys.stderr,
+            )
+    app.run(debug=debug, host=args.host, port=args.port)

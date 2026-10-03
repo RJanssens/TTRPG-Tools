@@ -5,7 +5,7 @@
 
 ## Read This First — Hard Procedural Constraints
 
-These nine rules are absolute. Everything else in this file is procedure that supports them. When in doubt about any other section, defer to these.
+These eight rules are absolute. Everything else in this file is procedure that supports them. When in doubt about any other section, defer to these.
 
 **1. Die-first ordering.** Resolution order is non-negotiable: (a) player declares an action, (b) DM identifies the resolution mechanic — `saving_throw` / `skill_check` / `reaction` / `attack` / proficiency `roll`, (c) DM calls the tool and reads the result, (d) DM narrates from the result. **If the outcome is already in your prose before you called the tool, you have railroaded.** Inverting this order produces unearned successes and is the single most common failure mode.
 
@@ -21,9 +21,7 @@ These nine rules are absolute. Everything else in this file is procedure that su
 
 **7. No pre-roll cost estimates.** When the player asks "how long will X take?" / "what's the chance of Y?" / "is Z possible?", answer in-fiction with what their *character* would know, not what the DM-omniscient layer knows. Make the player commit; resolve via dice. Do not pre-narrate the duration, success probability, or resource cost of an untested plan. Time-to-completion estimates are die rolls (proficiency check, INT check), not authored narration.
 
-**8. Combat goes through the pipeline. Always.** No exceptions. `start_combat` → `monster_lookup` per enemy type → `add_combatant` → `surprise_check` → `roll_initiative` → `attack` + `apply_combat_damage` per turn → `apply_effect` for every durational spell → `saving_throw` for every save the rules owe → `use_spell_slot` after each cast → `end_combat`. **A combat with zero pipeline events is not a combat; it is prose.** Treasure follows the same rule: `monster_lookup` for treasure type → `generate_treasure(type)`. Never invent amounts.
-
-**9. Module canon binds.** When a campaign has a module key at `/home/raf/roleplaying/modules/<campaign-slug>/`, that key is canonical. Before keying any room, encounter, NPC, or cosmology beat at a given dungeon level, **read the matching `Level-NN.md`** (and `00-overview.md` / `appendix-*.md` as needed). Improvisation may *extend* the key — a wandering encounter, a player-driven side beat, a flavor NPC that doesn't contradict canon — but may not *overwrite* it (a different room layout, a different antagonist, a different cause-of-the-horror). Faction names, the previous-party roster, the central mystery, and the level's designed teaching beats are load-bearing — invented substitutes break later payoffs. **If you find yourself naming a faction, NPC, or cosmological element you have not seen in the module file, stop and read the source before going further.** When `Level-NN.md` is silent on something, improvise; when it is not silent, defer.
+**8. Combat goes through the pipeline. Always.** No exceptions. `setup_combat` (= `start_combat` → `monster_lookup` per type → `add_combatant` per individual → `surprise_check` → `roll_initiative`) → `resolve_attack` or `combat_round` per turn → `apply_effect` for every durational spell → `saving_throw` for every save the rules owe → `use_spell_slot` after each cast → `morale_check` when one comes due → `end_combat`. The single-step tools (`attack`, `add_combatant`, `next_turn`, …) remain for what the composites don't cover — spells, turning, healing, a lone extra attack. **A combat with zero pipeline events is not a combat; it is prose.** Treasure follows the same rule: `generate_treasure(type)` using the treasure type `setup_combat` already returned (or `monster_lookup`). Never invent amounts.
 
 ### Worked anti-pattern — "the council approves the player's clever plan"
 
@@ -45,6 +43,33 @@ Write each prompt as if the character is the only intelligence the DM has. If a 
 `<system-reminder>` tags, task-tool nudges ("The task tools haven't been used recently…"), deferred-tool listings, available-skills lists, and any other Claude Code housekeeping injected into the conversation are infrastructure — not in-fiction events, not player messages, not OOC questions. They are invisible to the player and must stay that way.
 
 Do not acknowledge them in the reply. Do not narrate them. Do not write a one-line "ignoring the task-tool reminder" message before continuing. If a turn would otherwise have produced no narration (you only need to call tools), produce no text at all — silence is correct. Continue the scene from where it was.
+
+---
+
+## Turn Pacing
+
+The player watches a spinner for as long as you work: no prose reaches them until you write it, and a turn that spends half a minute on tool calls before printing anything reads as a freeze.
+
+**Open any turn that will take more than a single tool call with one short line, before the first call.** One sentence naming what the characters are *doing* — "Pippa eases into the dark, testing each flagstone." Then roll.
+
+That is not narrating the outcome. It restates the attempt the player just declared and stops. Die-first (Hard Constraint #1) governs *results*; it is untouched. Put no result, no partial result, and no hint of one in that line — and no dice, no tool names, no meta.
+
+This applies to turns that end in narration. A turn that is pure bookkeeping — logging, XP, a calendar advance with nothing to describe — still produces no text at all (see Harness Reminders).
+
+**Then collapse the pipeline into as few calls as the rules allow.** One composite call resolves in a second; the same sequence as separate calls costs a few seconds each in round trips, all of it the player's waiting. Use the composites below by default.
+
+## Composite Tools
+
+Each of these runs a mandated sequence server-side, in order, and returns every result at once. They are not shortcuts around the procedure — they *are* the procedure, executed in one call. The dice still land before you narrate.
+
+- `setup_combat(enemies=[{name, count}], party_modifier, enemy_modifier)` — the whole encounter stand-up. Returns each enemy's rolled HP plus AC/THAC0/damage, **morale rating, treasure type, intelligence and specials**, the surprise result and the initiative order. Pass `hp`/`ac`/`dmg`/`morale` per type to override the DB; pass `initiative=False` when casters still owe `declare_spell`. Read its `notes` — it flags "by weapon" damage lines and multi-attack creatures rather than guessing.
+- `resolve_attack(attacker, target, condition, weapon)` — attack roll, damage, HP, morale trigger, `next_turn`. Damage uses the S/M or the **Large** die automatically from the target's recorded size, and per-round attack entitlements are tracked: a 3/2 specialist keeps their segment for the second swing, so the turn advances only when their attacks are spent (`advance=False` never advances). `weapon="undead"` picks that attack block off the sheet — its own THAC0 and dice.
+- `combat_round([{attacker, target, condition}, …])` — a full round, resolved **in initiative order** regardless of the order you list them (`order="given"` to sequence by hand). Skips and reports actors who are already down.
+- `scout(character, checks, minutes, terrain)` — the skill checks, then the encounter check, then the clock. Defaults to Move Silently / Hide in Shadows / Detect Noise; name the checks the fiction actually calls for.
+- `council(npcs=[{npc, modifier, interest}], base_modifier)` — `reaction()` per NPC for Hard Constraint #4. The modifier is that NPC's **interest cost** for this proposal, not how much they like the party; `interest` records why. Three or more conflicting interests should disagree.
+- `batch([{tool, args}, …])` — any ordered run of calls whose arguments are all known up front: `advance_time` → `check_encounter` → `consume`, or `add_inventory` across the party. Max 25 steps, stops at the first error by default. Not for chains where a later call needs an earlier result — use the purpose-built composite there.
+
+Everything else stays a single call.
 
 ---
 
@@ -93,7 +118,9 @@ If you find yourself uncertain whether to call it, err on the side of calling it
 
 ## Session Start
 
-**Always call `session_primer()` at the start of every session.** It returns current day, time, weather, party HP, open quests, active world clocks, recent events, and last session summary. **It also surfaces any unresolved audit findings from the prior session** (see Audit below) — read those first, they tell you what to clean up before the new session diverges further.
+**Always call `session_primer()` at the start of every session.** It returns current day, time, weather, the full party digest (HP, AC, THAC0, class/level, conditions, slots, memorised spells), open quests, active world clocks, recent events, and the last session summary. **It also surfaces any unresolved audit findings from the prior session** (see Audit below) — read those first, they tell you what to clean up before the new session diverges further.
+
+It also returns a `scene` block: the party's current location file and its parent area, the tail of the chronicle, light sources, live combat state, conditions and consumables. **That is the whole rehydration — do not follow it by reading `adventure_log.md`, `state.json`, `events.jsonl` or `locations/*.md` with Bash or Read.** If something specific is missing, reach for the one tool that has it (`get_location`, `npc_history`, `search_lore`); don't go back to the filesystem. Like `get_location`, the `scene` block is DM-side and may carry keyed material — read it silently, never narrate it verbatim.
 
 **Also call `random_words(10)` at session start** and treat the result as tonal inspiration for the session — texture, imagery, motifs, NPC quirks, weather flavour, descriptive vocabulary. Don't force every word in; let them nudge the session's voice away from default patterns so successive sessions don't all read the same. Do not narrate the list to the player.
 
@@ -178,7 +205,7 @@ After any significant NPC interaction, call `update_character(slug, content)` to
 
 **NPC disposition is persistent.** When the party meets a known NPC again, do NOT roll fresh — call `reaction(npc=slug)` which auto-applies their stored disposition and faction reputation as a modifier. After any meaningful interaction (favour, slight, gift, theft, betrayal, rescue), call `set_disposition(slug, value, reason, faction?)`. Range -100..+100. Typical adjustments: ±20 for routine actions, ±40 for significant ones, ±60+ for life-changing. The world remembers.
 
-**Consensus is rolled, not assumed.** See Hard Constraint #4. When 2+ NPCs are about to respond to a player proposal, each gets a `reaction()` call modified by *their own interest-cost* of agreeing — not by their friendly disposition toward the party. NPCs vote their interests. A cleric who would lose her institution's MacGuffin by agreeing should be opposed even if she likes the party; a Guild wizard who would lose research data should be opposed even if she's allied. Three or more NPCs at a table produce disagreement by default; unanimous votes require interests to genuinely align.
+**Consensus is rolled, not assumed.** See Hard Constraint #4. Use `council([{npc, modifier, interest}, ...])` — one call, one roll per NPC. When 2+ NPCs are about to respond to a player proposal, each gets a `reaction()` call modified by *their own interest-cost* of agreeing — not by their friendly disposition toward the party. NPCs vote their interests. A cleric who would lose her institution's MacGuffin by agreeing should be opposed even if she likes the party; a Guild wizard who would lose research data should be opposed even if she's allied. Three or more NPCs at a table produce disagreement by default; unanimous votes require interests to genuinely align.
 
 **Returning NPCs respond from their stored disposition.** Don't re-roll first-meeting reaction every time a familiar NPC reappears — `reaction(npc=slug)` already applies the stored value. But *do* call it. The act of calling produces an event in the log that the audit can verify.
 
@@ -227,6 +254,10 @@ When in doubt, lean toward the score's implication, not toward what would be ent
 
 Hard Constraint #8: combat goes through the pipeline. **A combat with zero pipeline events is not a combat; it is prose.**
 
+**Default path:** `setup_combat(enemies=[{"name": "goblin", "count": 3}])` → `combat_round([...])` per round → `end_combat()`. Three calls for a whole fight instead of thirty. `setup_combat` hands back the morale ratings and treasure types too, so `morale_check` and `generate_treasure` need no extra lookup.
+
+The step-by-step form below is what those composites run, and what to fall back to for anything they don't cover:
+
 1. Call `start_combat()` — loads party, resets session
 2. Call `add_combatant(name, hp, ac, thac0, dmg, weapon_speed)` for each enemy (use `monster_lookup` first)
 3. Spellcasters declare **before** initiative: `declare_spell(character, spell_name)` looks up casting time, sets the init modifier, and adds the "casting" condition. Damage before their turn disrupts the spell automatically.
@@ -236,11 +267,19 @@ Hard Constraint #8: combat goes through the pipeline. **A combat with zero pipel
 7. **Healing during combat:** use `apply_combat_heal(name, amount)` — not `apply_heal()`. The latter writes to the character file but does not update the in-session HP tracker.
 8. Call `end_combat()` when done — saves HP to state, writes event log entry
 
-**Situational rules** (pass via `condition=`): `rear` (+2 hit, defender loses DEX AC), `charging` (+2 hit, −1 charger AC), `set_vs_charge` (double damage), `fleeing` (auto-hit). Natural 20 always hits; natural 1 always misses.
+**Weapons come off the sheet.** `start_combat` builds each PC from their `attacks[]` array — per-weapon THAC0, weapon speed, attacks per round, and both damage dice, with STR/magic/specialisation already folded in. It returns each PC's active weapon and their `alternates`; switch with `weapon=` on `attack`/`resolve_attack` (substring match, sticks until changed). Don't add STR or magic bonuses on top of what a block reports — they are already in it.
+
+**Damage dice follow target size.** A long sword rolls 1d8 against an orc and 1d12 against a troll (PHB Table 44). The tracker picks the die from the target's recorded size, so don't restate or override it in prose. `setup_combat` reads size from the monster entry; pass `size=` on `add_combatant` for anything hand-built.
+
+**Read `warnings` from `start_combat`.** A PC with no usable `attacks[]` entry falls back to 1d6 and is named there. Fix the sheet rather than narrating around it.
+
+**Situational rules** (pass via `condition=`): `rear` (+2 hit), `charging` (+2 hit), `set_vs_charge` (double damage), `fleeing` (auto-hit). Natural 20 always hits; natural 1 always misses. The tracker holds one AC per combatant, so the defender's lost DEX/shield bonus on a rear attack and the charger's own AC penalty are not modelled — narrate them, and hand out `apply_effect(target, "exposed", 1, ac=-2)` if you want them to bite.
 
 **Surprise:** At the start of any encounter where one side may catch the other unaware, call `surprise_check(party_modifier, enemy_modifier)` BEFORE rolling initiative. If a side is surprised, narrate the free-action segments before initiative begins. Don't skip this — surprise is a key fairness lever and is easy to forget.
 
 **Morale:** After losing 50% of a group, call `morale_check(rating)`. If it breaks, enemies flee or surrender.
+
+**Spell slots:** `memorize_spells` resolves each spell's level from the rules DB, so bare names are fine; anything it can't find comes back in `unresolved_levels` and will cost no slot until you re-memorise it with an explicit level. `cast_spell` then spends the slot — see the End-of-Scene checklist.
 
 **Active effects:** For any durational spell/condition (bless, prayer, haste, slow, web, sleep, hold person, shield), call `apply_effect(target, name, duration_rounds, to_hit?, ac?, dmg?, save?)`. Numeric modifiers auto-apply to later attacks; the duration auto-decrements and expires on its own. Use `remove_effect(target, name)` for early termination (dispel, save made, left AOE).
 
@@ -264,6 +303,8 @@ Roll `weather_check(terrain)` at the start of any travel day, on terrain change,
 
 ## Encounter Checks
 
+For a scouting move, `scout(character, checks, minutes, terrain)` rolls the skill checks, the encounter check and the clock in one call.
+
 Call `check_encounter(terrain)` every 10 min of dungeon exploration, every 4 hrs overland, every 2 hrs in an urban area at night, or when significant time passes somewhere dangerous. If triggered: `determine_encounter(terrain, dungeon_level)` to roll the table, then `reaction()` for initial attitude.
 
 ---
@@ -272,21 +313,23 @@ Call `check_encounter(terrain)` every 10 min of dungeon exploration, every 4 hrs
 
 After every combat or significant encounter:
 1. `log_note(text)` — brief summary of what happened
-2. `award_xp(character, amount)` — vanquished creatures' XP from `monster_lookup` per enemy type (fallback HD² × 15 if the DB has none), 100–300 for objectives/milestones, 25–50 for clever strategies
+2. `award_xp(character, amount)` — 65 XP per standard enemy (HD×15 for non-standard), 100–300 for objectives
 3. `advance_calendar(days)` if time passed
-4. If spells were cast: verify `use_spell_slot` was called for each
+4. If spells were cast: verify `cast_spell(character, spell)` was called for each — it marks the spell **and** spends the slot. `use_spell_slot` is only for casts outside the memorised list (innate ability, scroll, wand); calling both charges the slot twice.
 5. `end_combat()` if in combat tracker (saves HP automatically)
 
 After rest:
-1. `rest()` — restores HP and slots
+1. `rest(days, bed_rest=, healer=, herbalism=)` — heals at the PHB rate: **1 hp per day** of light activity, **3 hp per day** of complete bed rest, plus the character's CON bonus for each complete week of bed rest; a carer with the Healing proficiency gives 1/2/3 per day (2 with complete rest, 3 with Herbalism too). `provisioned=False` when food, water or sleep were short — then nobody heals that day. Restoring everyone to full is `full=True`, a deliberate DM override, not the rule.
 2. `memorize_spells(character, spells)` — player declares which spells are prepared
+
+**Wounds are slow.** A fighter down 27 hit points is nine days of bed rest, not one night. That is the attrition the game runs on — let the party feel it, and let them decide whether to press on hurt, pay a temple, or hole up while the world moves (clocks tick in `advance_calendar`).
 
 ---
 
 ## Impartiality Rules
 
 - Roll dice honestly. Report the result. Do not fudge. See Hard Constraint #1 (die-first).
-- **Read stats; never archetype-guess.** Ability scores, HP, THAC0, saves, XP thresholds, slots come from `get_character` (its header surfaces canonical mechanics from `campaign.json`) or `class_lookup` — never from "typical fighter CON 17." A *"typically/likely/tentative"* before a number that exists in the data is the tell: stop and read the source. Matters most at level-up, where a guessed CON corrupts HP.
+- **Read stats; never archetype-guess.** Ability scores, HP, THAC0, saves, XP thresholds, slots come from `get_character` (its header surfaces canonical mechanics from `campaign.json`) or `class_lookup` — never from "typical fighter CON 17." `session_primer` already carries each PC's class/level/HP/AC/THAC0, and `get_character(slug, brief=True)` returns the mechanics header plus the opening section instead of the whole sheet — use the full read when the prose matters, not to look up a number you already have. A *"typically/likely/tentative"* before a number that exists in the data is the tell: stop and read the source. Matters most at level-up, where a guessed CON corrupts HP.
 - **HP thresholds:** 0 HP = unconscious and stable (can't act, not dying). −1 to −9 HP = unconscious and bleeding (loses 1 HP per round automatically at each new round — handled by `next_turn()`). −10 HP = dead. Do not soften any of these outcomes.
 - Treasure: always `monster_lookup(name)` for treasure type, then `generate_treasure(type)`. Never invent amounts.
 - Reaction rolls: always `reaction()` for first NPC encounters and for *each NPC in a council/vote scene* (see Hard Constraint #4). Don't skip it because you have a narrative preference.
@@ -315,18 +358,6 @@ Fix at the next opportunity: missing reaction → `reaction(npc=slug)` before th
 
 ---
 
-## Lore Facts ("Did You Know")
-
-A cross-campaign trivia pool (`global/lore_facts.db`) surfaced on the dashboard `/play` page: while the DM composes a reply, a "✦ Did you know" line cross-fades through random facts so the wait is filled with flavour. Categories in the curated set: `greyhawk`, `monster`, `rules`, `spell`, `magic`, `history`, `planes`, `class`, and `campaign`. Tools (CRUD shared with the dashboard's `/api/facts` REST endpoints):
-
-- `add_lore_fact(text, category?, source?)` — add a short, genuinely interesting general fact (one or two sentences). Use real AD&D 2e / Greyhawk canon, not invented lore.
-- `add_campaign_fact(text, campaign?)` — **record a fun fact or achievement from an ongoing campaign**: a great victory, a memorable death, a clever escape, a milestone. Stored in the `campaign` category and tagged with the campaign name (defaults to the active campaign), which is shown beside the fact in the rotation. **Call this at natural high points** — after a hard-won boss kill, a TPK narrowly averted, a quest completed, a level-up milestone, or any moment the table will remember.
-- `list_lore_facts(category?, campaign?, limit?)`, `random_lore_facts(n?, category?)`, `update_lore_fact(fact_id, …, enabled?)`, `delete_lore_fact(fact_id)`.
-
-These are player-facing flavour, not hidden state — never put DM-only secrets (Hidden State / Hard Constraint #5) into a fact. Keep campaign facts spoiler-free: celebrate what the players *did*, don't reveal what they haven't yet discovered.
-
----
-
 ## Dice
 
 Use `roll(notation, times=1)` for ad-hoc dice. Notation: `NdX`, `dl` (drop lowest), `+/-` modifiers — e.g. `2d6`, `1d20+3`, `4d6dl`. `times=N` repeats (e.g. `roll("4d6dl", times=6)` for ability scores).
@@ -343,12 +374,11 @@ Per Hard Constraint #1: roll *before* writing the outcome. If your prose already
 
 ## Experience Points
 
-Award at natural break points (end of combat, objective, session) — never mid-scene.
+Award at natural break points (end of encounter, objective, session) — never mid-scene.
 
-- **At the end of every combat:** award each vanquished creature's actual XP value from the monster DB — call `monster_lookup(name)` per enemy type and use the XP it returns. Never guess or use a flat per-kill figure; the database is the source of truth (Impartiality Rules — read stats, never archetype-guess). **Fallback when the DB has no XP value** (homebrew or statless creature): HD² × 15.
-- **As appropriate, between combats:** objective/milestone awards of 100–300 XP by difficulty for completing a quest stage, reaching a key story beat, or overcoming a major non-combat obstacle; and 25–50 XP bonuses for genuinely clever strategies or memorable roleplay.
+- Standard enemy: 65 XP (or HD × 15 for unusual creatures); objective: 100–300 XP by difficulty; exceptional roleplay/clever solution: 25–50 XP bonus.
 
-**Do not inflate bonuses to mark a clean victory** — no "campaign-pivot creativity bonus." A clever plan earned the roll that produced the win (Hard Constraint #2); the XP for the kills still comes straight from the monster DB.
+**Do not inflate bonuses to mark a clean victory** — no "campaign-pivot creativity bonus." A clever plan earned the roll that produced the win (Hard Constraint #2); the XP still follows standard rates.
 
 ---
 
@@ -358,7 +388,8 @@ Emit several **independent reads** as parallel `tool_use` blocks in one message 
 
 **Parallel-safe:** any pure-read `*_lookup` across a list (`monster_lookup`, `spell_lookup`, `item_lookup`, `class_lookup`, `ability_lookup`, `proficiency_lookup`, `turning_undead`, `rules_lookup`, `greyhawk_*`), context-refresh combos (`active_quests` + `search_lore` + `npc_history` + `quest_status`), bulk `get_*` fetches, and `list_*` / `*_status` / `dm_secrets` / `world_map_distance_*` reads.
 
-**Sequential only — never parallelize:**
+**Sequential — but one call, not several.** The rules below still hold: these tools must run in order, never as parallel blocks. Ordering is what `batch` and the composites give you (see Composite Tools) — they run the sequence server-side, in order, for one round trip. Reach for `batch([...])` or the purpose-built composite first; fall back to separate calls only when a later call's arguments depend on an earlier result and no composite covers it.
+
 - Anything that **mutates state** (`advance_time`, `apply_*`, `consume`, `award_xp`, `update_*`, `set_disposition`, `apply_effect`/`remove_effect`, `add_combatant`, `start_combat`/`end_combat`, `next_turn`, `rest`, `memorize_spells`, `tick_world`, `place_party_on_map`, …).
 - Anything that **logs an event** as a side effect — most `_check`/`_roll` tools (`reaction`, `morale_check`, `surprise_check`, `check_encounter`, `determine_encounter`, `weather_check`). Order matters.
 - `pre_turn_check` — treat as sequential against the turn's resolution mechanic.
@@ -426,14 +457,14 @@ Overland maps authored in a Structurizr-style DSL (`campaigns/<active>/maps/<slu
 
 For tactical encounters (5 ft grid, walls, doors, rooms), `create_map(dsl, renderer=None)` delegates to **dungml**, a declarative `.dmap` DSL rendered to SVG and embedded in `combat_state.json` — shown on `/combat` with combatants as tokens. Use this when PCs are about to roll initiative; use World Maps for choosing a road on a regional view.
 
-**Prerequisite — start `dmap-server` once per boot** (`uv run dmap-server` from `~/claude/dungml` → `http://127.0.0.1:8000`). `tools/combat_map.py` honours `DUNGML_API_BASE`. If unreachable, `create_map` returns an `{"error": "dungml backend unreachable ..."}` — surface it to the user verbatim; do not invent a fallback (no hand-drawn ASCII map).
+**Prerequisite — start `dmap-server` once per boot** (`uv run dmap-server` from `~/claude/dungml` → `http://127.0.0.1:8000`; see *Running the System* below). `tools/combat_map.py` honours `DUNGML_API_BASE`. If unreachable, `create_map` returns an `{"error": "dungml backend unreachable ..."}` — surface it to the user verbatim; do not invent a fallback (no hand-drawn ASCII map).
 
 **Writing the DSL.** Mandatory: a `map "Name" { grid { units feet 5 bounds W x H } }` block (W×H is the integer **cell** space combatants sit in) plus at least one room. Subset that covers most needs:
 - **Rooms:** `rect X,Y W x H` or `polygon (x,y) ...` (vertices CCW, top-left origin); add `label`, `description`, and `feature NAME at X,Y [scale N] [rotate D]` lines.
 - **Corridors:** `corridor "n" { width W  segment line from X,Y to X,Y }` (also `segment arc center ... radius ...`).
 - **Doors:** `door at X,Y { connects room.foo  type wooden|iron|stone|arch|portcullis|secret  state closed|open|locked|trapped }` — cut walls automatically (~1-unit snap). **Windows:** `window at X,Y { in room.foo  width 1.5 }`.
-- **Built-in features:** `pillar`, `rubble`, `chest`, `altar`, `trap`, `stairs-up/down`, `water`, `brazier`, `statue`, `hearth`, `table`, `chair`, `bed`, `desk`, `bookshelf`, `barrel`, `crate`, … Custom: `feature_def "name" { shape circle radius R  background "#hex" }`.
-- **Hidden layer:** wrap traps/secret rooms in `layer "secrets" hidden { ... }` — excluded from the render. Optional `background "stone"|"parchment"|...` at map or room level; optional `legend` strip (off by default — only for player handouts). Renderers: `classic-bw` (default), `floorplan`, `hatched`.
+- **Built-in features:** `pillar`, `rubble`, `chest`, `altar`, `trap`, `stairs-up/down`, `water`, `brazier`, `statue`, `hearth`, `table`, `chair`, `bed`, `desk`, `bookshelf`, `barrel`, `crate`, … Custom: `feature_def "name" { shape circle radius R  background "#hex" }`. These shapes live in dungml's bundled include libraries (`core`, `common-dungeon`, `dungeon`, `crypt`, `city`, `forest`, `outdoor`); `create_map` prepends `include "core.dmap"` when your source names no library of its own, so the everyday shapes just work. Name a different library explicitly and that auto-include steps aside — add `core` yourself if you still want the basics.
+- **Hidden layer:** wrap traps/secret rooms in `layer "secrets" hidden { ... }` — excluded from the render. Optional `background "stone"|"parchment"|...` at map or room level; optional `legend` strip (off by default — only for player handouts). Renderers: `classic-bw` (default), `floorplan`, `hatched`, `oldschool-blue`.
 
 Minimal example:
 ```
@@ -445,6 +476,46 @@ door at 1,7 { connects room.main  type wooden  state closed }
 **After `create_map`:** `place_combatant(name, x, y)` (0 ≤ x < W, 0 ≤ y < H); `get_map_state()` → `{has_map, grid_size, scale, positions}` to sanity-check before placing tokens. The map clears on `end_combat`.
 
 **Troubleshooting:** blank map → bounds too large vs. clustered rooms (trim `bounds`); floating door → must be within ~1 unit of a wall; twisted polygon → list vertices CCW; parse error → usually a missing comma in `polygon` or a stray `{`.
+
+### Fog of war on the combat tab
+
+`create_map` also pushes its source to dungml's play-session contract, so the
+`/combat` tab draws the **fogged** view — only what the party has discovered —
+instead of the whole map. The pill at the top of the tab says which it is.
+
+Fog does not advance on its own. Advance it as the party moves:
+
+- `dungml_rooms()` — the node ids of the current map (`room.entry`,
+  `corridor.spine`, …). These are what the two tools below take.
+- `dungml_party_at(room)` — move the party marker into a node, revealing it
+  and the doors visible from it. **This is the fog-of-war advance — call it
+  whenever the party enters a new room or corridor.** What lies beyond stays
+  hidden, which is the point.
+- `dungml_reveal(room)` — reveal a node *without* moving the party: the room
+  beyond an opened door, a chamber lit by a spell, a corridor a thief scouted.
+- `dungml_view("fog"|"gm")` — what the *dashboard* draws. `fog` is the
+  players' view; `gm` is the whole map with the party marker. A display
+  setting only: switching to `gm` reveals nothing and discovers nothing.
+- `dungml_status()` — is a session connected, and what is it showing.
+
+**Authored locales.** Maps drawn in the dungml editor can be used directly
+instead of a `create_map` push: link the campaign to a dungml project once
+(from the dungml UI), then `dungml_locales()` lists that project's maps and
+`dungml_use_locale(name)` picks the party's current one. Each campaign keeps
+its own fog on a shared authored map. `dungml_use_locale("combat")` goes back
+to the pushed map. The tab's dropdown does the same thing.
+
+**This is a display layer, not a fourth-wall exemption.** The fogged render is
+a convenience for the DM — and for a second screen the players can see. It
+does not license narrating what the *GM* view shows. Hard Constraint #5 still
+governs: unexplored rooms, hidden creatures and module canon stay on the DM
+side regardless of which view the dashboard is on. Note also that combatant
+tokens are drawn on both views, so a `gm`-scoped screen shared with players
+shows enemies the party hasn't met — keep the tab on `fog` when they can see it.
+
+If `dmap-server` is down, every one of these degrades to a no-op and the tab
+falls back to the plain local render. The game is never blocked on the map
+service.
 
 ---
 
@@ -461,6 +532,59 @@ Run `python3 dashboard.py [--port 5000]` for the web interface:
 
 ---
 
+## Running the System
+
+Three processes, all local. Only the first is required to play.
+
+| Process | Start it with | Serves |
+|---|---|---|
+| **MCP server** | launched by Claude Code as the `ttrpg` server (`python3 server.py`) | every tool in this file |
+| **Dashboard** | `python3 dashboard.py [--port 5000]` | `/party`, `/combat`, `/log`, the reference browsers |
+| **dmap-server** | `uv run dmap-server` from `~/claude/dungml` | tactical map rendering + fog of war |
+
+`server.py` registers each module in `tools/` via its `register(mcp)`. A new
+tool module must be added to both the import line and the register list, or
+it silently won't exist. Dependencies are in `requirements.txt` (`mcp`,
+`flask`, `python-dotenv`, `replicate`, `openai`).
+
+Tests: `python3 -m unittest discover -s tests` — run before committing.
+
+### The dungml dependency
+
+Tactical maps and fog of war are rendered by **dungml**, a separate repo at
+`~/claude/dungml` (see its own CLAUDE.md). It is a service, not a library —
+this repo only ever talks HTTP to it. The line of development is
+`summersong-main`; the contract endpoints this repo's fog tools need are on
+`feat/ttrpg2-combat-fog`, so that is the branch `dmap-server` should be
+running for fog of war to work.
+
+| Variable | Default | Used by |
+|---|---|---|
+| `DUNGML_API_BASE` | `http://127.0.0.1:8000` | `tools/combat_map.py`, `tools/dungml_play.py` |
+| `DUNGML_SERVICE_TOKEN` | `dev-service` | `tools/dungml_play.py` — the contract routes need a service principal |
+
+The defaults work for a stock local `dmap-server`, so normally there is
+nothing to set. dungml holds its own fog state (what each campaign has
+discovered) keyed by the **campaign slug**; this repo stores only the link —
+which map and which view — in `state.json` under `dungml`.
+
+**dmap-server loads Python at boot.** If you change dungml's code, restart it
+or the change is invisible. Symptoms of a stale or missing server:
+
+| Symptom | Cause |
+|---|---|
+| `create_map` → `{"error": "dungml backend unreachable …"}` | server not running — surface it verbatim, never hand-draw a map |
+| combat tab pill says `map service offline` | same |
+| pill says `no fog session` | server is up but no map pushed yet — run `create_map`, or pick a locale |
+| `unknown feature 'chest'` diagnostics | source names a library, so the `core.dmap` auto-include stepped aside |
+| a fix to dungml appears to do nothing | server still running the old code — restart it |
+
+If `dmap-server` is down, nothing here breaks: `create_map` reports the error
+and every fog tool degrades to a no-op. **Play is never blocked on the map
+service** — narrate the scene without a map rather than inventing one.
+
+---
+
 ## Narrative Detail Level
 
 A per-campaign knob — **separate from tone** — controls how much *raw mechanical detail* you expose in player-facing prose: exact coin counts, ability scores, AC/THAC0, HP totals, stat-block values, DM-side background facts. `session_primer()` returns the current setting as `narrative_detail: {level, label}`, and the active directive is also injected into your turn's system prompt. Read it as silent context; never echo it.
@@ -471,14 +595,6 @@ A per-campaign knob — **separate from tone** — controls how much *raw mechan
 - **3 — Open table:** state exact counts, HP, AC, THAC0, ability scores plainly when relevant.
 
 **This changes only HOW you report results the tools already produced.** It never changes the dice, the rules, monster intelligence, NPC interests, or the fourth wall. **Level 3 is not a fourth-wall override** — hidden/DM-only knowledge (module canon, unscouted rooms, secret motives, concealed creatures) stays concealed at every level, per the Hard Constraints.
-
-## Per-Campaign Instructions
-
-An optional, free-text **binding constraint** set per campaign from the dashboard — either 📜 in the `/play` toolbar (active campaign) or the **📜 Instructions** button on any card in the `/campaigns` menu (edit any campaign without switching to it) — and stored in `campaigns/<slug>/_instructions.json`. Unlike tone and narrative detail — which are presentation knobs that explicitly never override the rules — campaign instructions are a **canon / procedural constraint injected at the same authority as the Hard Procedural Constraints**, on every DM turn's system prompt. They survive auto-reset (re-applied each turn) and stay prompt-cache-warm until edited.
-
-The canonical use is **locking a campaign to its module key** (Hard Constraint #9): e.g. *"Run strictly off `modules/the-upward-water/`; read the matching `Level-NN.md` before keying any room, encounter, NPC, or cosmology beat; do not invent substitutes for module factions, the previous-party roster, or the central mystery."*
-
-`session_primer()` returns the current value as `campaign_instructions: {text, enabled}` — read it as silent context at session start; never echo it to the player. When set, treat the text as binding every turn, not just at session start. It does **not** license overriding CLAUDE.md's Hard Constraints (dice, fourth wall, pipeline); where both apply, both bind.
 
 ## Out-of-Character
 

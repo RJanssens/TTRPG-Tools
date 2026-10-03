@@ -318,15 +318,8 @@ def build_row(title: str, wikitext: str) -> dict | None:
 
     row = {c: None for c in _ALL_COLUMNS}
     for wiki_key, col in _FIELD_MAP.items():
-        # Multi-variant infoboxes (Badger Common/Giant, Aartuk Warrior/Elder, …)
-        # suffix their stat fields with a variant number — ``hitdice1``,
-        # ``thac01``, ``xp1`` — and leave the unsuffixed key empty. Fall back to
-        # variant 1 as the canonical row when the base key is missing/blank.
-        raw = fields.get(wiki_key)
-        if raw is None or raw.strip() == "":
-            raw = fields.get(wiki_key + "1")
-        if raw is not None and raw.strip() != "":
-            val = clean_markup(raw)
+        if wiki_key in fields:
+            val = clean_markup(fields[wiki_key])
             row[col] = _parse_thac0(val) if col == "thac0" else (val or None)
 
     raw_body = clean_markup(wikitext[end:] if end else wikitext)
@@ -365,112 +358,12 @@ def insert_row(conn, item_id: int, row: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Backfill: re-parse the wiki and fill EMPTY stat columns on existing rows.
-# --------------------------------------------------------------------------- #
-# Columns the backfill is allowed to fill: exactly the ones the {{Creature}}
-# infobox provides. Never touches id/name/description/categories/source/image,
-# nor _NULL_COLUMNS (which the wiki never supplies, so counting them as "gaps"
-# would mark every row gappy).
-_BACKFILL_COLUMNS = tuple(_FIELD_MAP.values())
-
-
-def _is_empty(v) -> bool:
-    return v is None or (isinstance(v, str) and v.strip() == "")
-
-
-def backfill(conn, args) -> int:
-    """Re-list Category:Creatures, re-parse each page with the (now
-    variant-aware) parser, and UPDATE only the empty stat columns of the
-    matching existing row. Matched by the same name-derivation the import uses,
-    so no title-casing guesswork. Never clobbers a non-empty value."""
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM monsters").fetchall()
-    # rows that have at least one empty stat column worth filling
-    gappy = {
-        r["name"].strip().lower(): r
-        for r in rows
-        if any(_is_empty(r[c]) for c in _BACKFILL_COLUMNS if c in r.keys())
-    }
-    print(f"{len(gappy)} existing rows have ≥1 empty stat column.")
-
-    print("Listing Category:Creatures members…")
-    titles = list(iter_category_members("Creatures"))
-    if args.limit:
-        titles = titles[:args.limit]
-    print(f"{len(titles)} member pages to re-parse.")
-
-    wikitexts: dict[str, str] = {}
-    for i in range(0, len(titles), 40):
-        wikitexts.update(fetch_wikitext_batch(titles[i:i + 40]))
-        print(f"  fetched {min(i + 40, len(titles))}/{len(titles)} pages…",
-              end="\r", flush=True)
-    print()
-
-    # Build a parsed row per wiki page, keyed by canonical name.
-    parsed: dict[str, dict] = {}
-    for title in titles:
-        wt = wikitexts.get(title)
-        row = build_row(title, wt) if wt else None
-        if row is not None:
-            parsed.setdefault(row["name"], row)
-
-    matched = updated = fields_filled = 0
-    unmatched: list[str] = []
-    fill_tally: dict[str, int] = {}
-    for name, dbrow in gappy.items():
-        src = parsed.get(name)
-        if src is None:
-            unmatched.append(name)
-            continue
-        matched += 1
-        sets: dict[str, object] = {}
-        for col in _BACKFILL_COLUMNS:
-            if col not in dbrow.keys():
-                continue
-            if _is_empty(dbrow[col]) and not _is_empty(src.get(col)):
-                sets[col] = src[col]
-        if sets:
-            conn.execute(
-                f"UPDATE monsters SET {', '.join(c + '=?' for c in sets)} "
-                "WHERE id=?",
-                list(sets.values()) + [dbrow["id"]],
-            )
-            updated += 1
-            fields_filled += len(sets)
-            for c in sets:
-                fill_tally[c] = fill_tally.get(c, 0) + 1
-            if args.verbose:
-                print(f"  ~ {name}: filled {', '.join(sorted(sets))}")
-
-    if not args.dry_run:
-        conn.commit()
-
-    verb = "would fill" if args.dry_run else "filled"
-    print(f"\nMatched {matched}/{len(gappy)} gappy rows to a wiki page; "
-          f"{verb} {fields_filled} fields across {updated} rows.")
-    print("Fields filled by column:")
-    for c, n in sorted(fill_tally.items(), key=lambda x: -x[1]):
-        print(f"  {n:4}  {c}")
-    if unmatched:
-        print(f"\n{len(unmatched)} gappy rows had no matching Creatures page "
-              f"(umbrella/index entries with no single stat block), e.g.:")
-        for n in unmatched[:20]:
-            print(f"  - {n}")
-    if args.dry_run:
-        print("(dry run — nothing written)")
-    return 0
-
-
-# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--backfill", action="store_true",
-                    help="Fill empty stat columns on existing rows instead of "
-                         "inserting new creatures (variant-aware re-parse).")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--no-images", action="store_true")
     ap.add_argument("--db", default=str(_DEFAULT_DB))
@@ -487,9 +380,6 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = sqlite3.connect(str(db_path))
     try:
-        if args.backfill:
-            return backfill(conn, args)
-
         have = existing_names(conn)
         nid = next_id(conn)
         print(f"DB: {db_path} — {len(have)} creatures recorded; new ids from {nid}.")

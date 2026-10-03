@@ -8,12 +8,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.parent
 RULES_DB = BASE_DIR / "global" / "rules.db"
 
-SOURCE_LABELS = {
-    "phb": "Player's Handbook",
-    "dmg": "Dungeon Master Guide",
-    "mm": "Monstrous Manual",
-    "ct": "Player's Option: Combat & Tactics",
-}
+SOURCE_LABELS = {"phb": "Player's Handbook", "dmg": "Dungeon Master Guide", "mm": "Monstrous Manual"}
 
 
 def _escape_fts(query: str) -> str:
@@ -32,8 +27,7 @@ def register(mcp):
 
         query:  FTS5 query. Plain words = AND. Quote a phrase: '"saving throw vs spell"'.
                 Wildcards: 'turn*'. Boolean: 'morale OR rally'.
-        source: filter — 'phb', 'dmg', 'mm', 'ct' (Combat & Tactics optional rules);
-                blank = all sources.
+        source: filter — 'phb', 'dmg', 'mm'; blank = all sources.
         limit:  max results (default 5, capped at 20).
 
         Returns a list of {source, chapter, section, excerpt} ranked by relevance."""
@@ -82,7 +76,7 @@ def register(mcp):
         """Return the full text of one rules section (no FTS — exact section title match).
         Use after rules_lookup when you need more than the snippet excerpt.
 
-        source:  'phb', 'dmg', 'mm', or 'ct' (Combat & Tactics)
+        source:  'phb', 'dmg', or 'mm'
         section: section heading text (case-insensitive substring match)"""
         if not RULES_DB.exists():
             return {"error": "rules.db not found. Run: python3 tools/build_rules_db.py"}

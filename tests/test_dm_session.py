@@ -272,5 +272,116 @@ class PerCampaignSessionTests(unittest.TestCase):
         self.assertEqual(dm_session.session_id(), "already-saved")
 
 
+class BuildArgsTests(unittest.TestCase):
+    """Flags that carry real behaviour, not just cosmetics."""
+
+    def test_system_prompt_snapshot_is_off(self):
+        # Default `on` records the system prompt on a conversation's first
+        # request and replays it on every resume, silently discarding the
+        # per-turn tone/detail/audit addenda from turn 2 onward.
+        args = dm_session._build_args("hello", None)
+        self.assertIn("--system-prompt-snapshot", args)
+        self.assertEqual(args[args.index("--system-prompt-snapshot") + 1], "off")
+
+    def test_message_form_passes_the_prompt_positionally(self):
+        args = dm_session._build_args("scout ahead", None)
+        self.assertEqual(args[1], "-p")
+        self.assertEqual(args[2], "scout ahead")
+        self.assertNotIn("--input-format", args)
+
+    def test_resident_form_takes_the_turn_on_stdin(self):
+        args = dm_session._build_args(None, None)
+        self.assertIn("--input-format", args)
+        self.assertEqual(args[args.index("--input-format") + 1], "stream-json")
+        # No positional prompt: the turn arrives as a stream-json line.
+        self.assertEqual(args[1], "-p")
+        self.assertEqual(args[2], "--input-format")
+
+    def test_effort_is_passed_when_set_and_omitted_when_not(self):
+        self.assertNotIn("--effort", dm_session._build_args("hi", None))
+        args = dm_session._build_args("hi", None, effort="low")
+        self.assertEqual(args[args.index("--effort") + 1], "low")
+
+    def test_resume_appended_when_a_session_exists(self):
+        args = dm_session._build_args(None, "sess-1")
+        self.assertEqual(args[-2:], ["--resume", "sess-1"])
+
+
+class EffortPolicyTests(unittest.TestCase):
+    """auto: cheap effort for routine turns, full effort where the Hard
+    Constraints bite. Errs high — a wrongly-cheap turn can railroad."""
+
+    def setUp(self):
+        self._combat = dm_session._combat_active
+        self._labels = dm_session._npc_labels
+        self._setting = dm_session.effort_setting
+        dm_session._combat_active = lambda: False
+        dm_session._npc_labels = lambda: []
+        dm_session.effort_setting = lambda: {"effort": "auto"}
+
+    def tearDown(self):
+        dm_session._combat_active = self._combat
+        dm_session._npc_labels = self._labels
+        dm_session.effort_setting = self._setting
+
+    def test_routine_turn_is_low(self):
+        self.assertEqual(dm_session._effort_for_turn("Aldric opens the door."), "low")
+
+    def test_live_combat_is_high(self):
+        dm_session._combat_active = lambda: True
+        self.assertEqual(dm_session._effort_for_turn("Aldric swings."), "high")
+
+    def test_long_message_reads_as_a_plan(self):
+        long_msg = "We " + ("go quietly along the north wall and then " * 12)
+        self.assertGreaterEqual(len(long_msg), dm_session._PLAN_CHARS)
+        self.assertEqual(dm_session._effort_for_turn(long_msg), "high")
+
+    def test_plan_and_social_markers_are_high(self):
+        for msg in ("We set an ambush at the bend.",
+                    "Brenna tries to persuade the guard.",
+                    "Aelarion will cast sleep on them.",
+                    "Pippa checks the door for a trap."):
+            self.assertEqual(dm_session._effort_for_turn(msg), "high", msg)
+
+    def test_two_named_npcs_is_a_council(self):
+        dm_session._npc_labels = lambda: ["tira", "shalfey", "elmo"]
+        self.assertEqual(dm_session._effort_for_turn("We ask Tira and Shalfey."), "high")
+        # One NPC is an exchange, not a table of competing interests.
+        self.assertEqual(dm_session._effort_for_turn("We ask Tira."), "low")
+
+    def test_pinned_setting_overrides_the_policy(self):
+        dm_session.effort_setting = lambda: {"effort": "max"}
+        self.assertEqual(dm_session._effort_for_turn("Aldric opens the door."), "max")
+
+
+class ResidentSignatureTests(unittest.TestCase):
+    """The signature decides reuse vs respawn. It must exclude the session id
+    (learned from the init event on a new session) and include the system
+    prompt (the addenda only take effect on a respawn)."""
+
+    def setUp(self):
+        self._parts = dm_session._system_prompt_parts
+        dm_session._system_prompt_parts = lambda rehydrate: ["TONE: grim"]
+
+    def tearDown(self):
+        dm_session._system_prompt_parts = self._parts
+
+    def test_signature_ignores_the_session_id(self):
+        self.assertEqual(
+            dm_session._turn_signature(False, "low"),
+            dm_session._turn_signature(False, "low"),
+        )
+
+    def test_signature_tracks_effort_and_rehydrate(self):
+        base = dm_session._turn_signature(False, "low")
+        self.assertNotEqual(base, dm_session._turn_signature(False, "high"))
+        self.assertNotEqual(base, dm_session._turn_signature(True, "low"))
+
+    def test_signature_tracks_the_system_prompt(self):
+        base = dm_session._turn_signature(False, "low")
+        dm_session._system_prompt_parts = lambda rehydrate: ["TONE: heroic"]
+        self.assertNotEqual(base, dm_session._turn_signature(False, "low"))
+
+
 if __name__ == "__main__":
     unittest.main()

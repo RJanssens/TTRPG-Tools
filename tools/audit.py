@@ -319,19 +319,29 @@ def _run_audit(target_session: int, dm_text: str | None = None) -> dict:
                 "fix":      f"Clock '{c.get('label','?')}' has {c.get('days_remaining')} days left. Consider letting NPCs reference urgency.",
             })
 
-    # 8. Combat narrated but the in-session pipeline never ran a roll_initiative
-    # alongside the combat event. Catches "freehand combat" — narrative says
-    # there was a fight, no procedural events accompanied it. CLAUDE.md Hard
-    # Constraint #8: a combat with zero pipeline events is not a combat; it
-    # is prose.
-    if combat_indices:
-        init_events = [e for e in in_session if e.get("type") in ("roll_initiative", "attack", "apply_combat_damage")]
-        if not init_events:
-            findings.append({
-                "severity": "lapse",
-                "kind":     "combat_without_pipeline",
-                "fix":      "Combat event(s) logged this session with zero accompanying roll_initiative / attack / apply_combat_damage events. The combat was narrated freehand. CLAUDE.md Hard Constraint #8: next combat must use start_combat -> monster_lookup -> add_combatant -> surprise_check -> roll_initiative -> attack -> apply_combat_damage -> end_combat.",
-            })
+    # 8. Combat narrated but the tracker never resolved anything. CLAUDE.md
+    # Hard Constraint #8: a combat with zero pipeline events is not a combat;
+    # it is prose.
+    #
+    # end_combat stamps each combat event with a `pipeline` counter block
+    # (initiative_rolls / attacks / damage_applications) recording what the
+    # tracker actually did. Events written before that existed carry no
+    # counters, and absence of evidence isn't evidence — those are left alone
+    # rather than flagged, so the check means something when it does fire.
+    for ci in combat_indices:
+        pipeline = in_session[ci].get("pipeline")
+        if not isinstance(pipeline, dict):
+            continue
+        if any(int(v or 0) > 0 for v in pipeline.values()):
+            continue
+        findings.append({
+            "severity": "lapse",
+            "kind":     "combat_without_pipeline",
+            "fix":      "A combat ended this session having resolved no initiative, "
+                        "no attacks and no damage through the tracker — it was narrated "
+                        "freehand. CLAUDE.md Hard Constraint #8: run the next one through "
+                        "setup_combat -> combat_round/resolve_attack -> end_combat.",
+        })
 
     # 9. encounter_check cadence — if the session has any travel/dungeon
     # references but very few encounter checks for its length, flag.

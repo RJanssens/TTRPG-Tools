@@ -72,6 +72,7 @@ def _mechanics_block(char: dict) -> str:
 
     ident = " · ".join(p for p in [
         cls,
+        char.get("alignment") or "",
         f"Level {level}" if level is not None else "",
         f"HP {char['hp_max']}" if char.get("hp_max") is not None else "",
         f"AC {char['ac']}"     if char.get("ac")     is not None else "",
@@ -91,9 +92,6 @@ def _mechanics_block(char: dict) -> str:
              "prose below may lag. Never archetype-guess these."]
     if ident:
         lines.append(f"> {ident}")
-    align = (char.get("alignment") or "").strip()
-    if align:
-        lines.append(f"> Alignment — {align}")
     if score_parts:
         lines.append("> " + " · ".join(score_parts))
     saves = char.get("saves") or []
@@ -115,6 +113,9 @@ def _roll_hd(notation: str) -> int:
     n, sides, mod = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
     return max(1, sum(random.randint(1, sides) for _ in range(n)) + mod)
 
+
+# Cap for get_character(brief=True) — the opening section, not the sheet.
+_BRIEF_CHARS = 900
 
 _DEFAULT_AC = {
     "fighter": 5, "ranger": 6, "paladin": 4, "cleric": 5, "druid": 7,
@@ -146,23 +147,18 @@ _RACE_ADJ = {
 def register(mcp):
 
     @mcp.tool()
-    def introduce_npc(race: str, gender: str = "", description: str = "", name: str = "", slug: str = "") -> dict:
+    def introduce_npc(race: str, gender: str = "", description: str = "") -> dict:
         """Generate a named NPC, create their character file, and record the encounter.
         race: human/halfling/elf/dwarf/gnome/halfelf/halforc
         gender: 'male', 'female', or empty for random
         description: brief description or role (e.g. 'innkeeper', 'guard captain')
-        name: optional preset name (e.g. a published-module NPC like 'Elmo');
-              leave blank to roll a random name for the race/gender.
-        slug: optional file/id slug; leave blank to derive from the name's
-              first word. A numeric suffix is appended if it collides.
         Automatically generates a portrait (best-effort).
         For stat blocks use set_npc_stats(slug, ...) after introduction."""
         cfg = _c.load_campaign()
         female = gender.lower() == "female"
-        name = name.strip() or names.generate(race=race, female=female)
+        name = names.generate(race=race, female=female)
 
-        slug_seed = slug.strip() or name.lower().split()[0]
-        base_slug = re.sub(r"[^a-z0-9]", "", slug_seed.lower())
+        base_slug = re.sub(r"[^a-z0-9]", "", name.lower().split()[0])
         chars_dir = cfg["_data_dir"] / "characters"
         chars_dir.mkdir(parents=True, exist_ok=True)
 
@@ -281,104 +277,6 @@ def register(mcp):
         return {"slug": slug, "label": label, "updated": True}
 
     @mcp.tool()
-    def set_pc_stats(
-        key: str,
-        cls: str = "",
-        level: int = None,
-        hp: int = None,
-        ac: int = None,
-        thac0: int = None,
-        weapon: str = "",
-        weapon_speed: int = None,
-        bonus_hit: int = None,
-        bonus_dmg: int = None,
-        saves: list = None,
-        attacks: list = None,
-        ability_scores: dict = None,
-        weapon_profs: list = None,
-        nwps: list = None,
-        natural_abilities: list = None,
-        inventory: list = None,
-        skills: dict = None,
-        spell_slots: dict = None,
-        memorized_spells: list = None,
-        background: str = "",
-        alignment: str = "",
-        portrait_prompt: str = "",
-    ) -> dict:
-        """Partial-update a PC's structured stat block (campaign.json['characters']).
-
-        The PC analogue of set_npc_stats. Only fields you pass are changed; the
-        rest are left untouched. Regenerates the markdown sheet from the stored
-        data afterwards, so campaign.json stays the single source of truth.
-
-        Use this — NOT update_character — whenever a *mechanical* stat changes:
-        equipping a magic weapon, a level-up, an ability-score bump, new
-        proficiencies. update_character only rewrites prose and is invisible to
-        the combat tools, which read thac0/weapon/bonus_hit/bonus_dmg from here.
-
-        IMPORTANT — combat reads the scalar fields, not the `attacks` array:
-        start_combat pulls thac0, weapon (damage dice), weapon_speed, bonus_hit,
-        bonus_dmg. The `attacks` array is sheet-display only. So to make a +1
-        weapon actually swing at +1/+1, bump bonus_hit and bonus_dmg — updating
-        only the attacks array changes the sheet but not the dice.
-
-        key:          character key (from campaign.json['characters'])
-        bonus_hit/bonus_dmg: pass explicitly (incl. 0) to set; omit to leave as-is
-        attacks:      [{name, speed, attacks, thac0, damage_sm, damage_l?, range?}, ...]
-        weapon:       damage dice string the combat tracker rolls (e.g. '1d8')
-        hp:           sets hp_max in campaign.json (does NOT touch current HP in
-                      state.json — use apply_heal/apply_damage for current HP)
-        """
-        cfg = _c.load_campaign()
-        chars = cfg.get("characters", {})
-        char = chars.get(key)
-        if not char:
-            return {
-                "error": (
-                    f"No PC '{key}' in campaign.json['characters']. "
-                    "PCs are created with add_character; NPCs use set_npc_stats."
-                )
-            }
-
-        if cls:                  char["cls"]               = cls
-        if level is not None:     char["level"]             = level
-        if hp is not None:        char["hp_max"]            = hp
-        if ac is not None:        char["ac"]                = ac
-        if thac0 is not None:     char["thac0"]             = thac0
-        if weapon:               char["weapon"]            = weapon
-        if weapon_speed is not None: char["weapon_speed"]   = weapon_speed
-        if bonus_hit is not None: char["bonus_hit"]         = bonus_hit
-        if bonus_dmg is not None: char["bonus_dmg"]         = bonus_dmg
-        if saves:                char["saves"]             = _c.normalize_saves(saves)
-        if attacks:              char["attacks"]           = attacks
-        if ability_scores:       char["ability_scores"]    = ability_scores
-        if weapon_profs:         char["weapon_profs"]      = weapon_profs
-        if nwps:                 char["nwps"]              = nwps
-        if natural_abilities:    char["natural_abilities"] = natural_abilities
-        if inventory:            char["inventory"]         = inventory
-        if skills:               char["skills"]            = skills
-        if spell_slots:          char["spell_slots"]       = {str(k): int(v) for k, v in spell_slots.items()}
-        if memorized_spells:     char["memorized_spells"]  = memorized_spells
-        if background:           char["background"]        = background
-        if alignment:            char["alignment"]         = alignment
-        if portrait_prompt:      char["portrait_prompt"]   = portrait_prompt
-
-        cfg["characters"][key] = char
-        _c.save_campaign(cfg)
-        _c.write_character_sheet(cfg, key, char)
-
-        return {
-            "key":        key,
-            "label":      char.get("label", key),
-            "thac0":      char.get("thac0"),
-            "weapon":     char.get("weapon"),
-            "bonus_hit":  char.get("bonus_hit", 0),
-            "bonus_dmg":  char.get("bonus_dmg", 0),
-            "updated":    True,
-        }
-
-    @mcp.tool()
     def quick_npc(
         cls:          str,
         level:        int = 1,
@@ -387,8 +285,6 @@ def register(mcp):
         description:  str = "",
         ac:           int = 0,
         weapon:       str = "",
-        name:         str = "",
-        slug:         str = "",
     ) -> dict:
         """Generate a fully-statted NPC in one call. Synthesises stats from
         class_lookup (THAC0, saves, spell slots, HD) and applies sensible
@@ -402,20 +298,17 @@ def register(mcp):
         description: role/notes appended to the character file (e.g. 'town guard')
         ac:          override the class-default AC
         weapon:      override the class-default weapon ('long sword', etc.)
-        name:        optional preset name; leave blank to roll a random one.
-        slug:        optional file/id slug; leave blank to derive from the name.
 
-        The NPC gets a name, character file, stat block in
+        The NPC gets a generated name, character file, stat block in
         campaign.json[npcs], and a portrait (best-effort)."""
         if not _2E_DB.exists():
             return {"error": "2e.db not found. Run tools/build_2e_db.py first."}
 
         cfg = _c.load_campaign()
         female = gender.lower() == "female"
-        npc_name = name.strip() or names.generate(race=race, female=female)
+        npc_name = names.generate(race=race, female=female)
 
-        slug_seed = slug.strip() or npc_name.lower().split()[0]
-        base_slug = re.sub(r"[^a-z0-9]", "", slug_seed.lower())
+        base_slug = re.sub(r"[^a-z0-9]", "", npc_name.lower().split()[0])
         chars_dir = cfg["_data_dir"] / "characters"
         chars_dir.mkdir(parents=True, exist_ok=True)
         slug = base_slug
@@ -598,14 +491,19 @@ def register(mcp):
         }
 
     @mcp.tool()
-    def get_character(slug: str) -> dict:
+    def get_character(slug: str, brief: bool = False) -> dict:
         """Read a character file by slug.
 
         Returns the markdown content with a canonical mechanics header
         prepended from campaign.json (ability scores, level, HP, AC, THAC0,
         saves) so the read-path is never silent on a stat the prose omits —
         this closes the gap that led to archetype-guessing CON at level-up.
-        Also returns the structured `mechanics` dict for programmatic use."""
+        Also returns the structured `mechanics` dict for programmatic use.
+
+        brief: return the mechanics header plus only the opening section of the
+        file instead of the whole sheet. A full PC sheet runs to ~8k characters
+        (~1.8k tokens) and mid-scene the DM usually wants the numbers, not the
+        backstory — the full read is still there when the prose matters."""
         cfg = _c.load_campaign()
         path = cfg["_data_dir"] / "characters" / f"{slug}.md"
         if not path.exists():
@@ -614,6 +512,23 @@ def register(mcp):
         content = path.read_text(encoding="utf-8")
         char = _canonical_mechanics(cfg, slug)
         block = _mechanics_block(char) if char else ""
+
+        if brief:
+            body = content.strip()
+            # Cut at the second heading: the first is the name, so this keeps
+            # the opening description and drops the long tail of sections.
+            headings = list(re.finditer(r'^##+\s', body, re.MULTILINE))
+            if len(headings) > 1:
+                body = body[:headings[1].start()].rstrip()
+            if len(body) > _BRIEF_CHARS:
+                body = body[:_BRIEF_CHARS].rstrip() + "\n…[truncated — call get_character without brief for the full sheet]"
+            return {
+                "slug":      slug,
+                "brief":     True,
+                "content":   f"{block}\n\n{body}" if block else body,
+                "mechanics": char or {},
+            }
+
         if block:
             content = f"{block}\n\n{content}"
         return {"slug": slug, "content": content, "mechanics": char or {}}

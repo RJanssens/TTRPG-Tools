@@ -6,168 +6,12 @@ Extracted from dashboard.py — registers /monsters, /monsters/<slug>,
 import html
 import json
 import re
-import urllib.parse
 from pathlib import Path
 
 from flask import abort, jsonify, request, send_from_directory
 
 
 _MONSTERS_PER_PAGE = 60
-
-
-# --- Overview-table filters -------------------------------------------------
-# The alignment / size / climate-terrain columns are free-form (hundreds of
-# distinct spellings each), so we don't build dropdowns from raw DISTINCT
-# values. Instead each filter offers a small canonical option set and we
-# normalise every row to it at request time. The `tag` filter is the
-# exception — its values (the `categories` JSON list) are clean, so its
-# dropdown is built from the actual distinct values.
-
-_ALIGN_OPTIONS = [
-    ("LG", "Lawful Good"),  ("NG", "Neutral Good"),  ("CG", "Chaotic Good"),
-    ("LN", "Lawful Neutral"), ("NN", "True Neutral"), ("CN", "Chaotic Neutral"),
-    ("LE", "Lawful Evil"),  ("NE", "Neutral Evil"),  ("CE", "Chaotic Evil"),
-]
-_ALIGN_ABBR = {
-    "lg": "LG", "ng": "NG", "cg": "CG", "ln": "LN", "n": "NN", "tn": "NN",
-    "cn": "CN", "le": "LE", "ne": "NE", "ce": "CE",
-}
-
-_SIZE_OPTIONS = [
-    ("T", "Tiny"), ("S", "Small"), ("M", "Medium"),
-    ("L", "Large"), ("H", "Huge"), ("G", "Gargantuan"),
-]
-_SIZE_WORDS = {
-    "tiny": "T", "small": "S", "medium": "M",
-    "large": "L", "huge": "H", "gargantuan": "G",
-}
-
-# (key, label, [substring keywords]) — matched against the lowercased
-# climate_terrain text; any keyword hit counts as a match.
-_TERRAIN_OPTIONS_FULL = [
-    ("any",          "Any",                  ["any"]),
-    ("subterranean", "Subterranean / Underdark", ["subterran", "underdark", "cavern", "cave"]),
-    ("forest",       "Forest / Woodland",    ["forest", "wood"]),
-    ("jungle",       "Jungle",               ["jungle"]),
-    ("desert",       "Desert / Wastes",      ["desert", "waste", "barren", "arid"]),
-    ("mountain",     "Mountain",             ["mountain", "alpine"]),
-    ("hills",        "Hills",                ["hill"]),
-    ("plains",       "Plains / Grassland",   ["plain", "grassland", "steppe", "prairie", "savanna"]),
-    ("swamp",        "Swamp / Marsh",        ["swamp", "marsh", "bog", "fen", "moor"]),
-    ("arctic",       "Arctic / Tundra",      ["arctic", "tundra", "glacial", "polar", "frigid"]),
-    ("aquatic",      "Aquatic / Ocean",      ["aquatic", "water", "ocean", "sea", "marine", "lake", "river", "coast"]),
-    ("tropical",     "Tropical",             ["tropical", "subtropical"]),
-    ("temperate",    "Temperate",            ["temperate"]),
-    ("urban",        "Urban",                ["urban", "city", "civili"]),
-    ("planar",       "Planes (Outer/Inner)", ["plane", "abyss", "hell", "baator", "elysium",
-                                              "arbor", "ethereal", "astral", "limbo", "gehenna",
-                                              "acheron", "carceri", "bytopia", "mechanus",
-                                              "ysgard", "outlands", "celestia", "beastland",
-                                              "pandemonium"]),
-    ("space",        "Wildspace / Space",    ["space", "wildspace", "phlogiston", "spelljammer"]),
-    ("dread",        "Ravenloft / Demiplane", ["ravenloft", "demiplane", "shadow rift",
-                                               "nightmare lands", "dread"]),
-]
-_TERRAIN_OPTIONS = [(k, lbl) for (k, lbl, _kw) in _TERRAIN_OPTIONS_FULL]
-_TERRAIN_KEYWORDS = {k: kw for (k, _lbl, kw) in _TERRAIN_OPTIONS_FULL}
-
-# Distinct-tag dropdown is cached and invalidated on the DB's mtime.
-_tags_cache = {"mtime": None, "tags": []}
-
-
-def _norm_alignment(raw: str):
-    """Free-form alignment string -> one of the 9 canonical codes (or None).
-
-    Resolves a law axis (L/C/N) and a morality axis (G/E/N) independently from
-    whichever words are present, so 'Chaotic evil', 'Neutral (evil)', and 'CE'
-    all map to CE. Returns None for non-alignments ('Any', 'Varies', 'Nil')."""
-    s = (raw or "").strip().lower()
-    if not s:
-        return None
-    token = re.sub(r"[^a-z]", "", s)
-    if token in _ALIGN_ABBR:
-        return _ALIGN_ABBR[token]
-    if "lawful" in s:
-        law = "L"
-    elif "chaotic" in s:
-        law = "C"
-    elif "neutral" in s:
-        law = "N"
-    else:
-        law = None
-    if "good" in s:
-        mor = "G"
-    elif "evil" in s:
-        mor = "E"
-    elif "neutral" in s:
-        mor = "N"
-    else:
-        mor = None
-    return (law + mor) if (law and mor) else None
-
-
-def _norm_size(raw: str):
-    """Free-form size -> a single AD&D size code (T/S/M/L/H/G), or None.
-
-    Most rows lead with the code letter ("M (6' tall)"); some spell the word
-    ("Medium"); ranges ("M-L", "S to M") resolve to the first code listed."""
-    s = (raw or "").strip()
-    if not s:
-        return None
-    low = s.lower()
-    for word, code in _SIZE_WORDS.items():
-        if low.startswith(word):
-            return code
-    c = s[0].upper()
-    return c if c in ("T", "S", "M", "L", "H", "G") else None
-
-
-def _distinct_tags(conn, db_path):
-    """Sorted list of distinct `categories` tag values, cached on DB mtime."""
-    try:
-        mt = db_path.stat().st_mtime
-    except OSError:
-        mt = None
-    if _tags_cache["mtime"] == mt and _tags_cache["tags"]:
-        return _tags_cache["tags"]
-    seen = set()
-    for r in conn.execute(
-        "SELECT categories FROM monsters WHERE categories IS NOT NULL AND categories != ''"
-    ):
-        try:
-            lst = json.loads(r["categories"])
-        except (ValueError, TypeError):
-            continue
-        if isinstance(lst, list):
-            for t in lst:
-                if isinstance(t, str) and t.strip():
-                    seen.add(t.strip())
-    tags = sorted(seen, key=str.lower)
-    _tags_cache["mtime"] = mt
-    _tags_cache["tags"] = tags
-    return tags
-
-
-def _filter_select(name, blank_label, options, selected):
-    """Render a dark-themed <select> for the overview filter bar."""
-    opts = [f'<option value="">{html.escape(blank_label)}</option>']
-    for val, text in options:
-        sel = " selected" if val == selected else ""
-        opts.append(
-            f'<option value="{html.escape(val)}"{sel}>{html.escape(text)}</option>'
-        )
-    return (
-        f'<select name="{name}" style="background:#2a2018;border:1px solid #4a3828;'
-        f'color:#d4c5a9;padding:6px 8px;border-radius:4px;font-size:0.95em">'
-        + "".join(opts) + "</select>"
-    )
-
-
-def _filter_qs(params: dict) -> str:
-    """Build a URL query fragment from non-empty filter params (URL-encoded)."""
-    return "&".join(
-        f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items() if v
-    )
 
 
 def _slugify(name: str) -> str:
@@ -257,10 +101,6 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
     @app.route("/monsters")
     def monsters():
         q = request.args.get("q", "").strip()
-        align = request.args.get("align", "").strip()
-        tag = request.args.get("tag", "").strip()
-        size = request.args.get("size", "").strip()
-        terrain = request.args.get("terrain", "").strip()
         try:
             page = max(1, int(request.args.get("page", "1")))
         except ValueError:
@@ -272,70 +112,31 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
 
         conn = db_get(_MONSTERS_DB)
 
-        # Name search is cheap in SQL; the free-form alignment/size/terrain
-        # columns and the JSON tag list are normalised and filtered in Python
-        # (only ~2.7k rows) so the dropdowns can use canonical option sets.
         where, params = "", []
         if q:
             where = "WHERE name LIKE ? COLLATE NOCASE"
             params = [f"%{q}%"]
 
-        all_rows = conn.execute(
-            "SELECT id, name, hit_dice, armor_class, thac0, damage_attack, "
-            f"alignment, size, climate_terrain, categories FROM monsters {where} ORDER BY name",
-            params,
+        total = conn.execute(f"SELECT COUNT(*) FROM monsters {where}", params).fetchone()[0]
+
+        offset = (page - 1) * _MONSTERS_PER_PAGE
+        rows = conn.execute(
+            f"SELECT * FROM monsters {where} ORDER BY name LIMIT ? OFFSET ?",
+            [*params, _MONSTERS_PER_PAGE, offset],
         ).fetchall()
 
-        terrain_kw = _TERRAIN_KEYWORDS.get(terrain)
-
-        def _keep(r):
-            if align and _norm_alignment(r["alignment"]) != align:
-                return False
-            if size and _norm_size(r["size"]) != size:
-                return False
-            if terrain_kw is not None:
-                ct = (r["climate_terrain"] or "").lower()
-                if not any(k in ct for k in terrain_kw):
-                    return False
-            if tag:
-                try:
-                    cats = json.loads(r["categories"]) if r["categories"] else []
-                except (ValueError, TypeError):
-                    cats = []
-                if tag not in cats:
-                    return False
-            return True
-
-        matched = [r for r in all_rows if _keep(r)]
-        total = len(matched)
-        total_pages = max(1, (total + _MONSTERS_PER_PAGE - 1) // _MONSTERS_PER_PAGE)
-        page = min(page, total_pages)
-        offset = (page - 1) * _MONSTERS_PER_PAGE
-        rows = matched[offset:offset + _MONSTERS_PER_PAGE]
-
-        tag_opts = [(t, t) for t in _distinct_tags(conn, _MONSTERS_DB)]
-        any_filter = bool(q or align or tag or size or terrain)
         search_box = (
-            '<form method="get" style="margin-bottom:16px;display:flex;gap:8px;'
-            'flex-wrap:wrap;align-items:center">'
-            f'<input name="q" value="{html.escape(q)}" placeholder="Search monsters…" '
+            '<form method="get" style="margin-bottom:16px">'
+            '<input name="q" value="{q}" placeholder="Search monsters…" '
             'style="background:#2a2018;border:1px solid #4a3828;color:#d4c5a9;'
-            'padding:6px 10px;border-radius:4px;width:220px;font-size:1em">'
-            + _filter_select("align", "Any alignment", _ALIGN_OPTIONS, align)
-            + _filter_select("tag", "Any tag", tag_opts, tag)
-            + _filter_select("size", "Any size", _SIZE_OPTIONS, size)
-            + _filter_select("terrain", "Any climate/terrain", _TERRAIN_OPTIONS, terrain)
-            + '<button type="submit" style="background:#3a2818;border:1px solid #5a4030;'
-            'color:#c8a96e;padding:6px 14px;border-radius:4px;cursor:pointer">Filter</button>'
-            + ('<a href="/monsters" style="color:#8a7a60;font-size:0.9em;'
-               'padding:6px 4px">clear</a>' if any_filter else '')
-            + '</form>'
-        )
+            'padding:6px 10px;border-radius:4px;width:300px;font-size:1em">'
+            ' <button type="submit" style="background:#3a2818;border:1px solid #5a4030;'
+            'color:#c8a96e;padding:6px 14px;border-radius:4px;cursor:pointer">Search</button>'
+            '</form>'
+        ).format(q=html.escape(q))
 
         if not rows:
-            msg = ("No monsters match these filters." if any_filter
-                   else "No monsters found.")
-            body = f"<h1>Monsters</h1>{search_box}<p class='muted'>{msg}</p>"
+            body = f"<h1>Monsters</h1>{search_box}<p class='muted'>No results for '{html.escape(q)}'.</p>"
             return render("Monsters", body)
 
         portraits = monster_portraits_dict()
@@ -365,11 +166,10 @@ def init(app, *, get_cfg, render, db_get, _MONSTERS_DB, _MONSTERS_DIR,
                 f'</p></div>'
             )
 
+        total_pages = max(1, (total + _MONSTERS_PER_PAGE - 1) // _MONSTERS_PER_PAGE)
         pager = ""
         if total_pages > 1:
-            base_qs = _filter_qs({"q": q, "align": align, "tag": tag,
-                                  "size": size, "terrain": terrain})
-            q_arg = f"&{base_qs}" if base_qs else ""
+            q_arg = f"&q={html.escape(q)}" if q else ""
             prev_link = f'<a href="?page={page-1}{q_arg}">‹ prev</a>' if page > 1 else '<span class="muted">‹ prev</span>'
             next_link = f'<a href="?page={page+1}{q_arg}">next ›</a>' if page < total_pages else '<span class="muted">next ›</span>'
             pager = (
