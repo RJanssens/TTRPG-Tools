@@ -1,7 +1,14 @@
 """Survival resources — consumable inventory, light sources, encumbrance, ration tracking.
 
 Consumables are stored in state.json under:
-    state.consumables.<character_key> = {item_name: qty, ...}
+    state.consumables.<character_key>          = {item_name: qty, ...}     # carried, weighs on the PC
+    state.vehicle_consumables.<mount_slug>     = {item_name: qty, ...}     # stowed in a cart/wagon/saddle bag, no carry weight
+
+Both bags share the same item-name vocabulary. add_inventory/consume
+accept either a PC name OR a mount slug for the first argument; PC
+resolution wins on ambiguity. Vehicle pools are intentionally invisible
+to compute_encumbrance — items stowed there don't load the rider.
+
 Light sources are a stack in state.light_sources:
     [{type: 'torch'|'lantern'|...,
       minutes_remaining: int,
@@ -63,31 +70,64 @@ def _consumables(state: dict, key: str) -> dict:
     return state.setdefault("consumables", {}).setdefault(key, {})
 
 
+def _vehicle_pool(state: dict, slug: str) -> dict:
+    return state.setdefault("vehicle_consumables", {}).setdefault(slug, {})
+
+
+def _resolve_target(cfg: dict, name: str) -> tuple[str, str | None, str]:
+    """Resolve the consumable-bag target. Tries PC/NPC first, falls back
+    to a mount slug (vehicle pool). Returns ``(kind, key, label)`` where
+    kind is "char" or "vehicle", or ("none", None, "") on miss."""
+    key, _char, label = _resolve_char(cfg, name)
+    if key is not None:
+        return ("char", key, label)
+    low = name.lower().strip()
+    mounts = cfg.get("mounts") or {}
+    if low in mounts:
+        return ("vehicle", low, mounts[low].get("name", low))
+    # Allow display-name match for ergonomics (e.g. "Trader's Cart").
+    for slug, m in mounts.items():
+        if (m.get("name") or "").lower() == low:
+            return ("vehicle", slug, m.get("name", slug))
+    return ("none", None, "")
+
+
 def register(mcp):
 
     @mcp.tool()
     def add_inventory(character: str, item: str, qty: int = 1) -> dict:
-        """Add a quantity of a consumable to a character's tracked inventory.
-        Use for torches, rations, arrows, oil flasks, holy water, potions, etc.
-        For one-of-a-kind items (a magic sword, a key) keep them in the character
-        markdown sheet — this tool is for things that get used up."""
+        """Add a quantity of a consumable to a character's tracked inventory,
+        or to a vehicle's stowed pool when the first argument is a mount slug
+        (e.g. ``trader-cart``). Use for torches, rations, arrows, oil flasks,
+        holy water, potions, etc. Stowed items in vehicle pools do NOT count
+        toward the rider's encumbrance.
+
+        For one-of-a-kind items (a magic sword, a key) keep them in the
+        character markdown sheet — this tool is for things that get used up."""
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
-        key, _char, label = _resolve_char(cfg, character)
-        if key is None:
-            return {"error": f"Character '{character}' not found."}
+        kind, key, label = _resolve_target(cfg, character)
+        if kind == "none":
+            return {"error": f"Target '{character}' is neither a character nor a mount slug."}
 
         item_key = item.lower().strip()
-        bag = _consumables(state, key)
+        bag = _vehicle_pool(state, key) if kind == "vehicle" else _consumables(state, key)
         bag[item_key] = bag.get(item_key, 0) + int(qty)
         _c.save_state(cfg, state)
 
-        return {"character": label, "item": item_key, "qty_added": qty, "now_holds": bag[item_key]}
+        result = {"item": item_key, "qty_added": qty, "now_holds": bag[item_key]}
+        if kind == "vehicle":
+            result["vehicle"] = label
+            result["stowed_in"] = key
+        else:
+            result["character"] = label
+        return result
 
     @mcp.tool()
     def consume(character: str, item: str, qty: int = 1) -> dict:
-        """Decrement a character's consumable. Errors if they don't have enough.
+        """Decrement a character's consumable, or a vehicle's stowed pool when
+        the first argument is a mount slug. Errors if they don't have enough.
         Use proactively whenever an in-fiction action depletes supplies:
         firing arrows, lighting a torch, eating a ration, drinking a potion.
 
@@ -95,12 +135,12 @@ def register(mcp):
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
 
-        key, _char, label = _resolve_char(cfg, character)
-        if key is None:
-            return {"error": f"Character '{character}' not found."}
+        kind, key, label = _resolve_target(cfg, character)
+        if kind == "none":
+            return {"error": f"Target '{character}' is neither a character nor a mount slug."}
 
         item_key = item.lower().strip()
-        bag = _consumables(state, key)
+        bag = _vehicle_pool(state, key) if kind == "vehicle" else _consumables(state, key)
         have = bag.get(item_key, 0)
         if have < qty:
             return {"error": f"{label} has only {have} {item_key} (needed {qty})."}
@@ -111,11 +151,14 @@ def register(mcp):
         _c.save_state(cfg, state)
 
         result = {
-            "character":  label,
             "item":       item_key,
             "qty_used":   qty,
             "remaining":  bag.get(item_key, 0),
         }
+        if kind == "vehicle":
+            result["vehicle"] = label
+        else:
+            result["character"] = label
         remaining = bag.get(item_key, 0)
         if remaining == 0:
             result["warning"] = f"{label} is out of {item_key}."

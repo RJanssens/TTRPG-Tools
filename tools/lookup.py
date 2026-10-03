@@ -27,6 +27,11 @@ def _find_db(candidates) -> Path | None:
     return None
 
 
+def _has(row, col) -> bool:
+    """True if a sqlite3.Row carries `col` (tolerates pre-migration DBs)."""
+    return col in row.keys()
+
+
 def _generate_treasure_text(types_list: list[str]) -> str:
     """Run treasure.generate_treasure for each type, capture printed output as a
     single string. Replaces the previous subprocess+regex approach."""
@@ -88,6 +93,8 @@ def register(mcp):
                 "morale":            row["morale"],
                 "xp_value":          row["xp_value"],
                 "description":       row["description"],
+                "categories":        json.loads(row["categories"]) if _has(row, "categories") and row["categories"] else [],
+                "source":            (row["source"] if _has(row, "source") else None),
             }
         finally:
             conn.close()
@@ -305,14 +312,14 @@ def register(mcp):
 
         # ── Parse ────────────────────────────────────────────────────────
         import re as _re
-        coin_added = {"cp": 0, "sp": 0, "ep": 0, "gp": 0}
+        coin_added = {"cp": 0, "sp": 0, "ep": 0, "gp": 0, "pp": 0}
         gems       = []
         art        = []
         magic      = []
 
         # Lines of form: '  Gold (gp): 1,736 (25% ✓)' — only parse when value is numeric
         for m in _re.finditer(
-            r'\b(Copper|Silver|Electrum|Gold)\s*\((cp|sp|ep|gp)\):\s+([\d,]+)\b',
+            r'\b(Platinum|Copper|Silver|Electrum|Gold)\s*\((pp|cp|sp|ep|gp)\):\s+([\d,]+)\b',
             text,
         ):
             denom = m.group(2)
@@ -353,7 +360,7 @@ def register(mcp):
         # ── Apply to state ───────────────────────────────────────────────
         cfg = _c.load_campaign()
         state = _c.load_state(cfg)
-        coin = state.setdefault("coin", {"gp": 0, "ep": 0, "sp": 0, "cp": 0})
+        coin = state.setdefault("coin", {"pp": 0, "gp": 0, "ep": 0, "sp": 0, "cp": 0})
         for denom, val in coin_added.items():
             coin[denom] = coin.get(denom, 0) + val
 
@@ -504,5 +511,389 @@ def register(mcp):
             if cur.rowcount == 0:
                 return {"error": f"No item with id {item_id} found."}
             return {"updated": item_id, "fields": {k.split(" =")[0]: v for k, v in zip(sets, params[:-1])}}
+        finally:
+            conn.close()
+
+    _ABILITY_NAMES = {"strength", "dexterity", "constitution",
+                      "intelligence", "wisdom", "charisma"}
+
+    def _ability_canonical(s: str) -> str | None:
+        s = (s or "").strip().lower()
+        if s in _ABILITY_NAMES:
+            return s
+        # Accept common short forms: str, dex, con, int, wis, cha
+        short = {"str": "strength", "dex": "dexterity", "con": "constitution",
+                 "int": "intelligence", "wis": "wisdom", "cha": "charisma"}
+        return short.get(s)
+
+    @mcp.tool()
+    def ability_lookup(ability: str, score: str = "") -> dict:
+        """Look up AD&D 2e derived attributes for an ability score.
+
+        ability: 'strength'|'dexterity'|'constitution'|'intelligence'|'wisdom'|
+                 'charisma' (or 3-letter shortcut: str, dex, con, int, wis, cha).
+        score:   '15', '18/76-90', '4-5', etc. Optional. If omitted, returns
+                 the column definitions plus every row for that ability.
+
+        Returns derived values such as hit probability, bend bars/lift gates %,
+        system shock %, bonus spells, henchmen cap, etc., along with brief
+        column descriptions."""
+        canon = _ability_canonical(ability)
+        if canon is None:
+            return {"error": f"Unknown ability '{ability}'. Use one of: "
+                              f"{', '.join(sorted(_ABILITY_NAMES))}."}
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            note = conn.execute(
+                "SELECT headline, xp_bonus, extra FROM ability_notes "
+                "WHERE ability=?", (canon,),
+            ).fetchone()
+            if note is None:
+                return {"error": f"No ability data for '{canon}'. Rebuild with "
+                                  f"tools/build_phb_ref.py."}
+            cols = list(conn.execute(
+                "SELECT name, short_name, note FROM ability_columns "
+                "WHERE ability=? ORDER BY sort_order", (canon,),
+            ).fetchall())
+            score_rows = list(conn.execute(
+                "SELECT score, data FROM ability_scores "
+                "WHERE ability=? ORDER BY sort_order", (canon,),
+            ).fetchall())
+        finally:
+            conn.close()
+
+        columns = [{
+            "name":       r["name"],
+            "short_name": r["short_name"],
+            "note":       r["note"],
+        } for r in cols]
+
+        base = {
+            "ability":  canon,
+            "headline": note["headline"],
+            "xp_bonus": note["xp_bonus"],
+            "extra":    note["extra"],
+            "columns":  columns,
+        }
+
+        if not score:
+            base["rows"] = [
+                {"score": r["score"], **json.loads(r["data"])}
+                for r in score_rows
+            ]
+            return base
+
+        # Match the requested score against the stored row labels. Accept
+        # exact matches, dash-range membership (e.g. '12' → '12-13'), and
+        # 18/xx percentile bands.
+        score = score.strip()
+        match = None
+        for r in score_rows:
+            label = r["score"]
+            if label == score:
+                match = r
+                break
+        if match is None and score.isdigit():
+            n = int(score)
+            for r in score_rows:
+                label = r["score"]
+                if "-" in label and "/" not in label:
+                    try:
+                        lo, hi = label.split("-")
+                        if int(lo) <= n <= int(hi):
+                            match = r
+                            break
+                    except ValueError:
+                        continue
+        if match is None and score.startswith("18/") and score[3:].isdigit():
+            pct = int(score[3:])
+            if pct == 0 or pct == 100:
+                match = next((r for r in score_rows if r["score"] == "18/00"), None)
+            else:
+                for r in score_rows:
+                    lbl = r["score"]
+                    if not lbl.startswith("18/") or lbl == "18/00":
+                        continue
+                    rest = lbl[3:]
+                    if "-" in rest:
+                        lo, hi = rest.split("-")
+                        if int(lo) <= pct <= int(hi):
+                            match = r
+                            break
+
+        if match is None:
+            return {**base, "error": f"No row for score '{score}'.",
+                    "available": [r["score"] for r in score_rows]}
+
+        return {**base,
+                "score": match["score"],
+                "values": json.loads(match["data"])}
+
+    _PROF_GROUPS = {"general", "priest", "rogue", "warrior", "wizard"}
+
+    @mcp.tool()
+    def proficiency_lookup(name: str = "", group: str = "",
+                           ability: str = "") -> dict:
+        """Look up AD&D 2e nonweapon proficiencies (PHB Table 37).
+
+        name:    proficiency name (partial, case-insensitive). Returns matching
+                 entries across all groups.
+        group:   'general'|'priest'|'rogue'|'warrior'|'wizard'. Filter results.
+        ability: 'Strength'|'Dexterity'|… Filter by relevant ability.
+
+        At least one of name/group/ability must be supplied. With no filters
+        the result would be the entire table; use the dashboard /proficiencies
+        page for that.
+
+        Each entry: name, group, slots required, relevant ability, check
+        modifier. A proficiency check is d20 ≤ (ability score + check
+        modifier)."""
+        if not (name or group or ability):
+            return {"error": "Provide at least one of name, group, or ability."}
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+
+        group_norm = group.strip().lower() if group else ""
+        if group_norm and group_norm not in _PROF_GROUPS:
+            return {"error": f"Unknown group '{group}'. Use one of: "
+                              f"{', '.join(sorted(_PROF_GROUPS))}."}
+
+        where, params = [], []
+        if name:
+            where.append("name LIKE ? COLLATE NOCASE")
+            params.append(f"%{name}%")
+        if group_norm:
+            where.append("group_name = ?")
+            params.append(group_norm)
+        if ability:
+            where.append("ability LIKE ? COLLATE NOCASE")
+            params.append(ability)
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = list(conn.execute(
+                f"SELECT name, group_name, slots, ability, check_modifier "
+                f"FROM proficiencies WHERE {' AND '.join(where)} "
+                f"ORDER BY name COLLATE NOCASE, group_name",
+                params,
+            ).fetchall())
+        finally:
+            conn.close()
+
+        if not rows:
+            return {"error": "No matching proficiencies.",
+                    "filters": {"name": name or None, "group": group or None,
+                                "ability": ability or None}}
+
+        return {
+            "count": len(rows),
+            "results": [{
+                "name":           r["name"],
+                "group":          r["group_name"],
+                "slots":          r["slots"],
+                "ability":        r["ability"],
+                "check_modifier": r["check_modifier"],
+            } for r in rows],
+        }
+
+    _TURNING_LEVEL_COLUMNS = [
+        "1", "2", "3", "4", "5", "6", "7", "8", "9",
+        "10-11", "12-13", "14+",
+    ]
+
+    def _turning_level_column_index(eff_level: int) -> int | None:
+        if eff_level < 1:
+            return None
+        if 1 <= eff_level <= 9:
+            return eff_level - 1
+        if 10 <= eff_level <= 11:
+            return 9
+        if 12 <= eff_level <= 13:
+            return 10
+        if eff_level >= 14:
+            return 11
+        return None
+
+    def _turning_decode(cell: str) -> dict:
+        if cell == "—":
+            return {
+                "needs_roll":        False,
+                "destroys":          False,
+                "extra_turned_2d4":  False,
+                "affects_2d6":       False,
+                "meaning":           "A priest of this level cannot turn this type.",
+            }
+        if cell == "T":
+            return {
+                "needs_roll":        False,
+                "destroys":          False,
+                "extra_turned_2d4":  False,
+                "affects_2d6":       True,
+                "meaning":           "Automatically turned — no d20 roll required. "
+                                     "Affects 2d6 creatures.",
+            }
+        if cell == "D":
+            return {
+                "needs_roll":        False,
+                "destroys":          True,
+                "extra_turned_2d4":  False,
+                "affects_2d6":       True,
+                "meaning":           "Automatically destroyed (dispel). Affects 2d6 creatures.",
+            }
+        if cell == "D*":
+            return {
+                "needs_roll":        False,
+                "destroys":          True,
+                "extra_turned_2d4":  True,
+                "affects_2d6":       True,
+                "meaning":           "Automatically destroyed (dispel). Affects 2d6 creatures, "
+                                     "plus an additional 2d4 of that type are turned.",
+            }
+        # Numeric target
+        return {
+            "needs_roll":        True,
+            "target":            int(cell),
+            "destroys":          False,
+            "extra_turned_2d4":  False,
+            "affects_2d6":       True,
+            "meaning":           f"Roll 1d20; on a result of {cell} or higher, "
+                                 f"2d6 of these undead are turned and flee.",
+        }
+
+    @mcp.tool()
+    def turning_undead(level: int, undead: str = "", hd: int = 0,
+                       role: str = "priest") -> dict:
+        """Look up DMG Table 47 — turning undead.
+
+        level: caster's actual class level (priest or paladin).
+        undead: undead type name (e.g. 'ghoul', 'vampire', 'spectre', 'lich').
+                Case-insensitive; matches aliases stored on each row.
+        hd:     hit dice of the undead — used if undead is not supplied.
+                Recognised buckets: 1, 2, 3-4, 5, 6, 7, 8, 9, 10, 11+.
+        role:   'priest' (default) or 'paladin'. Paladins read the column
+                two lower than their actual level (a 5th-level paladin uses
+                column 3; 1st- and 2nd-level paladins cannot turn).
+
+        Druids cannot turn undead — not modelled here.
+
+        Returns the d20 target and a decoded meaning of the cell value
+        (number = roll-to-turn; T = auto-turn; D = destroy; D* = destroy
+        plus 2d4 extra; — = cannot turn at this level)."""
+        role_norm = (role or "priest").strip().lower()
+        if role_norm not in ("priest", "paladin"):
+            return {"error": f"Unknown role '{role}'. Use 'priest' or 'paladin'."}
+        if not undead and hd <= 0:
+            return {"error": "Provide either undead (name) or hd (hit dice)."}
+
+        eff_level = level - 2 if role_norm == "paladin" else level
+        col_idx = _turning_level_column_index(eff_level)
+        if col_idx is None:
+            return {
+                "error": f"{role_norm.capitalize()} of level {level} cannot "
+                         f"turn undead (effective turning level {eff_level}).",
+                "role": role_norm,
+                "caster_level": level,
+                "effective_level": eff_level,
+            }
+
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = None
+            if undead:
+                needle = undead.strip().lower()
+                candidates = list(conn.execute(
+                    "SELECT undead_type, min_hd, max_hd, results, aliases "
+                    "FROM turning_undead ORDER BY sort_order"
+                ).fetchall())
+                # Alias match first (cleanest).
+                for c in candidates:
+                    if needle in json.loads(c["aliases"]):
+                        row = c
+                        break
+                # Fallback: substring match on undead_type.
+                if row is None:
+                    for c in candidates:
+                        if needle in c["undead_type"].lower():
+                            row = c
+                            break
+                if row is None:
+                    return {
+                        "error": f"No turning entry matching '{undead}'.",
+                        "available": [c["undead_type"] for c in candidates],
+                    }
+            else:
+                row = conn.execute(
+                    "SELECT undead_type, min_hd, max_hd, results, aliases "
+                    "FROM turning_undead "
+                    "WHERE min_hd IS NOT NULL AND min_hd <= ? AND max_hd >= ? "
+                    "ORDER BY sort_order LIMIT 1",
+                    (hd, hd),
+                ).fetchone()
+                if row is None:
+                    return {
+                        "error": f"No HD-based turning entry for {hd} HD. "
+                                  f"(Zombies and Ghasts have no HD bucket — "
+                                  f"look them up by name.)",
+                    }
+        finally:
+            conn.close()
+
+        cells = json.loads(row["results"])
+        cell = cells[col_idx]
+        decoded = _turning_decode(cell)
+        return {
+            "undead":          row["undead_type"],
+            "role":            role_norm,
+            "caster_level":    level,
+            "effective_level": eff_level,
+            "level_column":    _TURNING_LEVEL_COLUMNS[col_idx],
+            "result":          cell,
+            **decoded,
+        }
+
+    @mcp.tool()
+    def proficiency_groups(class_name: str = "") -> dict:
+        """Return PHB Table 38 — which proficiency groups each class draws from.
+
+        class_name: optional. If supplied, returns just that class's groups.
+        Otherwise returns the whole crossover table. A class can spend
+        nonweapon proficiency slots on any proficiency in its listed groups.
+        Every class can additionally pick from General."""
+        db_path = _find_db(_2E_DB_CANDIDATES)
+        if db_path is None:
+            return {"error": "2e.db not found."}
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            if class_name:
+                row = conn.execute(
+                    "SELECT class_name, groups FROM proficiency_class_crossover "
+                    "WHERE class_name LIKE ? COLLATE NOCASE LIMIT 1",
+                    (f"%{class_name}%",),
+                ).fetchone()
+                if row is None:
+                    return {"error": f"No class matching '{class_name}'."}
+                return {"class": row["class_name"],
+                        "groups": json.loads(row["groups"])}
+            rows = list(conn.execute(
+                "SELECT class_name, groups FROM proficiency_class_crossover "
+                "ORDER BY class_name"
+            ).fetchall())
+            return {"crossover": [
+                {"class": r["class_name"], "groups": json.loads(r["groups"])}
+                for r in rows
+            ]}
         finally:
             conn.close()

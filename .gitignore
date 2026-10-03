@@ -28,3 +28,16 @@ global/reference/phb.txt
 campaigns/*/images/*.png
 campaigns/*/images/*.jpg
 campaigns/*/images/*.webp
+
+# Generated narration audio (regeneratable via TTS)
+campaigns/*/audio/
+
+# Scraped Greyhawk wiki images — ~300 MB, refetchable with the scraper.
+# The DB snapshot itself (settings/greyhawk/greyhawk.db) stays tracked:
+# it is the queryable reference the lookup tools read.
+settings/*/images/
+
+# Timestamped local backups of generated data
+*.bak
+*.bak.*
+*.bak_*

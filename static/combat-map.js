@@ -205,10 +205,37 @@ class CombatMap {
         ctx.save();
         ctx.translate(-this._offsetX, -this._offsetY);
         this._drawGrid(g, C);
+        this._drawSvgBackground(g, C);
         this._drawTerrain(g, C);
         this._drawTokens(state.combatants || [], C);
         if (this._selectedToken) this._drawMovementRadius(this._selectedToken, C);
         ctx.restore();
+    }
+
+    /**
+     * If the active map was rendered via dungml the grid carries an
+     * `svg_url` (a data: URL). Decode it once, cache the resulting
+     * Image, and draw at `g.width * C` × `g.height * C` so one cell
+     * = one world unit at the current zoom. The image scales naturally
+     * because the SVG's viewBox uses world-unit coords.
+     */
+    _drawSvgBackground(g, C) {
+        var url = g && g.svg_url;
+        if (!url) return;
+        var ctx = this.ctx;
+        var img = this._svgImage;
+        if (!img || img._url !== url) {
+            img = new Image();
+            img._url = url;
+            var self = this;
+            img.onload  = function() { self._scheduleRender(); };
+            img.onerror = function() {};
+            img.src = url;
+            this._svgImage = img;
+        }
+        if (img.complete && img.naturalWidth > 0) {
+            ctx.drawImage(img, 0, 0, g.width * C, g.height * C);
+        }
     }
 
     // ── Canvas layers ─────────────────────────────────────────────────────────
@@ -269,6 +296,10 @@ class CombatMap {
         for (var i = 0; i < combatants.length; i++) {
             var c = combatants[i];
             if (c.x == null || c.y == null) continue;
+            // Combatants already drawn into the dungml SVG carry
+            // in_svg=true. Skip them so we don't double-draw the same
+            // token (server-side marker + client-side canvas token).
+            if (c.in_svg) continue;
             this._drawToken(c, c.x*C + C/2, c.y*C + C/2, C);
         }
     }

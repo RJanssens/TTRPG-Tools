@@ -8,16 +8,16 @@ import _campaign as _c
 BASE_DIR = Path(__file__).parent.parent
 
 STYLE_BASE = (
-    "Tabletop RPG game art illustration, AD&D 2nd edition style, ink and watercolor, muted earth tones. "
+    "Tabletop RPG game art illustration, AD&D 2nd edition cover-art aesthetic. "
     "Medieval fantasy, non-violent character portrait, safe for work. "
     "No text, no labels, no UI elements. "
     "No firearms, no modern technology."
 )
 
 TONE_STYLES = {
-    "high fantasy":    "Heroic, luminous, epic scale. Rich colours, dramatic lighting.",
-    "gritty realism":  "Grim, weathered, realistic. Dark tones, worn equipment.",
-    "comedy":          "Lighthearted, whimsical. Bright colours, cartoonish.",
+    "high fantasy":    "In the style of Larry Elmore and Clyde Caldwell. Painted oils, romantic heroic fantasy, heroic and luminous, epic scale. Rich colours, dramatic lighting.",
+    "gritty realism":  "In the style of Brom and Jeff Easley. Painted, high-contrast, gothic. Grim, weathered, realistic. Dark tones, worn equipment.",
+    "comedy":          "In the style of Tony DiTerlizzi. Inked line work with watercolor, whimsical. Lighthearted, bright colours, cartoonish.",
 }
 
 NEGATIVE_PROMPT = (
@@ -116,14 +116,12 @@ def generate_portrait_for(cfg: dict, slug: str, prompt: str) -> dict:
 
 def _generate_image(replicate, full_prompt: str, images_dir: Path, filename: str) -> Path:
     output = replicate.run(
-        "black-forest-labs/flux-1.1-pro",
+        "black-forest-labs/flux-2-pro",
         input={
             "prompt":           full_prompt,
-            "num_outputs":      1,
             "aspect_ratio":     "1:1",
             "output_format":    "png",
-            "output_quality":   95,
-            "safety_tolerance": 6,
+            "safety_tolerance": 5,
         },
     )
     images_dir.mkdir(parents=True, exist_ok=True)

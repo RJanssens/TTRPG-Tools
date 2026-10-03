@@ -9,49 +9,46 @@ import html
 from flask import Response, abort, request
 
 
+# Mundane equipment keeps functional slugs; magic items use the consolidated
+# human-readable category values written by tools/consolidate_magic_item_types.py.
+# An option's VALUE must equal the stored item_type exactly — the query does an
+# exact `item_type = ?` match.
 _ITEM_TYPE_LABELS = {
-    "armor":                    "Armor",
-    "weapon_melee":             "Melee Weapon",
-    "weapon_ranged":            "Ranged Weapon",
-    "weapon_ammo":              "Ammunition",
-    "misc_equipment":           "Equipment",
-    "provisions":               "Provisions",
-    "clothing":                 "Clothing",
-    "item_food_lodging":        "Food & Lodging",
-    "services":                 "Services",
-    "animals":                  "Animals",
-    "tack_harness":             "Tack & Harness",
-    "scroll":                   "Scroll",
-    "potion":                   "Potion",
-    "ring":                     "Ring",
-    "rod":                      "Rod",
-    "staff":                    "Staff",
-    "wand":                     "Wand",
-    "magic_item_armor_special": "Magic Armor",
-    "magic_item_weapon_special":"Magic Weapon",
-    "misc_magic_bags_bottles_pouch": "Bags & Bottles",
-    "misc_magic_books":         "Books",
-    "misc_magic_boots_gloves":  "Boots & Gloves",
-    "misc_magic_candles_etc":   "Candles & Misc",
-    "misc_magic_cloaks_robes":  "Cloaks & Robes",
-    "misc_magic_girdle_hats_helms": "Girdles, Hats & Helms",
-    "misc_magic_household_tools":"Household Tools",
-    "misc_magic_jewelry":       "Jewelry",
-    "misc_magic_musical_instruments": "Instruments",
-    "misc_magic_weird":         "Weird Magic",
+    # Mundane equipment (functional slugs → readable labels)
+    "armor":             "Armor",
+    "weapon_melee":      "Melee Weapon",
+    "weapon_ranged":     "Ranged Weapon",
+    "weapon_ammo":       "Ammunition",
+    "misc_equipment":    "Equipment",
+    "provisions":        "Provisions",
+    "clothing":          "Clothing",
+    "item_food_lodging": "Food & Lodging",
+    "services":          "Services",
+    "animals":           "Animals",
+    "tack_harness":      "Tack & Harness",
+    # Magic categories (already human-readable; identity labels)
+    "Magic Weapon":       "Magic Weapon",
+    "Magic Armor":        "Magic Armor",
+    "Magic Ammunition":   "Magic Ammunition",
+    "Ring":               "Ring",
+    "Wand":               "Wand",
+    "Rod":                "Rod",
+    "Staff":              "Staff",
+    "Potion & Oil":       "Potion & Oil",
+    "Scroll":             "Scroll",
+    "Book & Tome":        "Book & Tome",
+    "Musical Instrument": "Musical Instrument",
+    "Wondrous Item":      "Wondrous Item",
 }
 
 _ITEM_TYPE_GROUPS = {
     "Mundane": ["armor", "weapon_melee", "weapon_ranged", "weapon_ammo",
                 "misc_equipment", "provisions", "clothing", "item_food_lodging",
                 "services", "animals", "tack_harness"],
-    "Magic":   ["scroll", "potion", "ring", "rod", "staff", "wand",
-                "magic_item_armor_special", "magic_item_weapon_special",
-                "misc_magic_bags_bottles_pouch", "misc_magic_books",
-                "misc_magic_boots_gloves", "misc_magic_candles_etc",
-                "misc_magic_cloaks_robes", "misc_magic_girdle_hats_helms",
-                "misc_magic_household_tools", "misc_magic_jewelry",
-                "misc_magic_musical_instruments", "misc_magic_weird"],
+    "Magic":   ["Magic Weapon", "Magic Armor", "Magic Ammunition",
+                "Ring", "Wand", "Rod", "Staff",
+                "Potion & Oil", "Scroll", "Book & Tome",
+                "Musical Instrument", "Wondrous Item"],
 }
 
 
@@ -225,7 +222,7 @@ def init(app, *, render, db_get, _2E_DB, markdown_to_html, INPUT_STYLE, SELECT_S
             for t in types:
                 label = _ITEM_TYPE_LABELS.get(t, t)
                 sel = "selected" if itype == t else ""
-                type_opts += f'<option value="{t}" {sel}>{html.escape(label)}</option>'
+                type_opts += f'<option value="{html.escape(t, quote=True)}" {sel}>{html.escape(label)}</option>'
             type_opts += '</optgroup>'
 
         rarity_opts = (

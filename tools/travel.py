@@ -50,18 +50,30 @@ def _check_encounter(cfg: dict, terrain: str) -> dict:
 
 
 def _consume_rations(cfg: dict, state: dict) -> tuple[list, list]:
-    """Each PC eats one ration. Returns (fed, hungry)."""
+    """Each PC eats one ration. Vehicle stowed pools are drained first
+    (any cart/wagon with rations feeds the party before personal bags are
+    touched), then each PC's own consumables. Returns (fed, hungry)."""
     consumables = state.setdefault("consumables", {})
+    pools = state.setdefault("vehicle_consumables", {})
     fed, hungry = [], []
     for key, char in cfg.get("characters", {}).items():
-        bag = consumables.setdefault(key, {})
-        if bag.get("rations", 0) > 0:
-            bag["rations"] -= 1
-            if bag["rations"] == 0:
-                del bag["rations"]
-            fed.append(char.get("label", key))
-        else:
-            hungry.append(char.get("label", key))
+        ate = False
+        # First try any vehicle pool with rations.
+        for slug, pool in pools.items():
+            if pool.get("rations", 0) > 0:
+                pool["rations"] -= 1
+                if pool["rations"] == 0:
+                    del pool["rations"]
+                ate = True
+                break
+        if not ate:
+            bag = consumables.setdefault(key, {})
+            if bag.get("rations", 0) > 0:
+                bag["rations"] -= 1
+                if bag["rations"] == 0:
+                    del bag["rations"]
+                ate = True
+        (fed if ate else hungry).append(char.get("label", key))
     return fed, hungry
 
 
